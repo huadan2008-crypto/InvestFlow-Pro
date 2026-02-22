@@ -9,7 +9,7 @@ import os
 # --- 核心配置 ---
 # 记得核对这个链接是否是你现在的云端地址
 BASE_URL = "https://investflow-pro.streamlit.app/" 
-CSV_FILE = "invest_flow_data_v5.csv" 
+CSV_FILE = "invest_flow_data_v6.csv" 
 
 st.set_page_config(page_title="InvestFlow 数字化发行系统", layout="wide")
 
@@ -21,7 +21,7 @@ if not os.path.exists(CSV_FILE):
 # --- 邮件发送函数 ---
 def send_invite_email(to_email, order_id, ticker, price, lock_months, smtp_info):
     jump_url = f"{BASE_URL}?order_id={order_id}"
-    body = f"您好，项目预约已确认：\n- 标的: {ticker}\n- 价格: {price}\n- 链接: {jump_url}"
+    body = f"您好，项目预约已确认：\n- 标的: {ticker}\n- 价格: {price}\n- 锁定期: {lock_months}个月\n- 详情链接: {jump_url}"
     try:
         msg = MIMEText(body, 'plain', 'utf-8')
         msg['Subject'] = Header(f"项目预约确认: {ticker}", 'utf-8').encode()
@@ -35,11 +35,11 @@ def send_invite_email(to_email, order_id, ticker, price, lock_months, smtp_info)
         st.error(f"邮件发送异常: {e}")
         return False
 
-# --- 侧边栏：角色切换 ---
-st.sidebar.title("🚀 角色切换")
-role = st.sidebar.radio("选择进入的界面：", ["销售后台 (发行端)", "客户前端 (查询端)"])
+# --- 侧边栏角色切换 ---
+st.sidebar.title("🚀 导航")
+role = st.sidebar.radio("选择进入的界面：", ["销售后台", "客户前端"])
 
-# 获取 Secrets
+# --- 获取 Secrets 配置 ---
 smtp_info = {
     "host": "smtp.gmail.com",
     "port": 465,
@@ -47,56 +47,62 @@ smtp_info = {
     "pass": st.secrets.get("SMTP_PASS", "")
 }
 
-# --- 逻辑 A：客户前端 (通过邮件链接跳转进入) ---
-# 获取 URL 里的 order_id 参数
+# --- 逻辑处理 ---
 query_params = st.query_params
 url_order_id = query_params.get("order_id")
 
-if url_order_id or role == "客户前端 (查询端)":
-    st.title("👤 客户详情查询")
-    search_id = url_order_id if url_order_id else st.text_input("输入订单号查询")
+# --- 逻辑 A：客户前端 (带邮箱验证) ---
+if url_order_id or role == "客户前端":
+    st.title("👤 客户专属查询")
     
-    if search_id:
-        df = pd.read_csv(CSV_FILE)
-        res = df[df['order_id'] == search_id]
-        if not res.empty:
-            st.success(f"找到订单: {search_id}")
-            col_a, col_b = st.columns(2)
-            with col_a:
-                st.metric("项目代码", res.iloc[0]['ticker'])
-                st.metric("预约价格", res.iloc[0]['price'])
-            with col_b:
-                st.metric("锁定期 (月)", res.iloc[0]['lock_months'])
-                st.info(f"状态: {res.iloc[0]['status']}")
-        else:
-            st.error("未找到该订单信息，请检查链接或输入。")
+    target_id = url_order_id if url_order_id else st.text_input("请输入订单编号")
+    
+    if target_id:
+        input_email = st.text_input("请输入预留邮箱验证身份", type="default")
+        
+        if st.button("核验身份"):
+            df = pd.read_csv(CSV_FILE)
+            res = df[(df['order_id'] == target_id) & (df['email'] == input_email)]
+            
+            if not res.empty:
+                st.success("验证通过")
+                # 已移除 st.balloons()
+                c1, c2, c3 = st.columns(3)
+                c1.metric("项目代码", res.iloc[0]['ticker'])
+                c2.metric("预约价格", res.iloc[0]['price'])
+                c3.metric("锁定期 (月)", res.iloc[0]['lock_months'])
+                st.info(f"项目当前状态：{res.iloc[0]['status']}")
+            else:
+                st.error("验证失败：订单号与邮箱不匹配。")
 
 # --- 逻辑 B：销售后台 ---
-if role == "销售后台 (发行端)":
-    st.title("💼 销售发行监控管理")
+if role == "销售后台" and not url_order_id:
+    st.title("💼 销售管理系统")
     
-    with st.expander("➕ 发起新项目邀约", expanded=True):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            ticker = st.text_input("项目代码", "PROJECT-XYZ")
-        with c2:
-            price = st.number_input("价格", value=1.0)
-        with c3:
+    with st.container(border=True):
+        st.subheader("发起新项目邀约")
+        col1, col2 = st.columns(2)
+        with col1:
+            ticker = st.text_input("标的代码", "PROJECT-PRO")
+            price = st.number_input("预约价格", min_value=0.0, value=1000.0)
+        with col2:
             target_email = st.text_input("客户邮箱")
+            lock_months = st.number_input("锁定期 (月)", min_value=1, value=12)
         
-        lock_months = st.selectbox("锁定期 (月)", [3, 6, 12, 24])
-        
-        if st.button("发送邀约", type="primary"):
+        if st.button("确认发送邮件", type="primary"):
             if target_email and smtp_info["pass"]:
                 oid = str(uuid.uuid4())[:8]
                 if send_invite_email(target_email, oid, ticker, price, lock_months, smtp_info):
+                    # 保存数据
                     new_row = pd.DataFrame([[oid, ticker, price, lock_months, 'Active', target_email]], 
                                          columns=['order_id', 'ticker', 'price', 'lock_months', 'status', 'email'])
-                    df_all = pd.read_csv(CSV_FILE)
-                    pd.concat([df_all, new_row]).to_csv(CSV_FILE, index=False)
-                    st.success(f"发送成功！单号: {oid}")
-                    st.balloons()
+                    df_old = pd.read_csv(CSV_FILE)
+                    pd.concat([df_old, new_row]).to_csv(CSV_FILE, index=False)
+                    st.success(f"已发送，订单号: {oid}")
+                    # 已移除 st.balloons()
+            else:
+                st.warning("请检查配置信息")
 
-    st.subheader("📊 全局监控看板")
-    df_display = pd.read_csv(CSV_FILE)
-    st.dataframe(df_display, use_container_width=True)
+    st.subheader("所有发行记录")
+    df_all = pd.read_csv(CSV_FILE)
+    st.dataframe(df_all.iloc[::-1], use_container_width=True)
