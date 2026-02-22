@@ -1,0 +1,5 @@
+Ticker,Type,Date,Lock_months,Cost,Target,Owner,Unlock_Date,Days_Left,Current_Price,Alert_Sent,Status,Investor_Email
+VEIN.V,Private Placement,2026-02-21,6,0.0,0.0,,2026-08-21,181,0.8799999952316284,0,,
+VEIN.V,Private Placement,2025-10-21,6,0.52,0.8,,2026-04-21,59,,0,,
+BTU.V,Private Placement,2025-11-24,4,0.05,0.1,,2026-03-24,31,0.0700000002980232,0,,
+VEIN.V,Private Placement,2026-02-21,6,0.6,0.0,False,李四,Draft,fangjin_fangjin@yahoo.com
