@@ -1,5 +1,13 @@
+<<<<<<< HEAD
 Order_ID,Ticker,Investor_Email,Status,Price,Lock_months,Date_Created,Date_Active,Amount
 ORD043419,BTU.V,huadan2008@gmail.com,Active,0.05,6,2026-02-22,2026-02-22,200000
 INV-045302,VEIN.V,fangjin_fangjin@yahoo.com,Active,0.5,4,2026-02-22,2026-02-22,100000
 ORD-045959,VEIN.V,fangjin_fangjin@yahoo.com,Active,0.58,6,2026-02-22,2026-02-22,5000
 ORD-061844,BTU.V,fangjin_fangjin@yahoo.com,Sent,0.05,6,2026-02-22,,0
+=======
+Order_ID,Ticker,Investor_Email,Status,Price,Lock_months,Date_Created,Date_Active,Amount
+ORD043419,BTU.V,huadan2008@gmail.com,Active,0.05,6,2026-02-22,2026-02-22,200000
+INV-045302,VEIN.V,fangjin_fangjin@yahoo.com,Active,0.5,4,2026-02-22,2026-02-22,100000
+ORD-045959,VEIN.V,fangjin_fangjin@yahoo.com,Active,0.58,6,2026-02-22,2026-02-22,5000
+ORD-061844,BTU.V,fangjin_fangjin@yahoo.com,Sent,0.05,6,2026-02-22,,0
+>>>>>>> 3c73d750feda69802424e1c0d2f37337e31e182c
