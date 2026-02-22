@@ -1,8 +1,3 @@
-<<<<<<< HEAD
 streamlit
 pandas
-=======
-streamlit
-pandas
->>>>>>> 3c73d750feda69802424e1c0d2f37337e31e182c
 yfinance
