@@ -6,90 +6,98 @@ from email.header import Header
 import uuid
 import os
 
-# --- 1. 核心地址配置 (极其重要) ---
-# 请打开你的 App 网页，复制地址栏地址（不带任何后缀），确保以 / 结尾
+# --- 1. 核心地址配置 (手动核对：确保这是你现在的真实网址) ---
 BASE_URL = "https://ede-invest-flow.streamlit.app/" 
-CSV_FILE = "invest_master_v7.csv" 
+CSV_FILE = "invest_master_v10.csv" 
 
-st.set_page_config(page_title="InvestFlow 数字化发行", layout="wide")
+st.set_page_config(page_title="InvestFlow Pro", layout="wide")
 
-# --- 2. 初始化数据 ---
+# --- 2. 预定义列名 (解决 NameError 的关键) ---
+COLUMNS = ['order_id', 'ticker', 'price', 'lock_months', 'status', 'email']
+
+# --- 3. 初始化数据文件 ---
 if not os.path.exists(CSV_FILE):
-    df_init = pd.DataFrame(columns=['order_id', 'ticker', 'price', 'lock_months', 'status', 'email'])
-    df_init.to_csv(CSV_FILE, index=False)
+    df_new = pd.DataFrame(columns=COLUMNS)
+    df_new.to_csv(CSV_FILE, index=False)
 
-# --- 3. 侧边栏：邮件配置与角色 ---
+# --- 4. 侧边栏配置 ---
 st.sidebar.title("⚙️ 系统配置")
-with st.sidebar.expander("邮件服务器配置", expanded=False):
-    smtp_user = st.text_input("Gmail 账号", value=st.secrets.get("SMTP_USER", ""))
-    smtp_pass = st.text_input("Gmail 授权码", type="password", value=st.secrets.get("SMTP_PASS", ""))
-    smtp_info = {"host": "smtp.gmail.com", "port": 465, "user": smtp_user, "pass": smtp_pass}
+with st.sidebar.expander("邮件服务器设置", expanded=True):
+    u = st.text_input("Gmail 账号", value=st.secrets.get("SMTP_USER", ""))
+    p = st.text_input("Gmail 授权码", type="password", value=st.secrets.get("SMTP_PASS", ""))
+    smtp_info = {"host": "smtp.gmail.com", "port": 465, "user": u, "pass": p}
 
 role = st.sidebar.radio("当前角色", ["销售后台", "客户前端"])
 
-# --- 4. 邮件发送逻辑 ---
-def send_invite_email(to_email, order_id, ticker, price, lock_months, info):
-    jump_url = f"{BASE_URL}?order_id={order_id}"
-    body = f"项目预约确认：\n代码: {ticker}\n价格: {price}\n期限: {lock_months}月\n链接: {jump_url}"
-    try:
-        msg = MIMEText(body, 'plain', 'utf-8')
-        msg['Subject'] = Header(f"项目预约: {ticker}", 'utf-8').encode()
-        msg['From'] = info['user']
-        msg['To'] = to_email
-        with smtplib.SMTP_SSL(info['host'], info['port']) as server:
-            server.login(info['user'], info['pass'])
-            server.send_message(msg)
-        return True
-    except Exception as e:
-        st.error(f"邮件发送失败: {e}")
-        return False
-
-# --- 5. 获取 URL 参数 ---
+# 获取 URL 参数
 query_params = st.query_params
 url_oid = query_params.get("order_id")
 
-# --- 逻辑 A：客户前端 (自动识别单号，只需验邮箱) ---
+# --- 逻辑 A：客户前端 (点击链接进入) ---
 if url_oid:
-    st.title("👤 客户专属详情页")
+    st.title("👤 客户专属核验")
     st.info(f"正在核验单号: {url_oid}")
+    v_email = st.text_input("请输入预留邮箱验证身份")
     
-    v_email = st.text_input("请输入您的接收邮箱以核验身份")
-    
-    if st.button("核验并查看详情"):
-        df = pd.read_csv(CSV_FILE)
-        # 自动使用链接里的 url_oid 进行匹配
-        res = df[(df['order_id'] == url_oid) & (df['email'] == v_email)]
-        
+    if st.button("查看详情"):
+        df_db = pd.read_csv(CSV_FILE)
+        res = df_db[(df_db['order_id'] == url_oid) & (df_db['email'] == v_email)]
         if not res.empty:
-            st.success("验证成功！")
-            c1, c2, c3 = st.columns(3)
-            c1.metric("项目代码", res.iloc[0]['ticker'])
-            c2.metric("预约价格", res.iloc[0]['price'])
-            c3.metric("锁定期 (月)", res.iloc[0]['lock_months'])
+            st.success("验证成功")
+            st.table(res[['ticker', 'price', 'lock_months', 'status']])
         else:
-            st.error("验证失败：单号与邮箱不匹配。")
+            st.error("验证失败：单号与邮箱不匹配")
 
-# --- 逻辑 B：销售后台 ---
-elif role == "销售后台":
-    st.title("💼 销售管理管理后台")
-    
-    with st.form("send_form"):
+# --- 逻辑 B：手动查询 ---
+elif role == "客户前端":
+    st.title("👤 客户手动查询")
+    m_oid = st.text_input("订单号")
+    m_email = st.text_input("验证邮箱")
+    if st.button("查询记录"):
+        df_db = pd.read_csv(CSV_FILE)
+        res = df_db[(df_db['order_id'] == m_oid) & (df_db['email'] == m_email)]
+        if not res.empty:
+            st.table(res[['ticker', 'price', 'lock_months', 'status']])
+        else:
+            st.error("未找到记录")
+
+# --- 逻辑 C：销售后台 ---
+else:
+    st.title("💼 销售管理系统")
+    with st.container(border=True):
         st.subheader("发起新邀约")
         c1, c2 = st.columns(2)
-        ticker = c1.text_input("标的代码")
-        price = c1.number_input("价格", value=100.0)
-        email = c2.text_input("客户邮箱")
-        lock = c2.number_input("锁定期(月)", value=12)
-        
-        if st.form_submit_button("发送并标记为 Sent"):
-            if email and smtp_info["pass"]:
+        with c1:
+            ticker = st.text_input("标的代码", "EDE-PRO")
+            price = st.number_input("预约价格", value=100.0)
+        with c2:
+            target_email = st.text_input("客户邮箱")
+            lock = st.number_input("锁定期(月)", value=12)
+            
+        if st.button("确认发送", type="primary"):
+            if target_email and smtp_info["pass"]:
                 oid = str(uuid.uuid4())[:8]
-                if send_invite_email(email, oid, ticker, price, lock, smtp_info):
-                    new_row = pd.DataFrame([[oid, ticker, price, lock, 'Sent', email]], columns=df_init.columns)
-                    pd.concat([pd.read_csv(CSV_FILE), new_row]).to_csv(CSV_FILE, index=False)
+                jump_url = f"{BASE_URL}?order_id={oid}"
+                
+                # 邮件正文
+                body = f"预约确认：\n代码: {ticker}\n价格: {price}\n链接: {jump_url}"
+                
+                try:
+                    msg = MIMEText(body, 'plain', 'utf-8')
+                    msg['Subject'] = Header(f"预约确认 - {ticker}", 'utf-8').encode()
+                    msg['From'] = smtp_info['user']
+                    msg['To'] = target_email
+                    with smtplib.SMTP_SSL(smtp_info['host'], smtp_info['port']) as server:
+                        server.login(smtp_info['user'], smtp_info['pass'])
+                        server.send_message(msg)
+                    
+                    # 写入 CSV (使用全局 COLUMNS 变量)
+                    new_row = pd.DataFrame([[oid, ticker, price, lock, 'Sent', target_email]], columns=COLUMNS)
+                    df_all = pd.read_csv(CSV_FILE)
+                    pd.concat([df_all, new_row]).to_csv(CSV_FILE, index=False)
                     st.success(f"已发送！单号: {oid}")
-            else:
-                st.warning("请在侧边栏完善邮件配置")
+                except Exception as e:
+                    st.error(f"发信失败: {e}")
 
-    st.subheader("所有发行记录")
+    st.subheader("发行历史")
     st.dataframe(pd.read_csv(CSV_FILE).iloc[::-1], use_container_width=True)
