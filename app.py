@@ -6,175 +6,200 @@ from datetime import datetime
 import yfinance as yf
 
 # ==========================================
-# 1. 基础环境与数据初始化
+# 1. 基础环境与自愈初始化
 # ==========================================
 DATA_DIR = "data_vault"
 CONFIG_FILE = os.path.join(DATA_DIR, "pp_master_config.csv")
-SUBS_FILE = os.path.join(DATA_DIR, "subscriptions_v2.csv")
+SUBS_FILE = os.path.join(DATA_DIR, "subscriptions_v4.csv")
 CLIENT_MASTER = os.path.join(DATA_DIR, "client_master.csv")
+
+def format_curr(val):
+    """标准财务格式化"""
+    try:
+        return f"${float(val):,.2(f)}" if val else "$0.00"
+    except:
+        return str(val)
 
 def init_env():
     if not os.path.exists(DATA_DIR): os.makedirs(DATA_DIR)
-    
-    # 项目主表：增加 Total_Capacity(总额度) 字段
-    if not os.path.exists(CONFIG_FILE):
-        pd.DataFrame(columns=['ticker', 'company_name', 'share_price', 'issue_date', 'total_capacity', 'status']).to_csv(CONFIG_FILE, index=False)
-    
-    # 认购流水表
-    if not os.path.exists(SUBS_FILE):
-        pd.DataFrame(columns=['order_id', 'client_email', 'ticker', 'amount', 'entity_name', 'status']).to_csv(SUBS_FILE, index=False)
-        
-    # 客户 CRM 主表
-    if not os.path.exists(CLIENT_MASTER):
-        pd.DataFrame(columns=['email', 'name', 'kyc_status', 'kyc_expiry']).to_csv(CLIENT_MASTER, index=False)
+    # 定义最新列名，确保 lockup_months 和 total_capacity 存在
+    conf_cols = ['ticker', 'company_name', 'share_price', 'issue_date', 'total_capacity', 'lockup_months', 'status']
+    subs_cols = ['order_id', 'client_email', 'ticker', 'amount', 'entity_name', 'status']
+    client_cols = ['email', 'name', 'kyc_status', 'kyc_expiry']
+
+    for file, cols in zip([CONFIG_FILE, SUBS_FILE, CLIENT_MASTER], [conf_cols, subs_cols, client_cols]):
+        if not os.path.exists(file):
+            pd.DataFrame(columns=cols).to_csv(file, index=False)
+        else:
+            df = pd.read_csv(file)
+            # 自愈逻辑：补齐缺失列，防止 KeyError
+            missing = [c for c in cols if c not in df.columns]
+            if missing:
+                for m in missing: df[m] = 0 if 'capacity' in m or 'price' in m or 'lockup' in m else ""
+                df.to_csv(file, index=False)
 
 init_env()
 
 # ==========================================
-# 2. 核心逻辑：额度计算器
+# 2. 核心逻辑：数据统计与搜索
 # ==========================================
-def get_project_metrics(ticker):
-    df_subs = pd.read_csv(SUBS_FILE)
-    # 计算已占用额度 (包括已表达意向和已成交的)
-    reserved = df_subs[df_subs['ticker'] == ticker]['amount'].sum()
-    return reserved
+def get_reserved(ticker):
+    df = pd.read_csv(SUBS_FILE)
+    return df[(df['ticker'] == ticker) & (df['status'] != 'Invited')]['amount'].sum()
+
+def search_companies(query):
+    """Yahoo Finance 搜索并优先排序加拿大交易所"""
+    try:
+        results = yf.Search(query, max_results=10).quotes
+        sorted_results = []
+        # 优先级：.TO (TSX), .V (TSXV), CSE(通常无后缀或特殊后缀)
+        for r in results:
+            symbol = r.get('symbol', '')
+            score = 0
+            if symbol.endswith('.TO'): score = 3
+            elif symbol.endswith('.V'): score = 2
+            elif '.CN' in symbol or 'CSE' in r.get('exchDisp', ''): score = 1
+            sorted_results.append((score, r))
+        
+        # 按分数降序排列
+        sorted_results.sort(key=lambda x: x[0], reverse=True)
+        return [x[1] for x in sorted_results]
+    except:
+        return []
 
 # ==========================================
-# 3. 路由分发：Portal vs Admin
+# 3. UI 路由
 # ==========================================
 query_params = st.query_params
 
 if "oid" in query_params:
     # --------------------------------------
-    # 客户端门户 (Portal)
+    # 客户端门户 (Investor Portal)
     # --------------------------------------
     oid = query_params["oid"]
-    st.title("🌐 InvestFlow Investor Portal")
-    df_subs = pd.read_csv(SUBS_FILE)
-    sub_record = df_subs[df_subs['order_id'] == oid]
+    st.title("🌐 InvestFlow Portal")
+    df_s = pd.read_csv(SUBS_FILE)
+    sub = df_s[df_s['order_id'] == oid]
 
-    if sub_record.empty:
-        st.error("Invalid Link.")
+    if sub.empty:
+        st.error("Invalid link.")
     else:
-        ticker = sub_record.iloc[0]['ticker']
+        ticker = sub.iloc[0]['ticker']
         df_p = pd.read_csv(CONFIG_FILE)
-        p_info = df_p[df_p['ticker'] == ticker].iloc[0]
+        p = df_p[df_p['ticker'] == ticker].iloc[0]
         
-        # 检查项目是否已满或关闭
-        if p_info['status'] in ['Closed', 'Full']:
-            st.warning(f"Project {ticker} is currently {p_info['status']}. No new subscriptions accepted.")
+        if p['status'] in ['Closed', 'Full']:
+            st.warning("This placement is now closed.")
         else:
-            st.info(f"Project: {p_info['company_name']} ({ticker})")
-            with st.form("portal_form"):
-                amount = st.number_input("Subscription Amount (USD)", min_value=1000)
-                entity = st.text_input("Legal Entity Name")
-                if st.form_submit_button("Submit Interest"):
-                    df_subs.loc[df_subs['order_id'] == oid, ['amount', 'entity_name', 'status']] = [amount, entity, "Interested"]
-                    df_subs.to_csv(SUBS_FILE, index=False)
-                    st.success("Thank you! Our compliance team will contact you shortly.")
+            st.header(f"Subscription: {p['company_name']}")
+            st.markdown(f"**Ticker:** {ticker} | **Price:** {format_curr(p['share_price'])} | **Lock-up:** {p['lockup_months']} Months")
+            
+            with st.form("sub_form"):
+                amt = st.number_input("Amount (USD)", min_value=1000, step=1000)
+                ent = st.text_input("Legal Entity Name")
+                if st.form_submit_button("Confirm Interest"):
+                    df_s.loc[df_s['order_id'] == oid, ['amount', 'entity_name', 'status']] = [amt, ent, "Interested"]
+                    df_s.to_csv(SUBS_FILE, index=False)
+                    st.success("Interest logged successfully!")
 
 else:
     # --------------------------------------
-    # 销售管理后台 (Admin)
+    # 销售管理后台 (Sales Admin)
     # --------------------------------------
-    st.set_page_config(page_title="InvestFlow Admin v1.2", layout="wide")
-    st.sidebar.title("🏢 InvestFlow Admin")
+    st.set_page_config(page_title="InvestFlow Admin v1.4", layout="wide")
+    st.sidebar.title("💎 InvestFlow Admin")
     menu = st.sidebar.radio("Navigation", ["Project Manager", "Email Center", "CRM & Pipeline"])
 
-    # --- PROJECT MANAGER ---
     if menu == "Project Manager":
-        st.header("🚀 Project Initiation")
+        st.header("🚀 New Project Initiation")
         
-        with st.expander("Create New PP Project", expanded=True):
-            with st.form("add_pp"):
-                col1, col2 = st.columns(2)
-                with col1:
-                    t_in = st.text_input("Enter Ticker (e.g. EDE, TSLA)").upper()
-                    verify = st.form_submit_button("Verify with Yahoo Finance")
+        # 第一步：搜索公司
+        search_q = st.text_input("Search Company Name (TSX/TSXV/CSE Prioritized)", placeholder="e.g. Bank of Montreal")
+        
+        if search_q:
+            options = search_companies(search_q)
+            if options:
+                # 构造下拉显示： "Company Name (Ticker) - Exchange"
+                display_list = [f"{o.get('longname', 'N/A')} ({o.get('symbol')}) - {o.get('exchDisp')}" for o in options]
+                selected_idx = st.selectbox("Select matching entity:", range(len(display_list)), format_func=lambda x: display_list[x])
+                selected_item = options[selected_idx]
                 
-                # 智能抓取逻辑
-                comp_name = "Unknown Company"
-                est_price = 1.0
-                if t_in:
-                    try:
-                        s = yf.Ticker(t_in)
-                        comp_name = s.info.get('longName', 'Manual Entry Required')
-                        est_price = s.info.get('currentPrice', 1.0)
+                # 提取选中信息
+                st.divider()
+                st.subheader("Step 2: Set Terms")
+                with st.form("term_form"):
+                    c1, c2 = st.columns(2)
+                    final_ticker = c1.text_input("Ticker Symbol", value=selected_item.get('symbol'))
+                    final_name = c2.text_input("Company Name", value=selected_item.get('longname'))
+                    
+                    c3, c4, c5 = st.columns(3)
+                    # 获取参考价
+                    ref_price = 1.0
+                    try: ref_price = yf.Ticker(final_ticker).info.get('currentPrice', 1.0)
                     except: pass
+                    
+                    price = c3.number_input("Share Price (USD)", value=float(ref_price))
+                    cap = c4.number_input("Total Capacity (USD)", value=1000000)
+                    lock = c5.number_input("Lock-up (Months)", value=12)
+                    
+                    i_date = st.date_input("Issue Date")
+                    
+                    if st.form_submit_button("Launch Project"):
+                        df_p = pd.read_csv(CONFIG_FILE)
+                        new_row = pd.DataFrame([[final_ticker, final_name, price, i_date, cap, lock, 'Active']], columns=df_p.columns)
+                        pd.concat([df_p, new_row]).to_csv(CONFIG_FILE, index=False)
+                        st.success(f"Project {final_ticker} is now Active!")
+            else:
+                st.error("No matches found. Try a more specific name.")
 
-                with col2:
-                    c_name = st.text_input("Company Name", value=comp_name)
-                    capacity = st.number_input("Total Capacity (USD)", min_value=100000, value=1000000)
-                
-                p_price = st.number_input("Subscription Price", value=float(est_price))
-                i_date = st.date_input("Issue Date")
-                
-                if st.form_submit_button("Launch Project"):
-                    df_p = pd.read_csv(CONFIG_FILE)
-                    new_p = pd.DataFrame([[t_in, c_name, p_price, i_date, capacity, 'Active']], columns=df_p.columns)
-                    pd.concat([df_p, new_p]).to_csv(CONFIG_FILE, index=False)
-                    st.success(f"Project {t_in} Launched!")
-
-        st.subheader("Active Projects Monitoring")
+        # 项目列表监控
+        st.divider()
+        st.subheader("Current Placements")
         df_p = pd.read_csv(CONFIG_FILE)
-        for index, row in df_p.iterrows():
-            reserved = get_project_metrics(row['ticker'])
-            progress = min(reserved / row['total_capacity'], 1.0)
-            
+        for _, row in df_p.iterrows():
+            res = get_reserved(row['ticker'])
+            prog = min(res / row['total_capacity'], 1.0) if row['total_capacity'] > 0 else 0
             with st.container(border=True):
-                c1, c2, c3 = st.columns([2, 3, 1])
-                c1.metric(row['company_name'], f"${row['total_capacity']:,}")
-                c2.write(f"Fundraising Progress: ${reserved:,} / ${row['total_capacity']:,}")
-                c2.progress(progress)
+                col1, col2, col3 = st.columns([2, 4, 1])
+                col1.write(f"**{row['company_name']}**")
+                col1.caption(f"{row['ticker']} | Lockup: {row['lockup_months']}M")
                 
-                # 自动熔断逻辑显示
-                new_status = row['status']
-                if progress >= 1.0: new_status = "Full"
+                col2.write(f"Progress: {format_curr(res)} / {format_curr(row['total_capacity'])}")
+                col2.progress(prog)
                 
-                current_st = c3.selectbox("Status", ["Active", "Paused", "Closed", "Full"], index=["Active", "Paused", "Closed", "Full"].index(new_status), key=f"st_{row['ticker']}")
-                if current_st != row['status']:
-                    df_p.at[index, 'status'] = current_st
+                # 状态切换
+                st_list = ["Active", "Paused", "Closed", "Full"]
+                new_st = col3.selectbox("Status", st_list, index=st_list.index(row['status']), key=f"s_{row['ticker']}")
+                if new_st != row['status']:
+                    df_p.loc[df_p['ticker'] == row['ticker'], 'status'] = new_st
                     df_p.to_csv(CONFIG_FILE, index=False)
                     st.rerun()
 
-    # --- EMAIL CENTER ---
     elif menu == "Email Center":
-        st.header("✉️ Smart Email Distribution")
+        st.header("✉️ Smart Distribution")
         df_p = pd.read_csv(CONFIG_FILE)
-        target_p = st.selectbox("Select Project", df_p['ticker'].tolist())
-        
-        email_raw = st.text_area("Paste Emails (Comma or New Line separated)")
-        emails = [e.strip() for e in email_raw.replace('\n', ',').split(',') if '@' in e]
-        
-        if emails:
-            df_c = pd.read_csv(CLIENT_MASTER)
-            st.write(f"Identified {len(emails)} recipients.")
-            
-            with st.form("mail_content"):
-                subject = st.text_input("Subject", value=f"Investment Opportunity: {target_p}")
-                body = st.text_area("Body", value="Hello, \n\nPlease find the PPT attached. Use this link to subscribe: \n\n {{LINK}}", height=150)
-                file = st.file_uploader("Attach Project PPT")
-                
-                if st.form_submit_button("Generate & Send Invitations"):
-                    df_subs = pd.read_csv(SUBS_FILE)
-                    for e in emails:
-                        oid = str(uuid.uuid4())[:8]
-                        # 自动为新客户建档
-                        if e not in df_c['email'].values:
-                            new_c = pd.DataFrame([{'email': e, 'name': 'Investor', 'kyc_status': 'Missing'}])
-                            df_c = pd.concat([df_c, new_c])
-                        
-                        new_sub = pd.DataFrame([[oid, e, target_p, 0, "", "Invited"]], columns=df_subs.columns)
-                        df_subs = pd.concat([df_subs, new_sub])
-                    
-                    df_c.to_csv(CLIENT_MASTER, index=False)
-                    df_subs.to_csv(SUBS_FILE, index=False)
-                    st.success(f"Invitations created for {len(emails)} clients!")
+        if df_p.empty: st.warning("Create a project first.")
+        else:
+            sel_p = st.selectbox("Project", df_p['ticker'].tolist())
+            raw_e = st.text_area("Client Emails (comma separated)")
+            if st.button("Generate Invitations"):
+                emails = [e.strip() for e in raw_e.replace('\n', ',').split(',') if '@' in e]
+                df_subs = pd.read_csv(SUBS_FILE)
+                df_c = pd.read_csv(CLIENT_MASTER)
+                for e in emails:
+                    oid = str(uuid.uuid4())[:8]
+                    if e not in df_c['email'].values:
+                        new_c = pd.DataFrame([{'email': e, 'name': 'Investor', 'kyc_status': 'Missing'}])
+                        df_c = pd.concat([df_c, new_c])
+                    new_sub = pd.DataFrame([[oid, e, sel_p, 0, "", "Invited"]], columns=df_subs.columns)
+                    df_subs = pd.concat([df_subs, new_sub])
+                df_c.to_csv(CLIENT_MASTER, index=False)
+                df_subs.to_csv(SUBS_FILE, index=False)
+                st.success(f"Generated {len(emails)} unique links.")
 
-    # --- CRM & PIPELINE ---
     elif menu == "CRM & Pipeline":
-        tab1, tab2 = st.tabs(["👥 Client Master (CRM)", "📊 Subscription Pipeline"])
-        with tab1:
-            st.dataframe(pd.read_csv(CLIENT_MASTER), use_container_width=True)
-        with tab2:
-            st.dataframe(pd.read_csv(SUBS_FILE), use_container_width=True)
+        st.header("📊 Global Pipeline")
+        df_s = pd.read_csv(SUBS_FILE)
+        df_v = df_s.copy()
+        df_v['amount'] = df_v['amount'].apply(format_curr)
+        st.dataframe(df_v, use_container_width=True)
