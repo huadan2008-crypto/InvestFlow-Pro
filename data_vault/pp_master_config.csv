@@ -1,1 +1,1 @@
-ticker,share_price,issue_date,lockup_months,materials_link,status,company_name,total_capacity
+ticker,company_name,share_price,issue_date,total_capacity,lockup_months,status
