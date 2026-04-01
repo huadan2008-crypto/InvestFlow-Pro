@@ -1,0 +1,5 @@
+Client_ID,Name,Email,Household_ID,Tag,Tier,Phone,Status,Notes
+C00001,Jin Fang,fangjin_fangjin@yahoo.com,fang001,Value fund,Tier 1 (Anchor),4166710333,Active,
+C00002,Evelyn Fang,huadan2008@gmail.com,fang001,managed account,Tier 1 (Anchor),4166710222,Active,
+C00003,Rainyee Guo,rainyeeguo@gmail.com,fang003,value fund,Tier 1 (Anchor),4166709834,Active,
+C00004,Richard Guo,richardguo0906@gmail.com,guo001,others,Tier 2 (Public),6478900312,Active,

@@ -1,0 +1,8 @@
+client_id,household_id,name,email,tier,tag,entity_name
+C10001,fang family,Jin Fang,fangjin_fangjin@yahoo.com,Anchor,value fund,Jin Fang
+C10002,fang family,Rainyee Guo,rainyee.guo@gmail.com,Anchor,managed account,Rainyee Guo
+C10003,nan,Richard Guo,richardguo0906@gmail.com,Public,new client,Richard Guo
+C10004,nan,Anna Sun,anna.sun@edeasset.com,Anchor,insider,Anna Sun
+C10005,nan,Jianjun Dong,dongjianjun@gmail.com,Anchor,insider,JianJun Dong
+C10006,fang family,Qi Guo,qi.guo@edeasset.com,Anchor,insider,Qi Guo
+C10007,,Aaron Zhong,aaron.zhong@edeasset.com,Anchor,insider,Aaron Zhong
