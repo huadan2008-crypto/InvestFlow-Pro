@@ -1,3 +1,4 @@
-Project_ID,Project_Name,Company_Name,Ticker,Share_Price,Final_Cap,Open_Date,Close_Date,Soft_Deadline,Hard_Deadline,Target_Total_Cap,Negotiated_Final_Cap,Status,Deal_Type,Lot_Size,Preset_Options,Hold_Period_Months,Notes
-P0001,WML.NE_2026-03-31,wealth mineral,WML.NE,0.08,1000000.0,2026-04-01,2026-04-03,2026-04-01,2026-04-03,1000000.0,0.0,募集中 (Open),Hot Deal,1000,"12000,16000",4,
-P0002,NFLDF_2026-04-01,exploits discovery corp,NFLDF,0.075,1000000.0,2026-04-03,2026-04-06,2026-04-03,2026-04-06,1000000.0,0.0,募集中 (Open),Hot Deal,10000,"10500,15000",4,
+Project_ID,Project_Name,Company_Name,Ticker,Share_Price,Final_Cap,Open_Date,Close_Date,Soft_Deadline,Hard_Deadline,Target_Total_Cap,Negotiated_Final_Cap,Status,Deal_Type,Lot_Size,Preset_Options,preset_options,Hold_Period_Months,Notes,warrant_info,deadline_date
+P0001,WML.NE_2026-03-31,wealth mineral,WML.NE,0.1,1000000.0,2026-04-01,2026-04-03,2026-04-01,2026-04-03,1000000.0,0.0,募集中 (Open),Hot Deal,1000,"12000,16000,20000","12000,16000,20000",4,,,2026-04-03
+P0002,NFLDF_2026-04-03,exploits discovery corp,NFLDF,0.08,1000000.0,2026-04-03,2026-04-06,2026-04-03,2026-04-06,1000000.0,0.0,募集中 (Open),Hot Deal,10000,"10500,15000,20000","10500,15000,20000",4,nan,,2026-04-09
+P0003,ATHA.CN_2026-04-02,ATHENA,ATHA.CN,0.07,0.0,2026-04-07,2026-04-17,2026-04-07,2026-04-17,0.0,0.0,募集中 (Open),Soft Circle,1000,,,4,,,

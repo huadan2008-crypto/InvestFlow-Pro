@@ -37,8 +37,11 @@ PROJECT_COLUMNS = [
     "Deal_Type",
     "Lot_Size",
     "Preset_Options",
+    "preset_options",
     "Hold_Period_Months",
     "Notes",
+    "warrant_info",
+    "deadline_date",
 ]
 POOL_COLUMNS = [
     "Project_ID",
@@ -171,6 +174,18 @@ def _load_or_init_projects():
     df["Negotiated_Final_Cap"] = pd.to_numeric(df["Negotiated_Final_Cap"], errors="coerce").fillna(0.0)
     if "Hold_Period_Months" in df.columns:
         df["Hold_Period_Months"] = pd.to_numeric(df["Hold_Period_Months"], errors="coerce")
+    for col in ("preset_options", "warrant_info", "deadline_date"):
+        if col not in df.columns:
+            df[col] = ""
+    if "Preset_Options" in df.columns and "preset_options" in df.columns:
+        po = df["Preset_Options"].astype(str).replace("nan", "")
+        p2 = df["preset_options"].astype(str).replace("nan", "")
+        empty_m = p2.str.strip() == ""
+        df.loc[empty_m, "preset_options"] = po.loc[empty_m]
+        empty_p = po.str.strip() == ""
+        df.loc[empty_p, "Preset_Options"] = p2.loc[empty_p]
+    df["warrant_info"] = df["warrant_info"].fillna("").astype(str)
+    df["deadline_date"] = df["deadline_date"].fillna("").astype(str)
     return df[PROJECT_COLUMNS].copy()
 
 

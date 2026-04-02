@@ -44,3 +44,16 @@ www.edeasset.com
 
 (此处包含后面所有的 Confidentiality 声明...)
 """
+
+# 与 mail_templates.json 结构一致；`data/mail_templates.json` 损坏或丢失时由 Distribution 回退加载
+DEFAULT_MAIL_TEMPLATE = {
+    "active_template_id": "WML",
+    "templates": {
+        "WML": {
+            "name": "WML 默认定增",
+            "subject": COO_DISTRIBUTION_DEFAULT_SUBJECT,
+            "body": COO_DISTRIBUTION_EMAIL_BODY_TEMPLATE,
+            "content": COO_DISTRIBUTION_EMAIL_BODY_TEMPLATE,
+        }
+    },
+}

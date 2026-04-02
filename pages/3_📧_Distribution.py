@@ -4,6 +4,7 @@ InvestFlow — Distribution：完整模板分发（本页自包含）+ 通用 CO
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -15,6 +16,7 @@ import pandas as pd
 import streamlit as st
 
 from coo_mailer import _build_message, _send_smtp, _smtp_config_from_secrets, render_coo_mailer
+from utils.constants import COO_DISTRIBUTION_DEFAULT_SUBJECT, DEFAULT_MAIL_TEMPLATE
 
 st.set_page_config(page_title="Distribution", layout="wide", page_icon="📧")
 
@@ -36,6 +38,39 @@ def _read_projects_df() -> pd.DataFrame:
     return pd.DataFrame()
 
 
+def _project_id_column(df: pd.DataFrame) -> str:
+    for c in df.columns:
+        if str(c).strip().lower() == "project_id":
+            return str(c)
+    return "Project_ID"
+
+
+def _row_get(row: pd.Series, *names: str) -> Any:
+    """按给定列名（忽略大小写）取第一个有值的字段。"""
+    idx_lower = {str(i).strip().lower(): i for i in row.index}
+    for n in names:
+        key = n.strip().lower()
+        if key in idx_lower:
+            col = idx_lower[key]
+            v = row.get(col)
+            if v is None:
+                continue
+            if isinstance(v, float) and pd.isna(v):
+                continue
+            if isinstance(v, str) and not v.strip():
+                continue
+            return v
+    return None
+
+
+def _select_project_row(projects: pd.DataFrame, selected_id: str) -> pd.Series:
+    pid_col = _project_id_column(projects)
+    sub = projects[projects[pid_col].astype(str).str.strip() == str(selected_id).strip()]
+    if sub.empty:
+        raise KeyError(selected_id)
+    return sub.iloc[0]
+
+
 def _read_commitments_df() -> pd.DataFrame:
     for path in (_p(DATA_DIR, "commitments.csv"), _p(ROOT_DIR, "commitments.csv")):
         if os.path.isfile(path):
@@ -54,57 +89,8 @@ def _read_crm_df() -> pd.DataFrame:
     return pd.DataFrame()
 
 
-_WML_DEFAULT_SUBJECT = "[EDE/{{ticker}}] 定增材料与认购意向 — {{company_name}}"
-_WML_DEFAULT_BODY = r"""尊敬的投资人：
- 
-您好。{{ticker}}的Presentation请您参见附件。
- 
-{{ticker}} 定增价格${{price}}/股。{{warrant_info}}
- 
-{{ticker}} 定增每位投资人有认购额度可以选择：{{options_text}}。
- 
-如果您想参与此次定增，请点击下方专属链接提交您的认购意向：
-🔗 [点击此处提交认购意向]({{oid_link}})
-(如果您更习惯邮件回复，请尽快回复此邮件并提供姓名、额度和电话。)
- 
-因为名额有限，公司会安排我们懿德联动专户投资人和value fund 基金投资人优先参与。
- 
-另外，此次定增Close时间比较紧急，请您务必在{{deadline_text}}前回复您的订购额度。
- 
-如果您成功申请了此次定增，我们会发出确认邮件跟您单独联系，如果在2周内您没有收到任何确认邮件，基本表示此次认购已经额满，您没有获得相应的额度。鉴于工作量的巨大，没有获得相应额度的投资人我们一般不会另行通知，望见谅。
- 
-非常感谢您的信任以及参与，如果有任何问题，欢迎随时与我们联系！
- 
-谢谢
- 
-**注1：懿德公司的所有定向增发投资项目只针对accredited investor开放
-**注2：本文档中包含的信息由公司提供。EDE Asset Management Inc.不保证该信息仅对经认可的投资者是真实准确的，并且本文档中包含的信息不构成财务，投资建议，投资咨询或其他建议。敬请投资者注意风险，并谨慎决策。
-**Note: The information contained in this document is provided by the company and EDE Asset Management Inc. does not guarantee that the information is true and accurate for the information of accredited investors only, and the information contained in this document does not constitute financial, investment advice, investment consulting or other advice. Investors are kindly advised to take full care of risk and make prudent decisions
- 
-
-Aaron Zhong
-COO&CSO
-T: 416-238-2598 | C: 416-577-6530
-E: aaron.zhong@edeasset.com
-
-www.edeasset.com
-8 King Street East, Suite 610, Toronto, ON M5C 1B5
-
-(此处包含后面所有的 Confidentiality 声明...)
-"""
-
-
 def _default_mail_templates_payload() -> Dict[str, Any]:
-    return {
-        "active_template_id": "WML",
-        "templates": {
-            "WML": {
-                "name": "WML 默认定增",
-                "subject": _WML_DEFAULT_SUBJECT,
-                "body": _WML_DEFAULT_BODY,
-            }
-        },
-    }
+    return copy.deepcopy(DEFAULT_MAIL_TEMPLATE)
 
 
 def _load_mail_templates() -> Dict[str, Any]:
@@ -114,9 +100,14 @@ def _load_mail_templates() -> Dict[str, Any]:
         with open(MAIL_TEMPLATES_JSON, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
         return payload
-    with open(MAIL_TEMPLATES_JSON, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    if not data.get("templates"):
+    try:
+        with open(MAIL_TEMPLATES_JSON, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        payload = _default_mail_templates_payload()
+        _save_mail_templates(payload)
+        return payload
+    if not isinstance(data, dict) or not data.get("templates"):
         data = _default_mail_templates_payload()
         _save_mail_templates(data)
     return data
@@ -155,7 +146,8 @@ def _format_options_text(row: pd.Series) -> str:
             break
 
     if not nums:
-        for part in str(row.get("Preset_Options") or "").split(","):
+        raw_po = _row_get(row, "preset_options", "Preset_Options")
+        for part in str(raw_po or "").split(","):
             p = part.strip().replace(",", "")
             if not p:
                 continue
@@ -178,7 +170,7 @@ def _format_options_text(row: pd.Series) -> str:
         else:
             amt = f"${n:,.2f}"
         parts.append(f"{lab} {amt}")
-    return "，".join(parts)
+    return ", ".join(parts)
 
 
 _EN_MONTH = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
@@ -206,7 +198,7 @@ def _format_deadline_text(d: date, ref: date) -> str:
 
 
 def _price_token(row: pd.Series) -> str:
-    sp = pd.to_numeric(row.get("Share_Price"), errors="coerce")
+    sp = pd.to_numeric(_row_get(row, "share_price", "Share_Price"), errors="coerce")
     if pd.isna(sp):
         return "—"
     v = float(sp)
@@ -217,10 +209,29 @@ def _price_token(row: pd.Series) -> str:
 
 
 def _company_name_row(row: pd.Series) -> str:
-    c = str(row.get("Company_Name", "") or "").strip()
+    v = _row_get(row, "company_name", "Company_Name")
+    c = str(v or "").strip()
     if c:
         return c
-    return str(row.get("Project_Name", "") or "").strip() or "—"
+    return str(_row_get(row, "project_name", "Project_Name") or "").strip() or "—"
+
+
+def _warrant_info_row(row: pd.Series) -> str:
+    v = _row_get(row, "warrant_info", "Warrant_Info")
+    return str(v or "").strip()
+
+
+def _project_deadline_date(row: pd.Series) -> date:
+    """与 Project Hub 一致：优先 `deadline_date`，否则 Hard/Close（仅作兜底）。"""
+    for key in ("deadline_date", "Deadline_Date", "Hard_Deadline", "Close_Date"):
+        v = _row_get(row, key.lower(), key)
+        if v is None:
+            continue
+        try:
+            return pd.to_datetime(v).date()
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return date.today()
 
 
 def _oid_map(project_id: str, commits: pd.DataFrame) -> Dict[str, str]:
@@ -283,6 +294,11 @@ def _apply_placeholders_keep_unknown(text: str, ctx: Dict[str, str]) -> str:
     return re.sub(r"\{\{([a-zA-Z0-9_]+)\}\}", repl, text or "")
 
 
+def _dist_mark_template_changed() -> None:
+    """仅在用户操作「选择邮件模板」时触发，避免切换项目等无关重跑误从磁盘覆盖原件。"""
+    st.session_state["_dist_reload_tpl_from_disk"] = True
+
+
 def _new_template_id_from_display_name(name: str, existing: set) -> str:
     raw = str(name or "").strip()
     if not raw:
@@ -298,9 +314,44 @@ def _new_template_id_from_display_name(name: str, existing: set) -> str:
     return f"{base}_{n}"
 
 
+def _init_email_session_from_template() -> None:
+    """首次进入页面：从 mail_templates.json 当前活动模板注入 email_body / email_subj。"""
+    p = _load_mail_templates()
+    tpls: Dict[str, Any] = dict(p.get("templates") or {})
+    tid = str(p.get("active_template_id") or "").strip()
+    if not tid or tid not in tpls:
+        tid = sorted(tpls.keys())[0] if tpls else ""
+    t0 = tpls.get(tid) if tid else {}
+    body = _template_body(t0) if t0 else ""
+    if not body.strip():
+        body = str(
+            (DEFAULT_MAIL_TEMPLATE.get("templates") or {})
+            .get("WML", {})
+            .get("body", "")
+            or ""
+        )
+    st.session_state["email_body"] = body
+    subj = str(t0.get("subject", "") if t0 else "").strip() or COO_DISTRIBUTION_DEFAULT_SUBJECT
+    st.session_state["email_subj"] = subj
+
+
 def render_distribution_tab_full() -> None:
     st.subheader("COO 完整模板分发")
     st.caption("模板：`data/mail_templates.json` · 项目/客户：只读 CSV（`data/` 或根目录）。")
+
+    if "email_body" not in st.session_state:
+        if st.session_state.get("dist_tpl_skeleton"):
+            st.session_state["email_body"] = str(st.session_state.get("dist_tpl_skeleton", ""))
+        elif st.session_state.get("dist_master_body"):
+            st.session_state["email_body"] = str(st.session_state.get("dist_master_body", ""))
+        else:
+            _init_email_session_from_template()
+    if "email_subj" not in st.session_state:
+        st.session_state["email_subj"] = (
+            str(st.session_state.get("dist_master_subj", "")).strip()
+            or str(st.session_state.get("dist_tpl_subj_edit", "")).strip()
+            or COO_DISTRIBUTION_DEFAULT_SUBJECT
+        )
 
     projects = _read_projects_df()
     commits = _read_commitments_df()
@@ -308,22 +359,32 @@ def render_distribution_tab_full() -> None:
     cfg = _smtp_config_from_secrets()
     base_u = _base_url()
 
-    if projects.empty or "Project_ID" not in projects.columns:
+    pid_col = _project_id_column(projects)
+    if projects.empty or pid_col not in projects.columns:
         st.warning("未找到 projects.csv（可放在 `data/projects.csv` 或项目根目录）。")
         return
 
-    pids = projects["Project_ID"].astype(str).tolist()
+    pids = projects[pid_col].astype(str).tolist()
     pid = st.selectbox("选择项目", pids, key="dist_proj_pick")
-    row = projects[projects["Project_ID"].astype(str) == str(pid)].iloc[0]
+    try:
+        row = _select_project_row(projects, str(pid))
+    except KeyError:
+        st.error("未找到所选项目行。")
+        return
 
-    ticker = str(row.get("Ticker", "") or "").strip() or "—"
+    tk = _row_get(row, "ticker", "Ticker")
+    ticker = str(tk or "").strip() or "—"
     company_name = _company_name_row(row)
     price_tok = _price_token(row)
     options_text = _format_options_text(row)
+    warrant_txt = _warrant_info_row(row)
 
     today = date.today()
-    deadline_d = st.date_input("截止日期（用于 {{deadline_text}}）", value=today, key="dist_deadline_d")
+    deadline_d = _project_deadline_date(row)
     deadline_text = _format_deadline_text(deadline_d, today)
+    st.caption(
+        f"**{{{{deadline_text}}}}** 已由 Project Hub 的 **`deadline_date`**（缺省时用 Hard/Close）自动计算为：**{deadline_text}**"
+    )
 
     oid_m = _oid_map(str(pid), commits)
     oid_preview = "（发送时为每位收件人自动生成专属链接）"
@@ -338,10 +399,8 @@ def render_distribution_tab_full() -> None:
         "price": price_tok,
         "options_text": options_text,
         "deadline_text": deadline_text,
-        "warrant_info": "",
+        "warrant_info": warrant_txt,
     }
-    ctx_preview: Dict[str, str] = {**ctx_base, "oid_link": oid_preview}
-
     payload = _load_mail_templates()
     templates: Dict[str, Any] = dict(payload.get("templates") or {})
     tpl_ids = sorted(templates.keys())
@@ -355,7 +414,10 @@ def render_distribution_tab_full() -> None:
     if default_pick not in tpl_ids:
         default_pick = tpl_ids[0]
 
-    st.caption("切换「选择邮件模板」时会从磁盘重新读取 `data/mail_templates.json` 并填充下方编辑器（未保存的切换前修改会丢失）。")
+    st.caption(
+        "仅当您在「选择邮件模板」中**切换模板**时，才会从磁盘重新读取 `data/mail_templates.json` 并覆盖下方原件；"
+        "切换项目不会清空未保存的模板编辑。"
+    )
 
     tpl_sel = st.selectbox(
         "选择邮件模板",
@@ -363,51 +425,71 @@ def render_distribution_tab_full() -> None:
         index=tpl_ids.index(default_pick),
         format_func=lambda tid: str(templates.get(tid, {}).get("name", tid)),
         key="dist_mail_tpl_select",
+        on_change=_dist_mark_template_changed,
     )
 
-    if st.session_state.get("_dist_loaded_for_tpl") != tpl_sel:
+    need_tpl_disk = bool(st.session_state.pop("_dist_reload_tpl_from_disk", False)) or not st.session_state.get(
+        "_dist_tpl_bootstrapped", False
+    )
+    if need_tpl_disk:
         payload = _load_mail_templates()
         templates = dict(payload.get("templates") or {})
         tpl_ids = sorted(templates.keys())
         if tpl_sel in templates:
             t0 = templates[tpl_sel]
-            st.session_state["dist_tpl_skeleton"] = _template_body(t0)
+            st.session_state["email_body"] = _template_body(t0)
             st.session_state["dist_tpl_name_edit"] = str(t0.get("name", tpl_sel))
             subj0 = str(t0.get("subject", "") or "").strip()
-            st.session_state["dist_tpl_subj_edit"] = subj0 if subj0 else _WML_DEFAULT_SUBJECT
-        st.session_state["_dist_loaded_for_tpl"] = tpl_sel
+            st.session_state["dist_tpl_subj_edit"] = subj0 if subj0 else COO_DISTRIBUTION_DEFAULT_SUBJECT
+            st.session_state["email_subj"] = st.session_state["dist_tpl_subj_edit"]
+        st.session_state["_dist_tpl_bootstrapped"] = True
 
     st.text_input("模板显示名称", key="dist_tpl_name_edit")
     st.text_input("默认主题（支持 {{ticker}} {{company_name}} 等）", key="dist_tpl_subj_edit")
 
     st.markdown("**变量工具箱**")
-    st.caption(
-        "浏览器端无法获取光标位置，点击后在**模板原件**文末追加占位符，可在文本框内剪切到任意位置。"
+    st.radio(
+        "变量插入位置（Streamlit 无法读取真实光标，可选文首 / 文末）",
+        ["文末", "文首"],
+        horizontal=True,
+        key="dist_var_ins_pos",
     )
-    vcols = st.columns(5)
-    var_tokens = [
-        ("{{ticker}}", "dist_v_ticker"),
-        ("{{price}}", "dist_v_price"),
-        ("{{options_text}}", "dist_v_opt"),
-        ("{{deadline_text}}", "dist_v_dead"),
-        ("{{oid_link}}", "dist_v_oid"),
-    ]
-    for vc, (tok, bid) in zip(vcols, var_tokens):
-        with vc:
-            if st.button(tok, key=bid):
-                cur = str(st.session_state.get("dist_tpl_skeleton", ""))
-                st.session_state["dist_tpl_skeleton"] = cur + tok
-                st.rerun()
+    st.caption("点击下方按钮将占位符插入 **邮件正文**（`email_body`）；可在下方编辑框内再剪切到任意位置。")
 
-    st.text_area("编辑模板原件（content / 骨架）", height=320, key="dist_tpl_skeleton")
+    def _insert_tpl_token(tok: str) -> None:
+        cur = str(st.session_state.get("email_body", ""))
+        if st.session_state.get("dist_var_ins_pos") == "文首":
+            st.session_state["email_body"] = tok + cur
+        else:
+            st.session_state["email_body"] = cur + tok
+
+    row1 = st.columns(3)
+    row2 = st.columns(4)
+    var_btns = [
+        (row1, 0, "[Ticker]", "{{ticker}}", "dist_v_ticker"),
+        (row1, 1, "[Price]", "{{price}}", "dist_v_price"),
+        (row1, 2, "[Company]", "{{company_name}}", "dist_v_co"),
+        (row2, 0, "[Options]", "{{options_text}}", "dist_v_opt"),
+        (row2, 1, "[Deadline]", "{{deadline_text}}", "dist_v_dead"),
+        (row2, 2, "[Warrant]", "{{warrant_info}}", "dist_v_warr"),
+        (row2, 3, "[OID]", "{{oid_link}}", "dist_v_oid"),
+    ]
+    for r, i, label, tok, bid in var_btns:
+        with r[i]:
+            if st.button(label, key=bid, help=tok):
+                _insert_tpl_token(tok)
+                st.rerun()
 
     if st.button("保存修改到原件", key="dist_save_tpl_to_disk"):
         payload = _load_mail_templates()
         templates_w = dict(payload.get("templates") or {})
+        subj_save = str(
+            st.session_state.get("email_subj") or st.session_state.get("dist_tpl_subj_edit", "")
+        ).strip()
         templates_w[tpl_sel] = _template_record_for_save(
             str(st.session_state.get("dist_tpl_name_edit", "")),
-            str(st.session_state.get("dist_tpl_subj_edit", "")),
-            str(st.session_state.get("dist_tpl_skeleton", "")),
+            subj_save,
+            str(st.session_state.get("email_body", "")),
         )
         payload["templates"] = templates_w
         payload["active_template_id"] = tpl_sel
@@ -423,63 +505,37 @@ def render_distribution_tab_full() -> None:
         else:
             payload = _load_mail_templates()
             templates_w = dict(payload.get("templates") or {})
-            nid = _new_template_id_from_name(nn, set(templates_w.keys()))
+            nid = _new_template_id_from_display_name(nn, set(templates_w.keys()))
             if not nid:
                 st.error("无法生成模板 ID。")
             else:
-                templates_w[nid] = _template_record_for_save(
-                    nn,
-                    str(st.session_state.get("dist_tpl_subj_edit", "")),
-                    str(st.session_state.get("dist_tpl_skeleton", "")),
-                )
+                subj_n = str(
+                    st.session_state.get("email_subj") or st.session_state.get("dist_tpl_subj_edit", "")
+                ).strip()
+                templates_w[nid] = _template_record_for_save(nn, subj_n, str(st.session_state.get("email_body", "")))
                 payload["templates"] = templates_w
                 payload["active_template_id"] = nid
                 _save_mail_templates(payload)
-                st.session_state["_dist_loaded_for_tpl"] = None
                 st.session_state["dist_mail_tpl_select"] = nid
                 st.success(f"已新建模板「{nn}」（ID: `{nid}`）")
                 st.rerun()
 
     if st.button("✨ 立即填充变量", key="dist_fill_vars_btn"):
-        sk = str(st.session_state.get("dist_tpl_skeleton", ""))
-        st.session_state["dist_var_preview"] = _apply_placeholders_keep_unknown(sk, ctx_preview)
-        subj_src = str(st.session_state.get("dist_tpl_subj_edit", ""))
-        st.session_state["dist_var_preview_subj"] = _apply_placeholders_keep_unknown(subj_src, ctx_preview)
-        st.session_state["dist_preview_ver"] = int(st.session_state.get("dist_preview_ver", 0)) + 1
+        sk = str(st.session_state.get("email_body", ""))
+        st.session_state["email_body"] = _apply_placeholders_keep_unknown(sk, ctx_base)
+        sj = str(st.session_state.get("email_subj", "") or st.session_state.get("dist_tpl_subj_edit", ""))
+        st.session_state["email_subj"] = _apply_placeholders_keep_unknown(sj, ctx_base).strip()
         st.rerun()
 
-    if "dist_var_preview" in st.session_state:
-        pv = str(st.session_state.get("dist_var_preview", ""))
-        pvk = int(st.session_state.get("dist_preview_ver", 0))
-        st.subheader("变量填充预览")
-        st.text_area(
-            "预览正文（只读）",
-            value=pv,
-            height=280,
-            disabled=True,
-            key=f"dist_preview_body_ro_{pvk}",
-        )
-        pvs = str(st.session_state.get("dist_var_preview_subj", ""))
-        st.text_input("预览主题（只读）", value=pvs, disabled=True, key=f"dist_preview_subj_ro_{pvk}")
-        if st.button("将预览写入发送正文与主题", key="dist_apply_preview_to_master"):
-            sk2 = str(st.session_state.get("dist_tpl_skeleton", ""))
-            sj2 = str(st.session_state.get("dist_tpl_subj_edit", ""))
-            st.session_state["dist_master_body"] = _apply_placeholders_keep_unknown(sk2, ctx_base)
-            st.session_state["dist_master_subj"] = _apply_placeholders_keep_unknown(sj2, ctx_base).strip()
-            st.rerun()
-        st.info(
-            "预览中的 `{{oid_link}}` 会显示为示例链接；写入发送正文时**保留** `{{oid_link}}` 占位符，"
-            "以便批量发送时按收件人注入专属链接。"
-        )
+    st.text_area("邮件预览与编辑", height=500, key="email_body")
 
-    st.subheader("主编辑器（发送用全文）")
+    st.subheader("发送主题")
+    st.caption("与上方「默认主题」联动；也可直接改。批量发送以本框与 **邮件预览与编辑** 为准。")
+    st.text_input("主题", key="email_subj")
+
     st.caption(
-        "建议先使用「✨ 立即填充变量」生成预览，再点「将预览写入发送正文与主题」，或在此直接编辑。"
-        "「批量发送」以本区 **主题** 与 **正文** 的实时内容为准；"
-        "`{{oid_link}}` 在发送时仍按每位收件人替换为专属链接。"
+        "`{{oid_link}}` 在批量发送时按每位收件人替换；`{{warrant_info}}` 使用项目表中的 warrant_info。"
     )
-    st.text_input("主题", key="dist_master_subj")
-    st.text_area("正文（Master · 发送正文）", height=520, key="dist_master_body")
 
     st.subheader("收件人")
     use_crm = st.checkbox("从 CRM 勾选", value=True, key="dist_use_crm")
@@ -535,8 +591,8 @@ def render_distribution_tab_full() -> None:
         if not uniq:
             st.error("请选择至少一位收件人。")
             return
-        body_live = str(st.session_state.get("dist_master_body", ""))
-        subj_live = str(st.session_state.get("dist_master_subj", "")).strip()
+        body_live = str(st.session_state.get("email_body", ""))
+        subj_live = str(st.session_state.get("email_subj", "")).strip()
         if not subj_live:
             st.error("主题不能为空。")
             return
@@ -547,11 +603,14 @@ def render_distribution_tab_full() -> None:
 
         from_addr = cfg["from_email"]
         ok, errs = 0, []
+        warrant_body = warrant_txt
         for email, _n, cid in uniq:
             try:
                 oid = oid_m.get(str(cid).strip(), "") if cid else ""
                 url = _oid_url(base_u, oid) if oid else "（您的专属 OID 尚未生成，请联系 COO。）"
-                body_one = body_live.replace("{{oid_link}}", url).replace("{{warrant_info}}", "")
+                body_one = (
+                    body_live.replace("{{oid_link}}", url).replace("{{warrant_info}}", warrant_body)
+                )
                 msg = _build_message(from_addr, [email], subj_live, body_one, attachments=att or None)
                 _send_smtp(cfg, from_addr, [email], msg)
                 ok += 1
