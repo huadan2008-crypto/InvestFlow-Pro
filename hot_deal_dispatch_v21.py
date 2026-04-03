@@ -16,15 +16,23 @@ import os
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import streamlit as st
 
-from investflow_data import COMMITMENTS_CSV
+from investflow_data import COMMITMENTS_CSV, resolved_commitments_csv_path
+from utils.allocations_io import latest_allocation_map_for_project
+from utils.oid_feedback_io import (
+    RESPONSE_CONFIRMATION,
+    RESPONSE_INTENT,
+    append_oid_feedback_row,
+    client_has_confirmed_allocation,
+)
 
-COMMITMENTS_FILE = COMMITMENTS_CSV
+def _commitments_csv_path() -> str:
+    return resolved_commitments_csv_path()
 
 # Dispatch statuses (as required)
 DISPATCH_DRAFT = "Draft"
@@ -175,9 +183,11 @@ def _app_module():
 
 
 def _load_commitments() -> pd.DataFrame:
-    if not os.path.exists(COMMITMENTS_FILE):
-        pd.DataFrame(columns=COMMITMENT_COLUMNS).to_csv(COMMITMENTS_FILE, index=False)
-    df = pd.read_csv(COMMITMENTS_FILE)
+    path = _commitments_csv_path()
+    if not os.path.exists(path):
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        pd.DataFrame(columns=COMMITMENT_COLUMNS).to_csv(path, index=False)
+    df = pd.read_csv(path)
 
     string_cols = {"Project_ID", "client_id", "Name_Household", "Tier", "Deal_Type", "OID", "Dispatch_Status", "OID_Expiry_At"}
     for col in COMMITMENT_COLUMNS:
@@ -215,7 +225,7 @@ def _save_commitments(df: pd.DataFrame) -> None:
     if "Dispatch_Status" in out.columns:
         out.loc[out["Dispatch_Status"].astype(str).str.strip() == "", "Dispatch_Status"] = DISPATCH_DRAFT
 
-    out[COMMITMENT_COLUMNS].to_csv(COMMITMENTS_FILE, index=False)
+    out[COMMITMENT_COLUMNS].to_csv(_commitments_csv_path(), index=False)
 
 
 def _load_rules() -> pd.DataFrame:
@@ -287,6 +297,25 @@ def _get_query_param(name: str) -> Optional[str]:
         return None
 
 
+def resolve_oid_for_project_client(project_id: str, client_id: str) -> Optional[str]:
+    """由 project_id + client_id 在 commitments 中解析 OID（供 Investment Portal 深链使用）。"""
+    cid = str(client_id or "").strip()
+    pid = str(project_id or "").strip()
+    if not cid or not pid:
+        return None
+    df = _load_commitments()
+    if df.empty or "Project_ID" not in df.columns or "client_id" not in df.columns:
+        return None
+    sub = df[
+        (df["Project_ID"].astype(str).str.strip() == pid)
+        & (df["client_id"].astype(str).str.strip() == cid)
+    ]
+    if sub.empty:
+        return None
+    oid = str(sub.iloc[0].get("OID", "")).strip()
+    return oid or None
+
+
 def _hash_oid(project_id: str, client_id: str, salt: str) -> str:
     raw = f"{project_id}|{client_id}|{salt}".encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
@@ -309,6 +338,45 @@ def _style_alignment(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _portal_deadline_as_date(prj: pd.Series) -> Optional[date]:
+    idx_lower = {str(i).strip().lower(): i for i in prj.index}
+    for name in ("deadline_date", "hard_deadline", "close_date"):
+        col = idx_lower.get(name)
+        if not col:
+            continue
+        v = prj.get(col)
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            continue
+        if isinstance(v, str) and not str(v).strip():
+            continue
+        try:
+            return pd.to_datetime(v).date()
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return None
+
+
+def _portal_preset_amounts(prj: pd.Series) -> List[float]:
+    idx_lower = {str(i).strip().lower(): i for i in prj.index}
+    raw = None
+    pc = idx_lower.get("preset_options")
+    if pc is not None:
+        raw = prj.get(pc)
+    nums: List[float] = []
+    for part in str(raw or "").split(","):
+        p = part.strip().replace(",", "")
+        if not p:
+            continue
+        v = pd.to_numeric(p, errors="coerce")
+        if pd.notna(v):
+            nums.append(float(v))
+    if not nums:
+        ls = pd.to_numeric(prj.get("Lot_Size"), errors="coerce")
+        if pd.notna(ls) and float(ls) > 0:
+            nums = [float(ls)]
+    return sorted(set(nums))
+
+
 def _show_client_view(oid: str) -> None:
     commits = _load_commitments()
     row = commits[commits["OID"].astype(str) == str(oid)]
@@ -318,12 +386,14 @@ def _show_client_view(oid: str) -> None:
 
     idx = row.index[0]
     r = row.iloc[0]
-    project_id = str(r["Project_ID"])
-    client_id = str(r["client_id"])
+    project_id = str(r["Project_ID"]).strip()
+    client_id = str(r["client_id"]).strip()
 
     dispatch_status = str(r.get("Dispatch_Status", DISPATCH_SENT)).strip() or DISPATCH_SENT
     amount = float(r.get("Final_Allocation", 0.0) or 0.0)
     share_price = float(r.get("Share_Price", 0.0) or 0.0)
+    if share_price <= 0:
+        share_price = 1e-12
     expiry_raw = str(r.get("OID_Expiry_At", "")).strip()
 
     now = datetime.now()
@@ -336,21 +406,66 @@ def _show_client_view(oid: str) -> None:
         except Exception:
             expired = False
 
-    # Auto-transition Sent -> Expired if needed
     if expired and dispatch_status == DISPATCH_SENT:
         commits.at[idx, "Dispatch_Status"] = DISPATCH_EXPIRED
         _save_commitments(commits)
         dispatch_status = DISPATCH_EXPIRED
 
-    st.title("Client Confirmation (Mock)")
-    st.caption(f"Project: {project_id} | Client: {client_id}")
+    app = _app_module()
+    projects = app._load_or_init_projects()
+    prj = None
+    if not projects.empty and "Project_ID" in projects.columns:
+        subp = projects[projects["Project_ID"].astype(str).str.strip() == project_id]
+        if not subp.empty:
+            prj = subp.iloc[0]
 
-    st.success(f"您已获得 ${amount:,.2f} 的认购额度")
+    st.title("Investment Portal")
+    st.caption(f"项目：**{project_id}** · 客户：**{client_id}**")
+
+    if prj is not None:
+        ddl = _portal_deadline_as_date(prj)
+        if ddl is not None and date.today() > ddl:
+            st.warning("该项目认购已截止，如有疑问请联系客户经理。")
+            return
+
     if expiry_dt is not None:
-        st.caption(f"OID 过期时间: {expiry_dt.isoformat(sep=' ', timespec='seconds')}")
+        st.caption(f"链接有效至：{expiry_dt.isoformat(sep=' ', timespec='seconds')}")
+
+    alloc_map = latest_allocation_map_for_project(project_id)
+    reserved_csv = alloc_map.get(client_id)
+    if reserved_csv is not None and not pd.isna(reserved_csv) and float(reserved_csv) > 0:
+        reserved = float(reserved_csv)
+        if dispatch_status == DISPATCH_EXPIRED:
+            st.error("该链接已过期，无法确认配额。")
+            return
+        if dispatch_status == DISPATCH_REDUCED:
+            st.info("您已申请减额并完成更新。当前状态为 Reduced。")
+            return
+        if client_has_confirmed_allocation(project_id, client_id) or dispatch_status == DISPATCH_CONFIRMED:
+            st.success("您已确认此配额。")
+            return
+
+        st.markdown(f"## 为您预留的认购金额：**${reserved:,.0f}**")
+        st.caption("该额度由管理人锁定；请点击下方按钮确认接受。")
+        if st.button("✅ 确认接受此配额"):
+            append_oid_feedback_row(
+                project_id=project_id,
+                client_id=client_id,
+                feedback_amount=reserved,
+                response_type=RESPONSE_CONFIRMATION,
+                oid=str(oid),
+            )
+            commits.at[idx, "Dispatch_Status"] = DISPATCH_CONFIRMED
+            commits.at[idx, "Final_Allocation"] = reserved
+            sh = _compute_shares(reserved, share_price)
+            commits.at[idx, "Final_Shares"] = int(round(sh))
+            _save_commitments(commits)
+            st.success("已确认。感谢您的回复，后台已记录。")
+            st.stop()
+        return
 
     if dispatch_status == DISPATCH_EXPIRED:
-        st.error("该链接已过期，无法确认/减额。")
+        st.error("该链接已过期，无法继续操作。")
         return
 
     if dispatch_status == DISPATCH_CONFIRMED:
@@ -361,49 +476,80 @@ def _show_client_view(oid: str) -> None:
         st.info("您已申请减额并完成更新。当前状态为 Reduced。")
         return
 
-    # dispatch_status == Sent
-    reduced_default = amount
-    reduced_amount = st.number_input(
-        "申请减额至（Reduced Amount）",
-        min_value=0.0,
-        value=float(reduced_default),
-        step=max(0.01, amount * 0.01) if amount > 0 else 0.01,
-        format="%.2f",
-    )
+    if amount > 0 and dispatch_status in (DISPATCH_SENT, DISPATCH_DRAFT):
+        st.success(f"您已获得 **${amount:,.2f}** 的认购额度（Hot Deal OID）")
+        reduced_default = amount
+        reduced_amount = st.number_input(
+            "申请减额至（Reduced Amount）",
+            min_value=0.0,
+            value=float(reduced_default),
+            step=max(0.01, amount * 0.01) if amount > 0 else 0.01,
+            format="%.2f",
+        )
 
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("按此金额确认"):
-            commits.at[idx, "Dispatch_Status"] = DISPATCH_CONFIRMED
-            # Ensure shares match the allocation
-            shares = _compute_shares(amount, share_price)
-            commits.at[idx, "Final_Shares"] = int(round(shares))
-            _save_commitments(commits)
-            st.success("已确认。后台已收到更新。")
-            st.stop()
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("按此金额确认", key="portal_legacy_confirm"):
+                commits.at[idx, "Dispatch_Status"] = DISPATCH_CONFIRMED
+                shares = _compute_shares(amount, share_price)
+                commits.at[idx, "Final_Shares"] = int(round(shares))
+                append_oid_feedback_row(
+                    project_id=project_id,
+                    client_id=client_id,
+                    feedback_amount=amount,
+                    response_type=RESPONSE_CONFIRMATION,
+                    oid=str(oid),
+                )
+                _save_commitments(commits)
+                st.success("已确认。后台已收到更新。")
+                st.stop()
 
-    with col2:
-        if st.button("提交减额申请"):
-            ra = pd.to_numeric(reduced_amount, errors="coerce")
-            reduced_amount = 0.0 if pd.isna(ra) else float(ra)
-            if reduced_amount <= 0:
-                st.error("减额金额必须大于 0。")
-                return
-            if reduced_amount > amount + 1e-9:
-                st.error("减额金额不能大于当前额度。")
-                return
+        with col2:
+            if st.button("提交减额申请", key="portal_legacy_reduce"):
+                ra = pd.to_numeric(reduced_amount, errors="coerce")
+                reduced_amount_f = 0.0 if pd.isna(ra) else float(ra)
+                if reduced_amount_f <= 0:
+                    st.error("减额金额必须大于 0。")
+                    return
+                if reduced_amount_f > amount + 1e-9:
+                    st.error("减额金额不能大于当前额度。")
+                    return
 
-            shares = _compute_shares(reduced_amount, share_price)
-            if not _is_integer_shares(shares, tol=1e-6):
-                st.error("减额后股数必须为整数。请调整减额金额。")
-                return
+                shares = _compute_shares(reduced_amount_f, share_price)
+                if not _is_integer_shares(shares, tol=1e-6):
+                    st.error("减额后股数必须为整数。请调整减额金额。")
+                    return
 
-            commits.at[idx, "Final_Allocation"] = reduced_amount
-            commits.at[idx, "Final_Shares"] = int(round(shares))
-            commits.at[idx, "Dispatch_Status"] = DISPATCH_REDUCED
-            _save_commitments(commits)
-            st.success("已更新 Reduced。后台已收到更新。")
-            st.stop()
+                commits.at[idx, "Final_Allocation"] = reduced_amount_f
+                commits.at[idx, "Final_Shares"] = int(round(shares))
+                commits.at[idx, "Dispatch_Status"] = DISPATCH_REDUCED
+                _save_commitments(commits)
+                st.success("已更新 Reduced。后台已收到更新。")
+                st.stop()
+        return
+
+    # Soft Circle：无 allocations.csv 锁定额度且无 OID 分配金额时，收集意向档位
+    st.subheader("认购意向")
+    if prj is None:
+        st.error("未找到项目信息，无法展示档位。")
+        return
+    preset_vals = _portal_preset_amounts(prj)
+    if not preset_vals:
+        st.info("本项目暂无可选认购档位，请联系客户经理。")
+        return
+    fmt_opts = [f"${x:,.0f}" for x in preset_vals]
+    sel_label = st.radio("请选择意向认购金额（档位）", fmt_opts, key="portal_soft_circle_amt")
+    picked_amt = preset_vals[fmt_opts.index(sel_label)]
+    if st.button("📤 提交认购意向"):
+        append_oid_feedback_row(
+            project_id=project_id,
+            client_id=client_id,
+            feedback_amount=float(picked_amt),
+            response_type=RESPONSE_INTENT,
+            oid=str(oid),
+        )
+        st.success("已提交认购意向，感谢您的参与。")
+        st.stop()
 
 
 def render_hot_deal_dispatch_v21() -> None:

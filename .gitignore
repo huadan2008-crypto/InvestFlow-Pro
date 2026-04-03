@@ -1,0 +1,8 @@
+# Streamlit secrets — never commit
+.streamlit/secrets.toml
+
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/

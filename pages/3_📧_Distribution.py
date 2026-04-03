@@ -15,7 +15,13 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 import streamlit as st
 
-from coo_mailer import _build_message, _send_smtp, _smtp_config_from_secrets, render_coo_mailer
+from coo_mailer import (
+    plain_text_to_html_email,
+    render_coo_mailer,
+    resolve_mail_transport_config,
+    send_email,
+)
+from utils.mail_dispatch_log import append_mail_dispatch_record
 from utils.allocations_io import latest_allocation_map_for_project
 from utils.constants import COO_DISTRIBUTION_DEFAULT_SUBJECT, DEFAULT_MAIL_TEMPLATE
 
@@ -281,12 +287,49 @@ def _oid_url(base: str, oid: str) -> str:
     return f"?oid={oid_q}"
 
 
-def _base_url() -> str:
+def _portal_base_url() -> str:
+    """
+    门户根地址：优先 secrets / 环境变量；否则用当前请求的 Host（Streamlit Cloud）；
+    本地默认 http://localhost:8501。
+    """
     try:
         inv = st.secrets.get("investflow", {}) or {}
-        return str(inv.get("base_url", "")).strip().rstrip("/")
+        for k in ("portal_base_url", "base_url", "public_url"):
+            u = str(inv.get(k, "") or "").strip().rstrip("/")
+            if u:
+                return u
     except Exception:
-        return ""
+        pass
+    for env_k in ("PORTAL_BASE_URL", "INVESTFLOW_BASE_URL"):
+        v = os.environ.get(env_k, "").strip().rstrip("/")
+        if v:
+            return v
+    try:
+        ctx = getattr(st, "context", None)
+        headers = getattr(ctx, "headers", None) if ctx is not None else None
+        if isinstance(headers, dict):
+            host = (headers.get("Host") or headers.get("host") or "").strip()
+            proto = (
+                (headers.get("X-Forwarded-Proto") or headers.get("x-forwarded-proto") or "https")
+                .split(",")[0]
+                .strip()
+            )
+            if host:
+                return f"{proto}://{host}".rstrip("/")
+    except Exception:
+        pass
+    return "http://localhost:8501"
+
+
+def _investment_portal_link(base: str, project_id: str, client_id: str) -> str:
+    """正式/测试邮件中的 {{oid_link}}：Investment Portal 深链。"""
+    b = (base or "").strip().rstrip("/") or "http://localhost:8501"
+    cid = str(client_id or "").strip()
+    pid = str(project_id or "").strip()
+    if not cid:
+        return "（未绑定 client_id，无法生成专属门户链接。）"
+    q = urllib.parse.urlencode({"project_id": pid, "client_id": cid})
+    return f"{b}/Investment_Portal?{q}"
 
 
 def _unresolved_vars(text: str) -> List[str]:
@@ -352,6 +395,25 @@ def _personalize_distribution_body(
     b = str(body_live or "")
     b = b.replace("{{oid_link}}", oid_url).replace("{{warrant_info}}", warrant_body)
     return b.replace("{{allocated_amount}}", allocated_display)
+
+
+def _seal_recipient_tokens(
+    subject: str,
+    body: str,
+    *,
+    oid_link: str,
+    allocated_display: str,
+    warrant_body: str,
+) -> Tuple[str, str]:
+    """合并 warrant/额度/链接 后，再次扫尾替换 {{oid_link}}、{{allocated_amount}}（含主题行）。"""
+    subj = str(subject or "")
+    body_f = _personalize_distribution_body(
+        body, oid_url=oid_link, warrant_body=warrant_body, allocated_display=allocated_display
+    )
+    for _ in range(2):
+        subj = subj.replace("{{oid_link}}", oid_link).replace("{{allocated_amount}}", allocated_display)
+        body_f = body_f.replace("{{oid_link}}", oid_link).replace("{{allocated_amount}}", allocated_display)
+    return subj, body_f
 
 
 def _append_manual_allocations(rows: List[Dict[str, Any]]) -> None:
@@ -425,8 +487,8 @@ def render_distribution_tab_full() -> None:
     projects = _read_projects_df()
     commits = _read_commitments_df()
     crm = _read_crm_df()
-    cfg = _smtp_config_from_secrets()
-    base_u = _base_url()
+    cfg = resolve_mail_transport_config()
+    portal_base = _portal_base_url()
 
     pid_col = _project_id_column(projects)
     if projects.empty or pid_col not in projects.columns:
@@ -456,11 +518,11 @@ def render_distribution_tab_full() -> None:
     )
 
     oid_m = _oid_map(str(pid), commits)
-    oid_preview = "（发送时为每位收件人自动生成专属链接）"
-    if base_u and oid_m:
-        first_oid = next(iter(oid_m.values()), "")
-        if first_oid:
-            oid_preview = _oid_url(base_u, first_oid)
+    oid_preview = "（发送时为每位收件人自动生成 Investment Portal 链接）"
+    if oid_m:
+        first_cid = next(iter(oid_m.keys()), "")
+        if first_cid:
+            oid_preview = _investment_portal_link(portal_base, str(pid), first_cid)
 
     min_sub_amt = _min_subscription_amount(row)
     locked_alloc_map: Dict[str, float] = latest_allocation_map_for_project(str(pid))
@@ -473,6 +535,8 @@ def render_distribution_tab_full() -> None:
         "warrant_info": warrant_txt,
         "allocated_amount": _allocated_placeholder_soft_circle(),
     }
+    # 群发/测试发送时 {{allocated_amount}} 按人替换，不能用 ctx_base 里的软文案提前写死
+    ctx_mail_static = {k: v for k, v in ctx_base.items() if k != "allocated_amount"}
     payload = _load_mail_templates()
     templates: Dict[str, Any] = dict(payload.get("templates") or {})
     tpl_ids = sorted(templates.keys())
@@ -622,7 +686,8 @@ def render_distribution_tab_full() -> None:
     st.text_input("主题", key="email_subj")
 
     st.caption(
-        "`{{oid_link}}` 在批量发送时按每位收件人替换；`{{warrant_info}}` 使用项目表中的 warrant_info；"
+        "`{{oid_link}}` 在发送时替换为 **Investment Portal** 链接（`…/Investment_Portal?project_id=&client_id=`）；"
+        "`{{warrant_info}}` 使用项目表中的 warrant_info；"
         "`{{allocated_amount}}` 在 **确认分配模式** 下按表格逐人替换，在 **意向收集模式** 下替换为软文案（无固定数字）。"
     )
     st.caption(
@@ -723,8 +788,11 @@ def render_distribution_tab_full() -> None:
         st.caption(f"将发送 **{len(uniq)}** 位收件人")
     if hot_alloc_mode and uniq:
         fe0, _fn0, fc0, fa0 = uniq[0]
-        oid0 = oid_m.get(str(fc0).strip(), "") if fc0 else ""
-        url0 = _oid_url(base_u, oid0) if oid0 else "（您的专属 OID 尚未生成，请联系 COO。）"
+        url0 = (
+            _investment_portal_link(portal_base, str(pid), str(fc0).strip())
+            if fc0
+            else "（未绑定 client_id，无法生成门户链接。）"
+        )
         amt0 = fa0 if fa0 is not None else (float(min_sub_amt) if min_sub_amt > 0 else 0.0)
         disp0 = _format_allocated_currency(amt0)
         with st.expander("查看首位收件人预览（Hot Deal 下每人额度不同，此处仅展示列表第一位）", expanded=False):
@@ -747,84 +815,193 @@ def render_distribution_tab_full() -> None:
     if pdf is not None:
         att.append((pdf.name, pdf.getvalue(), str(getattr(pdf, "type", None) or "application/pdf")))
 
-    if st.button("🚀 正式开始群发", type="primary", key="dist_send_bulk"):
-        if not cfg or not cfg.get("host"):
-            st.error("未配置 SMTP secrets。")
-            return
-        if not uniq:
-            st.error("请选择至少一位收件人。")
-            return
-        body_live = str(st.session_state.get("email_body", ""))
-        subj_live = str(st.session_state.get("email_subj", "")).strip()
-        if not subj_live:
-            st.error("主题不能为空。")
-            return
-        bad = [
-            x
-            for x in _unresolved_vars(body_live)
-            if x not in ("oid_link", "warrant_info", "allocated_amount")
-        ]
-        if bad:
-            st.error("正文仍含未替换变量（请先处理）：" + ", ".join(bad))
-            return
+    st.subheader("发送")
+    st.caption(
+        "SMTP：优先 `secrets.toml` 的 `[smtp]`，否则使用 `[gmail]`（应用专用密码）。"
+        " 门户基址：`_portal_base_url()`（secrets `investflow.portal_base_url` / 环境变量 / 当前 Host）。"
+    )
 
-        from_addr = cfg["from_email"]
-        ok, errs = 0, []
-        warrant_body = warrant_txt
-        log_rows: List[Dict[str, Any]] = []
-        send_hot = str(st.session_state.get("dist_alloc_mode", _DIST_SOFT_LABEL)) == _DIST_HOT_LABEL
-        fallback_amt = float(min_sub_amt) if min_sub_amt > 0 else 0.0
-        soft_alloc_txt = _allocated_placeholder_soft_circle()
-        for email, _n, cid, row_alloc in uniq:
-            try:
-                oid = oid_m.get(str(cid).strip(), "") if cid else ""
-                url = _oid_url(base_u, oid) if oid else "（您的专属 OID 尚未生成，请联系 COO。）"
-                if send_hot:
-                    amt_f = float(row_alloc) if row_alloc is not None else fallback_amt
-                    alloc_disp = _format_allocated_currency(amt_f)
-                else:
-                    ck = str(cid).strip()
-                    if ck and ck in locked_alloc_map:
-                        alloc_disp = _format_allocated_currency(float(locked_alloc_map[ck]))
+    test_inbox = st.text_input(
+        "单封测试 · 收件邮箱",
+        value="",
+        key="dist_test_inbox",
+        placeholder="coo@company.com",
+    )
+    if st.button("📧 发送单封测试", key="dist_send_test"):
+        if not cfg or not cfg.get("host"):
+            st.error("未配置邮件：请在 `.streamlit/secrets.toml` 配置 `[smtp]` 或 `[gmail]`。")
+        elif not str(test_inbox).strip() or "@" not in str(test_inbox):
+            st.error("请输入有效的测试邮箱。")
+        else:
+            body_live = str(st.session_state.get("email_body", ""))
+            subj_live = str(st.session_state.get("email_subj", "")).strip()
+            if not subj_live:
+                st.error("主题不能为空。")
+            else:
+                send_hot = str(st.session_state.get("dist_alloc_mode", _DIST_SOFT_LABEL)) == _DIST_HOT_LABEL
+                fallback_amt = float(min_sub_amt) if min_sub_amt > 0 else 0.0
+                soft_alloc_txt = _allocated_placeholder_soft_circle()
+                demo_cid = ""
+                demo_link = oid_preview
+                demo_alloc_disp = _format_allocated_currency(10000.0)
+                if uniq:
+                    _e, _nm, demo_cid, fa_demo = uniq[0]
+                    if demo_cid:
+                        demo_link = _investment_portal_link(portal_base, str(pid), str(demo_cid).strip())
+                    if send_hot:
+                        demo_alloc_disp = _format_allocated_currency(
+                            float(fa_demo) if fa_demo is not None else fallback_amt
+                        )
                     else:
-                        alloc_disp = soft_alloc_txt
-                body_one = _personalize_distribution_body(
-                    body_live,
-                    oid_url=url,
-                    warrant_body=warrant_body,
-                    allocated_display=alloc_disp,
-                )
-                msg = _build_message(from_addr, [email], subj_live, body_one, attachments=att or None)
-                _send_smtp(cfg, from_addr, [email], msg)
-                ok += 1
-                if send_hot:
-                    log_rows.append(
-                        {
-                            "recorded_at": datetime.now(timezone.utc).isoformat(),
-                            "project_id": str(pid),
-                            "client_id": str(cid).strip(),
-                            "allocated_amount": float(row_alloc) if row_alloc is not None else fallback_amt,
-                            "allocation_source": "COO_hot_deal_mail",
-                            "email": str(email).strip(),
-                        }
+                        ck = str(demo_cid).strip()
+                        if ck and ck in locked_alloc_map:
+                            demo_alloc_disp = _format_allocated_currency(float(locked_alloc_map[ck]))
+                        else:
+                            demo_alloc_disp = soft_alloc_txt
+                elif oid_m:
+                    demo_cid = next(iter(oid_m.keys()), "")
+                    if demo_cid:
+                        demo_link = _investment_portal_link(portal_base, str(pid), demo_cid)
+                    demo_alloc_disp = (
+                        _format_allocated_currency(fallback_amt) if send_hot else soft_alloc_txt
                     )
-            except Exception as exc:
-                errs.append(f"{email}: {exc}")
-        if log_rows:
-            _append_manual_allocations(log_rows)
-        if ok:
-            st.success(f"已发送 {ok}/{len(uniq)} 封。")
-            if send_hot and log_rows:
-                st.caption(f"已将 {len(log_rows)} 条手工额度写入 `{MANUAL_ALLOCATIONS_CSV}`（供 Action Center 区分 COO 指定与投资人自报）。")
-        if errs:
-            st.error("\n".join(errs))
+                subj_demo = _apply_placeholders_keep_unknown(subj_live, ctx_mail_static)
+                body_demo = _apply_placeholders_keep_unknown(body_live, ctx_mail_static)
+                subj_demo, body_demo = _seal_recipient_tokens(
+                    subj_demo,
+                    body_demo,
+                    oid_link=demo_link,
+                    allocated_display=demo_alloc_disp,
+                    warrant_body=warrant_txt,
+                )
+                html_body = plain_text_to_html_email(body_demo)
+                try:
+                    send_email(
+                        cfg,
+                        cfg["from_email"],
+                        str(test_inbox).strip(),
+                        subj_demo,
+                        html_body,
+                        text_plain=body_demo,
+                        attachments=att or None,
+                    )
+                    st.success(f"测试邮件已发送至 {str(test_inbox).strip()}（演示数据：链接与额度见正文）。")
+                except Exception as exc:
+                    st.error(f"SMTP 发送失败：{exc}")
+
+    n_recipients = len(uniq)
+    st.warning(f"确定要向 **{n_recipients}** 位客户发送正式认购通知吗？")
+    bulk_ok = st.checkbox("我确认执行正式群发", key="dist_bulk_send_confirm")
+
+    if st.button("🚀 执行正式群发", type="primary", key="dist_send_bulk"):
+        if not bulk_ok:
+            st.error("请先勾选确认后再执行正式群发。")
+        elif not cfg or not cfg.get("host"):
+            st.error("未配置邮件：请在 `.streamlit/secrets.toml` 配置 `[smtp]` 或 `[gmail]`。")
+        elif not uniq:
+            st.error("请选择至少一位收件人。")
+        else:
+            body_live = str(st.session_state.get("email_body", ""))
+            subj_live = str(st.session_state.get("email_subj", "")).strip()
+            if not subj_live:
+                st.error("主题不能为空。")
+            else:
+                bad = [
+                    x
+                    for x in _unresolved_vars(body_live)
+                    if x not in ("oid_link", "warrant_info", "allocated_amount")
+                ]
+                if bad:
+                    st.error("正文仍含未替换变量（请先处理）：" + ", ".join(bad))
+                else:
+                    from_addr = cfg["from_email"]
+                    ok, errs = 0, []
+                    warrant_body = warrant_txt
+                    log_rows: List[Dict[str, Any]] = []
+                    send_hot = str(st.session_state.get("dist_alloc_mode", _DIST_SOFT_LABEL)) == _DIST_HOT_LABEL
+                    fallback_amt = float(min_sub_amt) if min_sub_amt > 0 else 0.0
+                    soft_alloc_txt = _allocated_placeholder_soft_circle()
+                    prog = st.progress(0)
+                    total = len(uniq)
+                    status_slot = st.empty()
+                    for i, (email, _n, cid, row_alloc) in enumerate(uniq):
+                        status_slot.caption(f"发送进度：{i + 1} / {total}")
+                        prog.progress(min(1.0, (i + 1) / max(total, 1)))
+                        try:
+                            portal_link = (
+                                _investment_portal_link(portal_base, str(pid), str(cid).strip())
+                                if cid
+                                else "（未绑定 client_id，无法生成专属门户链接。）"
+                            )
+                            if send_hot:
+                                amt_f = float(row_alloc) if row_alloc is not None else fallback_amt
+                                alloc_disp = _format_allocated_currency(amt_f)
+                            else:
+                                ck = str(cid).strip()
+                                if ck and ck in locked_alloc_map:
+                                    alloc_disp = _format_allocated_currency(float(locked_alloc_map[ck]))
+                                else:
+                                    alloc_disp = soft_alloc_txt
+                            subj_ctx = _apply_placeholders_keep_unknown(subj_live, ctx_mail_static)
+                            body_ctx = _apply_placeholders_keep_unknown(body_live, ctx_mail_static)
+                            subj_one, body_one = _seal_recipient_tokens(
+                                subj_ctx,
+                                body_ctx,
+                                oid_link=portal_link,
+                                allocated_display=alloc_disp,
+                                warrant_body=warrant_body,
+                            )
+                            html_one = plain_text_to_html_email(body_one)
+                            send_email(
+                                cfg,
+                                from_addr,
+                                email,
+                                subj_one,
+                                html_one,
+                                text_plain=body_one,
+                                attachments=att or None,
+                            )
+                            ok += 1
+                            if str(cid).strip():
+                                append_mail_dispatch_record(
+                                    str(pid),
+                                    str(cid).strip(),
+                                    str(email).strip(),
+                                )
+                            if send_hot:
+                                log_rows.append(
+                                    {
+                                        "recorded_at": datetime.now(timezone.utc).isoformat(),
+                                        "project_id": str(pid),
+                                        "client_id": str(cid).strip(),
+                                        "allocated_amount": float(row_alloc)
+                                        if row_alloc is not None
+                                        else fallback_amt,
+                                        "allocation_source": "COO_hot_deal_mail",
+                                        "email": str(email).strip(),
+                                    }
+                                )
+                        except Exception as exc:
+                            errs.append(f"{email}: {exc}")
+                    prog.progress(1.0)
+                    status_slot.caption("发送完成。")
+                    if log_rows:
+                        _append_manual_allocations(log_rows)
+                    if ok:
+                        st.success(f"已发送 {ok}/{len(uniq)} 封；Action Center 已对成功客户记录「Already Sent」。")
+                        if send_hot and log_rows:
+                            st.caption(
+                                f"已将 {len(log_rows)} 条手工额度写入 `{MANUAL_ALLOCATIONS_CSV}`（供 Action Center 区分 COO 指定与投资人自报）。"
+                            )
+                    if errs:
+                        st.error("部分失败：\n" + "\n".join(errs))
 
     with st.expander("说明"):
         st.markdown(
-            f"- OID 基础 URL：`{base_u or '（未配置 investflow.base_url）'}`\n"
+            f"- 门户基址（用于生成链接）：`{portal_base}`（可在 `investflow.portal_base_url` 或环境变量 `PORTAL_BASE_URL` 覆盖）\n"
             "- `{{warrant_info}}` 等未在自动注入列表中的占位符，请在主编辑器中手动填写或删除。\n"
             f"- **Hot Deal** 群发成功后，COO 手工额度会追加到 `{MANUAL_ALLOCATIONS_CSV}`（含 `project_id`、`client_id`、`allocated_amount`、`allocation_source`）。\n"
-            "- **Action Center** 锁定的方案见 `data/allocations.csv`（`final_allocated_amount`），本页会预填并在邮件中替换 `{{allocated_amount}}`。"
+            "- **Action Center** 锁定的方案见 `data/allocations.csv`（`final_allocated_amount`），本页会预填并在邮件中替换 `{{allocated_amount}}`；正式群发成功会写入 `data/mail_dispatch_log.csv` 供「📧 已发送」列展示。"
         )
 
 

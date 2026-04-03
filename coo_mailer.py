@@ -11,9 +11,17 @@ password = "..."
 from_email = "coo@example.com"
 use_tls = true
 use_ssl = false
+
+或使用 Gmail（未配置 [smtp] 时回退）：
+
+[gmail]
+user = "you@gmail.com"
+password = "应用专用密码"
+from_email = "you@gmail.com"
 """
 from __future__ import annotations
 
+import html as html_module
 import smtplib
 import ssl
 from email.mime.application import MIMEApplication
@@ -81,6 +89,47 @@ def _smtp_config_from_secrets() -> Optional[Dict[str, Any]]:
         return None
 
 
+def _gmail_config_from_secrets() -> Optional[Dict[str, Any]]:
+    """Gmail SMTP：使用 [gmail] 段（应用专用密码）。"""
+    try:
+        g = st.secrets.get("gmail", None)
+        if g is None:
+            return None
+        user = str(g.get("user", "")).strip()
+        password = str(g.get("password", "")).strip()
+        if not user or not password:
+            return None
+        return {
+            "host": "smtp.gmail.com",
+            "port": 587,
+            "user": user,
+            "password": password,
+            "from_email": str(g.get("from_email", user)).strip(),
+            "use_tls": True,
+            "use_ssl": False,
+        }
+    except Exception:
+        return None
+
+
+def resolve_mail_transport_config() -> Optional[Dict[str, Any]]:
+    """优先 [smtp]；否则 [gmail]。"""
+    cfg = _smtp_config_from_secrets()
+    if cfg and cfg.get("host"):
+        return cfg
+    return _gmail_config_from_secrets()
+
+
+def plain_text_to_html_email(body: str) -> str:
+    """将纯文本正文转为简单 HTML（邮件客户端友好）。"""
+    esc = html_module.escape(body or "")
+    return (
+        "<!DOCTYPE html><html><head><meta charset='utf-8'></head>"
+        "<body style='font-family:system-ui,Segoe UI,sans-serif;font-size:15px;line-height:1.5;'>"
+        f"<div style='white-space:pre-wrap;'>{esc}</div></body></html>"
+    )
+
+
 def _apply_template(text: str, ctx: Dict[str, str]) -> str:
     out = text or ""
     for k, v in ctx.items():
@@ -139,6 +188,87 @@ def _build_message(
     return msg
 
 
+def build_mime_message_html(
+    from_addr: str,
+    to_addrs: List[str],
+    subject: str,
+    html_content: str,
+    *,
+    text_plain: Optional[str] = None,
+    cc: Optional[List[str]] = None,
+    bcc: Optional[List[str]] = None,
+    attachments: Optional[List[Tuple[str, bytes, str]]] = None,
+) -> MIMEMultipart:
+    """
+    multipart/alternative：纯文本 + HTML；外层 mixed 承载附件。
+    """
+    plain = text_plain if text_plain is not None else ""
+    if not plain.strip():
+        plain = body_plain_from_html(html_content)
+
+    msg_root = MIMEMultipart("mixed")
+    msg_root["Subject"] = subject
+    msg_root["From"] = from_addr
+    msg_root["To"] = ", ".join(to_addrs)
+    if cc:
+        msg_root["Cc"] = ", ".join(cc)
+
+    alt = MIMEMultipart("alternative")
+    alt.attach(MIMEText(plain, "plain", "utf-8"))
+    alt.attach(MIMEText(html_content, "html", "utf-8"))
+    msg_root.attach(alt)
+
+    for name, data, mime in attachments or []:
+        if not name or not data:
+            continue
+        maintype, subtype = ("application", "octet-stream")
+        if mime and "/" in mime:
+            parts = mime.split("/", 1)
+            maintype, subtype = parts[0], parts[1]
+        part = MIMEApplication(data, _subtype=subtype)
+        part.add_header("Content-Disposition", "attachment", filename=name)
+        msg_root.attach(part)
+
+    return msg_root
+
+
+def body_plain_from_html(html_content: str) -> str:
+    """极简 HTML → 纯文本回退（去标签）。"""
+    import re
+
+    t = re.sub(r"<[^>]+>", " ", html_content or "")
+    t = html_module.unescape(t)
+    return " ".join(t.split())
+
+
+def send_email(
+    cfg: Dict[str, Any],
+    from_addr: str,
+    recipient_email: str,
+    subject: str,
+    html_content: str,
+    *,
+    text_plain: Optional[str] = None,
+    attachments: Optional[List[Tuple[str, bytes, str]]] = None,
+    cc: Optional[List[str]] = None,
+    bcc: Optional[List[str]] = None,
+) -> None:
+    """
+    发送单封邮件：HTML + 可选纯文本 + 附件；SMTP 配置与 _send_smtp 相同。
+    """
+    msg = build_mime_message_html(
+        from_addr,
+        [recipient_email],
+        subject,
+        html_content,
+        text_plain=text_plain,
+        cc=cc,
+        bcc=bcc,
+        attachments=attachments,
+    )
+    _send_smtp(cfg, from_addr, [recipient_email], msg, cc=cc, bcc=bcc)
+
+
 def _send_smtp(
     cfg: Dict[str, Any],
     from_addr: str,
@@ -178,9 +308,9 @@ def _send_smtp(
 
 def render_coo_mailer() -> None:
     st.header("COO 邮件发送")
-    st.caption("标准模板或完全自定义；支持附件。SMTP 请在 `.streamlit/secrets.toml` 的 `[smtp]` 段配置。")
+    st.caption("标准模板或完全自定义；支持附件。邮件通道：优先 `[smtp]`，否则 `[gmail]`。")
 
-    cfg = _smtp_config_from_secrets()
+    cfg = resolve_mail_transport_config()
 
     col_a, col_b = st.columns(2)
     with col_a:
@@ -261,7 +391,7 @@ def render_coo_mailer() -> None:
                         st.error(f"发送失败: {exc}")
         else:
             st.warning(
-                "未检测到 `st.secrets['smtp']`。请在项目目录 `.streamlit/secrets.toml` 添加 `[smtp]` 段（host/port/user/password/from_email/use_tls）。"
+                "未检测到可用的 `[smtp]` 或 `[gmail]`。请在 `.streamlit/secrets.toml` 至少配置其一。"
             )
             st.code(
                 "[smtp]\n"
@@ -271,7 +401,11 @@ def render_coo_mailer() -> None:
                 'password = "..."\n'
                 'from_email = "you@example.com"\n'
                 "use_tls = true\n"
-                "use_ssl = false",
+                "use_ssl = false\n\n"
+                "[gmail]\n"
+                'user = "you@gmail.com"\n'
+                'password = "应用专用密码"\n'
+                'from_email = "you@gmail.com"\n',
                 language="toml",
             )
 
@@ -325,7 +459,7 @@ def render_coo_mailer() -> None:
     st.divider()
     if st.button("发送邮件", type="primary"):
         if not cfg or not cfg.get("host"):
-            st.error("请先配置 secrets 中的 [smtp]。")
+            st.error("请先配置 secrets 中的 [smtp] 或 [gmail]。")
             return
         if not to_union:
             st.error("请至少填写一个收件人，或从 CRM 勾选。")

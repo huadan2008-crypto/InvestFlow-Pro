@@ -13,13 +13,14 @@ import streamlit as st
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(ROOT_DIR, "data")
-OID_FEEDBACK_CSV = os.path.join(DATA_DIR, "oid_feedback.csv")
 
 from utils.allocations_io import (
     ALLOCATIONS_CSV,
     latest_allocation_map_for_project,
     save_allocations_replace_project,
 )
+from utils.mail_dispatch_log import clients_with_mail_already_sent
+from utils.oid_feedback_io import RESPONSE_INTENT, clients_with_portal_confirmation, read_oid_feedback_df
 
 
 def _p(*parts: str) -> str:
@@ -138,20 +139,8 @@ def _is_soft_circle_project(row: pd.Series) -> bool:
     return "soft" in dt
 
 
-def _read_oid_feedback_df() -> pd.DataFrame:
-    if not os.path.isfile(OID_FEEDBACK_CSV):
-        return pd.DataFrame(
-            columns=["project_id", "client_id", "feedback_amount", "submitted_at"]
-        )
-    try:
-        return pd.read_csv(OID_FEEDBACK_CSV)
-    except (OSError, UnicodeDecodeError, pd.errors.EmptyDataError):
-        return pd.DataFrame(
-            columns=["project_id", "client_id", "feedback_amount", "submitted_at"]
-        )
-
-
 def _feedback_map_for_project(pid: str, fb: pd.DataFrame) -> Dict[str, float]:
+    """Soft Circle 参考：仅统计 Portal 提交的意向（response_type 为空或 Intent），按 submitted_at 取最新。"""
     if fb.empty or "client_id" not in fb.columns:
         return {}
     pcol = None
@@ -161,8 +150,10 @@ def _feedback_map_for_project(pid: str, fb: pd.DataFrame) -> Dict[str, float]:
             break
     if pcol is None:
         return {}
-    sub = fb[fb[pcol].astype(str).str.strip() == str(pid).strip()]
-    out: Dict[str, float] = {}
+    sub = fb[fb[pcol].astype(str).str.strip() == str(pid).strip()].copy()
+    if "response_type" in sub.columns:
+        rt = sub["response_type"].fillna("").astype(str).str.strip().str.lower()
+        sub = sub[rt.isin(("", RESPONSE_INTENT.lower()))]
     amt_col = None
     for c in sub.columns:
         cl = str(c).strip().lower()
@@ -171,14 +162,20 @@ def _feedback_map_for_project(pid: str, fb: pd.DataFrame) -> Dict[str, float]:
             break
     if amt_col is None:
         return {}
+    ts_col = "submitted_at" if "submitted_at" in sub.columns else None
+    latest: Dict[str, tuple] = {}
     for _, r in sub.iterrows():
         cid = str(r.get("client_id", "")).strip()
         if not cid:
             continue
         v = pd.to_numeric(r.get(amt_col), errors="coerce")
-        if pd.notna(v):
-            out[cid] = float(v)
-    return out
+        if pd.isna(v):
+            continue
+        ts = str(r.get(ts_col, "")) if ts_col else ""
+        prev = latest.get(cid)
+        if prev is None or ts >= prev[1]:
+            latest[cid] = (float(v), ts)
+    return {k: v[0] for k, v in latest.items()}
 
 
 def _crm_tier_weight(tier: Any) -> Tuple[str, float]:
@@ -196,7 +193,7 @@ def _build_allocation_base_table(
     soft: bool,
 ) -> pd.DataFrame:
     min_amt = _min_subscription_amount(proj_row)
-    fb_map = _feedback_map_for_project(pid, _read_oid_feedback_df()) if soft else {}
+    fb_map = _feedback_map_for_project(pid, read_oid_feedback_df()) if soft else {}
 
     if not commits.empty and "Project_ID" in commits.columns and "client_id" in commits.columns:
         sub = commits[commits["Project_ID"].astype(str).str.strip() == str(pid).strip()].copy()
@@ -351,6 +348,30 @@ def render_allocations_decision_center() -> None:
     commits = _read_commitments_df()
     base = _build_allocation_base_table(str(pid), proj_row, crm, commits, soft)
     base = _merge_locked_into_table(base, str(pid))
+    portal_ok = clients_with_portal_confirmation(str(pid))
+    base["Portal状态"] = base["client_id"].astype(str).str.strip().map(
+        lambda c: "🟢 已确认" if c in portal_ok else "—"
+    )
+    mail_sent = clients_with_mail_already_sent(str(pid))
+    base["📧 已发送"] = base["client_id"].astype(str).str.strip().map(
+        lambda c: "Already Sent" if c in mail_sent else "—"
+    )
+    _col_order = [
+        c
+        for c in (
+            "client_id",
+            "Portal状态",
+            "📧 已发送",
+            "客户姓名",
+            "投资人类型",
+            "原始意向_参考额度",
+            "最终分配额度",
+            "Weighted_Score",
+            "备注",
+        )
+        if c in base.columns
+    ]
+    base = base[_col_order]
 
     ed_key = f"ac_alloc_editor_{pid}"
 
@@ -362,6 +383,8 @@ def render_allocations_decision_center() -> None:
         base,
         column_config={
             "client_id": st.column_config.TextColumn("client_id", disabled=True),
+            "Portal状态": st.column_config.TextColumn("Portal状态", disabled=True),
+            "📧 已发送": st.column_config.TextColumn("📧 已发送", disabled=True),
             "客户姓名": st.column_config.TextColumn("客户姓名", disabled=True),
             "投资人类型": st.column_config.TextColumn("投资人类型", disabled=True),
             "原始意向_参考额度": st.column_config.NumberColumn(
