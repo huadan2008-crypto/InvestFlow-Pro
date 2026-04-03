@@ -683,8 +683,12 @@ def render_project_lifecycle():
 
     st.subheader("状态操作")
     c1, c2 = st.columns(2)
-    selected_pid = c1.selectbox("选择项目", display["Project_ID"].tolist())
-    action = c2.selectbox("操作", ["Force Close", "Reopen as Active"])
+    selected_pid = c1.selectbox(
+        "选择项目", display["Project_ID"].tolist(), key="lifecycle_status_project_select"
+    )
+    action = c2.selectbox(
+        "操作", ["Force Close", "Reopen as Active"], key="lifecycle_status_action_select"
+    )
     if st.button("执行状态更新"):
         idx = projects.index[projects["Project_ID"].astype(str) == str(selected_pid)]
         if len(idx) > 0:
@@ -712,7 +716,11 @@ def render_dynamic_pool():
         st.info("请先在“项目周期”创建项目。")
         return
 
-    project_id = st.selectbox("选择项目", projects["Project_ID"].astype(str).tolist())
+    project_id = st.selectbox(
+        "选择项目",
+        projects["Project_ID"].astype(str).tolist(),
+        key="dynamic_pool_project_select",
+    )
     prj = projects[projects["Project_ID"].astype(str) == str(project_id)].iloc[0]
     final_cap = float(pd.to_numeric(pd.Series([prj["Final_Cap"]]), errors="coerce").fillna(0.0).iloc[0])
 

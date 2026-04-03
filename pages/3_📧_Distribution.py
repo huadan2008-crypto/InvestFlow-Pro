@@ -9,13 +9,14 @@ import json
 import os
 import re
 import urllib.parse
-from datetime import date
-from typing import Any, Dict, List, Tuple
+from datetime import date, datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
 
 from coo_mailer import _build_message, _send_smtp, _smtp_config_from_secrets, render_coo_mailer
+from utils.allocations_io import latest_allocation_map_for_project
 from utils.constants import COO_DISTRIBUTION_DEFAULT_SUBJECT, DEFAULT_MAIL_TEMPLATE
 
 st.set_page_config(page_title="Distribution", layout="wide", page_icon="📧")
@@ -25,6 +26,10 @@ _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(_THIS_DIR)
 DATA_DIR = os.path.join(ROOT_DIR, "data")
 MAIL_TEMPLATES_JSON = os.path.join(DATA_DIR, "mail_templates.json")
+MANUAL_ALLOCATIONS_CSV = os.path.join(DATA_DIR, "manual_allocations.csv")
+
+_DIST_SOFT_LABEL = "意向收集模式 (Soft Circle)"
+_DIST_HOT_LABEL = "确认分配模式 (Hot Deal)"
 
 
 def _p(*parts: str) -> str:
@@ -119,8 +124,8 @@ def _save_mail_templates(payload: Dict[str, Any]) -> None:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
-def _format_options_text(row: pd.Series) -> str:
-    """Preset_Options（逗号分隔）或 Min/Max 类列 →「最低 $12,000，其次 $16,000」。"""
+def _tier_numeric_values(row: pd.Series) -> List[float]:
+    """项目行 → 认购档位数值列表（升序，去重）。"""
     nums: List[float] = []
     min_max_pairs = [
         ("Option_Min", "Option_Max"),
@@ -158,9 +163,30 @@ def _format_options_text(row: pd.Series) -> str:
         ls = pd.to_numeric(row.get("Lot_Size"), errors="coerce")
         if pd.notna(ls) and float(ls) > 0:
             nums = [float(ls)]
+    return sorted(set(nums))
+
+
+def _min_subscription_amount(row: pd.Series) -> float:
+    """最低认购档位（金额）；无配置时 0。"""
+    nums = _tier_numeric_values(row)
+    return float(min(nums)) if nums else 0.0
+
+
+def _format_allocated_currency(v: float) -> str:
+    """正文用：$12,000 / $1,234.56"""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return "—"
+    x = float(v)
+    if abs(x - round(x)) < 1e-9:
+        return f"${int(round(x)):,}"
+    return f"${x:,.2f}"
+
+
+def _format_options_text(row: pd.Series) -> str:
+    """Preset_Options（逗号分隔）或 Min/Max 类列 →「最低 $12,000，其次 $16,000」。"""
+    nums = _tier_numeric_values(row)
     if not nums:
         return "（未配置认购档位）"
-    nums = sorted(set(nums))
     labels = ["最低", "其次", "再次", "第四档", "第五档", "第六档", "第七档", "第八档"]
     parts: List[str] = []
     for i, n in enumerate(nums):
@@ -294,6 +320,49 @@ def _apply_placeholders_keep_unknown(text: str, ctx: Dict[str, str]) -> str:
     return re.sub(r"\{\{([a-zA-Z0-9_]+)\}\}", repl, text or "")
 
 
+def _crm_editor_df_from_session(key: str) -> Optional[pd.DataFrame]:
+    raw = st.session_state.get(key)
+    return raw if isinstance(raw, pd.DataFrame) else None
+
+
+def _first_checked_allocated_amount(editor_key: str, min_default: float) -> float:
+    df = _crm_editor_df_from_session(editor_key)
+    if df is None or df.empty or "Allocated_Amount" not in df.columns:
+        return float(min_default)
+    for _, r in df.iterrows():
+        if not bool(r.get("_send")):
+            continue
+        v = pd.to_numeric(r.get("Allocated_Amount"), errors="coerce")
+        if pd.notna(v) and float(v) >= 0:
+            return float(v)
+    return float(min_default)
+
+
+def _allocated_placeholder_soft_circle() -> str:
+    return "（请通过文末专属链接填报意向额度）"
+
+
+def _personalize_distribution_body(
+    body_live: str,
+    *,
+    oid_url: str,
+    warrant_body: str,
+    allocated_display: str,
+) -> str:
+    b = str(body_live or "")
+    b = b.replace("{{oid_link}}", oid_url).replace("{{warrant_info}}", warrant_body)
+    return b.replace("{{allocated_amount}}", allocated_display)
+
+
+def _append_manual_allocations(rows: List[Dict[str, Any]]) -> None:
+    if not rows:
+        return
+    os.makedirs(DATA_DIR, exist_ok=True)
+    df = pd.DataFrame(rows)
+    exists = os.path.isfile(MANUAL_ALLOCATIONS_CSV)
+    df.to_csv(MANUAL_ALLOCATIONS_CSV, mode="a", header=not exists, index=False, encoding="utf-8")
+
+
 def _dist_mark_template_changed() -> None:
     """仅在用户操作「选择邮件模板」时触发，避免切换项目等无关重跑误从磁盘覆盖原件。"""
     st.session_state["_dist_reload_tpl_from_disk"] = True
@@ -393,6 +462,8 @@ def render_distribution_tab_full() -> None:
         if first_oid:
             oid_preview = _oid_url(base_u, first_oid)
 
+    min_sub_amt = _min_subscription_amount(row)
+    locked_alloc_map: Dict[str, float] = latest_allocation_map_for_project(str(pid))
     ctx_base: Dict[str, str] = {
         "ticker": ticker,
         "company_name": company_name,
@@ -400,6 +471,7 @@ def render_distribution_tab_full() -> None:
         "options_text": options_text,
         "deadline_text": deadline_text,
         "warrant_info": warrant_txt,
+        "allocated_amount": _allocated_placeholder_soft_circle(),
     }
     payload = _load_mail_templates()
     templates: Dict[str, Any] = dict(payload.get("templates") or {})
@@ -413,6 +485,12 @@ def render_distribution_tab_full() -> None:
     default_pick = str(payload.get("active_template_id") or tpl_ids[0])
     if default_pick not in tpl_ids:
         default_pick = tpl_ids[0]
+
+    # 「另存为新模板」不能在 selectbox 已渲染后改 dist_mail_tpl_select；下一轮在控件之前写入。
+    pend_tpl = st.session_state.pop("_dist_pending_tpl_select", None)
+    if pend_tpl is not None and pend_tpl in tpl_ids:
+        st.session_state["dist_mail_tpl_select"] = pend_tpl
+        st.session_state["_dist_reload_tpl_from_disk"] = True
 
     st.caption(
         "仅当您在「选择邮件模板」中**切换模板**时，才会从磁盘重新读取 `data/mail_templates.json` 并覆盖下方原件；"
@@ -465,6 +543,7 @@ def render_distribution_tab_full() -> None:
 
     row1 = st.columns(3)
     row2 = st.columns(4)
+    row3 = st.columns(2)
     var_btns = [
         (row1, 0, "[Ticker]", "{{ticker}}", "dist_v_ticker"),
         (row1, 1, "[Price]", "{{price}}", "dist_v_price"),
@@ -473,6 +552,7 @@ def render_distribution_tab_full() -> None:
         (row2, 1, "[Deadline]", "{{deadline_text}}", "dist_v_dead"),
         (row2, 2, "[Warrant]", "{{warrant_info}}", "dist_v_warr"),
         (row2, 3, "[OID]", "{{oid_link}}", "dist_v_oid"),
+        (row3, 0, "[Allocated]", "{{allocated_amount}}", "dist_v_alloc"),
     ]
     for r, i, label, tok, bid in var_btns:
         with r[i]:
@@ -516,15 +596,23 @@ def render_distribution_tab_full() -> None:
                 payload["templates"] = templates_w
                 payload["active_template_id"] = nid
                 _save_mail_templates(payload)
-                st.session_state["dist_mail_tpl_select"] = nid
+                st.session_state["_dist_pending_tpl_select"] = nid
                 st.success(f"已新建模板「{nn}」（ID: `{nid}`）")
                 st.rerun()
 
     if st.button("✨ 立即填充变量", key="dist_fill_vars_btn"):
+        alloc_mode_fill = str(st.session_state.get("dist_alloc_mode", _DIST_SOFT_LABEL))
+        fill_ctx = dict(ctx_base)
+        if alloc_mode_fill == _DIST_HOT_LABEL:
+            ed_key_hot = f"dist_crm_hot_{pid}"
+            fa = _first_checked_allocated_amount(ed_key_hot, min_sub_amt)
+            fill_ctx["allocated_amount"] = _format_allocated_currency(fa)
+        else:
+            fill_ctx["allocated_amount"] = _allocated_placeholder_soft_circle()
         sk = str(st.session_state.get("email_body", ""))
-        st.session_state["email_body"] = _apply_placeholders_keep_unknown(sk, ctx_base)
+        st.session_state["email_body"] = _apply_placeholders_keep_unknown(sk, fill_ctx)
         sj = str(st.session_state.get("email_subj", "") or st.session_state.get("dist_tpl_subj_edit", ""))
-        st.session_state["email_subj"] = _apply_placeholders_keep_unknown(sj, ctx_base).strip()
+        st.session_state["email_subj"] = _apply_placeholders_keep_unknown(sj, fill_ctx).strip()
         st.rerun()
 
     st.text_area("邮件预览与编辑", height=500, key="email_body")
@@ -534,14 +622,38 @@ def render_distribution_tab_full() -> None:
     st.text_input("主题", key="email_subj")
 
     st.caption(
-        "`{{oid_link}}` 在批量发送时按每位收件人替换；`{{warrant_info}}` 使用项目表中的 warrant_info。"
+        "`{{oid_link}}` 在批量发送时按每位收件人替换；`{{warrant_info}}` 使用项目表中的 warrant_info；"
+        "`{{allocated_amount}}` 在 **确认分配模式** 下按表格逐人替换，在 **意向收集模式** 下替换为软文案（无固定数字）。"
+    )
+    st.caption(
+        "Hot Deal 话术示例（可粘贴进正文）：「……经过公司初步确认，现为您预留的认购额度为 {{allocated_amount}}。」"
     )
 
     st.subheader("收件人")
+    if locked_alloc_map:
+        st.caption(
+            f"已从 **allocations.csv** 加载 **{len(locked_alloc_map)}** 条锁定额度：Hot Deal 下将预填 `Allocated_Amount`；"
+            "Soft Circle 下若正文含 `{{allocated_amount}}`，仍会对有锁定记录的客户填入具体金额。"
+        )
+    alloc_mode = st.radio(
+        "分配模式",
+        [_DIST_SOFT_LABEL, _DIST_HOT_LABEL],
+        key="dist_alloc_mode",
+        horizontal=True,
+        help="Soft Circle：邮件以 OID 链接收集意向，不设个人固定额度。Hot Deal：在表格中为每位客户填写 Allocated_Amount 并写入邮件。",
+    )
+    hot_alloc_mode = alloc_mode == _DIST_HOT_LABEL
+    deal_lbl = str(_row_get(row, "deal_type", "Deal_Type") or "").strip()
+    if hot_alloc_mode and deal_lbl and "hot" not in deal_lbl.lower():
+        st.info("当前项目 Deal_Type 不是 Hot Deal；若仍使用确认分配模式，请自行核对话术与合规。")
+
     use_crm = st.checkbox("从 CRM 勾选", value=True, key="dist_use_crm")
     manual = st.text_input("额外邮箱（逗号分隔）", "", key="dist_manual_emails")
 
-    recips: List[Tuple[str, str, str]] = []
+    ed_key_soft = f"dist_crm_soft_{pid}"
+    ed_key_hot = f"dist_crm_hot_{pid}"
+
+    recips: List[Tuple[str, str, str, Optional[float]]] = []
     if use_crm and not crm.empty and "email" in crm.columns:
         for c in ("client_id", "name", "email"):
             if c not in crm.columns:
@@ -550,26 +662,57 @@ def render_distribution_tab_full() -> None:
         view["email"] = view["email"].astype(str).str.strip()
         view = view[view["email"].str.contains("@", na=False)]
         view = view.assign(_send=False)
-        ed = st.data_editor(
-            view,
-            column_config={"_send": st.column_config.CheckboxColumn("发送", default=False)},
-            disabled=["client_id", "name", "email"],
-            hide_index=True,
-            use_container_width=True,
-            key="dist_crm_editor",
-        )
+        if hot_alloc_mode:
+            default_amt = float(min_sub_amt) if min_sub_amt and min_sub_amt > 0 else 0.0
+            view["Allocated_Amount"] = (
+                view["client_id"]
+                .astype(str)
+                .str.strip()
+                .map(lambda c: float(locked_alloc_map.get(c, default_amt)))
+            )
+            ed = st.data_editor(
+                view,
+                column_config={
+                    "_send": st.column_config.CheckboxColumn("发送", default=False),
+                    "Allocated_Amount": st.column_config.NumberColumn(
+                        "Allocated_Amount",
+                        help="COO 手工预留认购额度（默认=本项目最低档位）",
+                        min_value=0.0,
+                        format="%.0f",
+                        step=1000.0,
+                    ),
+                },
+                disabled=["client_id", "name", "email"],
+                hide_index=True,
+                use_container_width=True,
+                key=ed_key_hot,
+            )
+        else:
+            ed = st.data_editor(
+                view,
+                column_config={"_send": st.column_config.CheckboxColumn("发送", default=False)},
+                disabled=["client_id", "name", "email"],
+                hide_index=True,
+                use_container_width=True,
+                key=ed_key_soft,
+            )
         for _, r in ed.iterrows():
             if r.get("_send"):
-                recips.append(
-                    (str(r["email"]).strip(), str(r.get("name", "")), str(r.get("client_id", "")).strip())
-                )
+                cid = str(r.get("client_id", "")).strip()
+                em = str(r["email"]).strip()
+                nm = str(r.get("name", ""))
+                alloc_v: Optional[float] = None
+                if hot_alloc_mode:
+                    v = pd.to_numeric(r.get("Allocated_Amount"), errors="coerce")
+                    alloc_v = float(v) if pd.notna(v) else (float(min_sub_amt) if min_sub_amt > 0 else 0.0)
+                recips.append((em, nm, cid, alloc_v))
     for part in manual.split(","):
         e = part.strip()
         if e and "@" in e:
-            recips.append((e, e, ""))
+            recips.append((e, e, "", None))
 
     seen = set()
-    uniq: List[Tuple[str, str, str]] = []
+    uniq: List[Tuple[str, str, str, Optional[float]]] = []
     for t in recips:
         k = t[0].lower()
         if k in seen:
@@ -578,13 +721,33 @@ def render_distribution_tab_full() -> None:
         uniq.append(t)
     if uniq:
         st.caption(f"将发送 **{len(uniq)}** 位收件人")
+    if hot_alloc_mode and uniq:
+        fe0, _fn0, fc0, fa0 = uniq[0]
+        oid0 = oid_m.get(str(fc0).strip(), "") if fc0 else ""
+        url0 = _oid_url(base_u, oid0) if oid0 else "（您的专属 OID 尚未生成，请联系 COO。）"
+        amt0 = fa0 if fa0 is not None else (float(min_sub_amt) if min_sub_amt > 0 else 0.0)
+        disp0 = _format_allocated_currency(amt0)
+        with st.expander("查看首位收件人预览（Hot Deal 下每人额度不同，此处仅展示列表第一位）", expanded=False):
+            prev_body = _personalize_distribution_body(
+                str(st.session_state.get("email_body", "")),
+                oid_url=url0,
+                warrant_body=warrant_txt,
+                allocated_display=disp0,
+            )
+            st.text_area(
+                "合并 OID / warrant / allocated_amount 后的正文",
+                value=prev_body,
+                height=300,
+                disabled=True,
+                key="dist_hot_preview_first_recipient",
+            )
 
     pdf = st.file_uploader("Presentation（PDF 附件）", type=["pdf"], accept_multiple_files=False, key="dist_pdf")
     att: List[Tuple[str, bytes, str]] = []
     if pdf is not None:
         att.append((pdf.name, pdf.getvalue(), str(getattr(pdf, "type", None) or "application/pdf")))
 
-    if st.button("批量发送", type="primary", key="dist_send_bulk"):
+    if st.button("🚀 正式开始群发", type="primary", key="dist_send_bulk"):
         if not cfg or not cfg.get("host"):
             st.error("未配置 SMTP secrets。")
             return
@@ -596,7 +759,11 @@ def render_distribution_tab_full() -> None:
         if not subj_live:
             st.error("主题不能为空。")
             return
-        bad = [x for x in _unresolved_vars(body_live) if x not in ("oid_link", "warrant_info")]
+        bad = [
+            x
+            for x in _unresolved_vars(body_live)
+            if x not in ("oid_link", "warrant_info", "allocated_amount")
+        ]
         if bad:
             st.error("正文仍含未替换变量（请先处理）：" + ", ".join(bad))
             return
@@ -604,27 +771,60 @@ def render_distribution_tab_full() -> None:
         from_addr = cfg["from_email"]
         ok, errs = 0, []
         warrant_body = warrant_txt
-        for email, _n, cid in uniq:
+        log_rows: List[Dict[str, Any]] = []
+        send_hot = str(st.session_state.get("dist_alloc_mode", _DIST_SOFT_LABEL)) == _DIST_HOT_LABEL
+        fallback_amt = float(min_sub_amt) if min_sub_amt > 0 else 0.0
+        soft_alloc_txt = _allocated_placeholder_soft_circle()
+        for email, _n, cid, row_alloc in uniq:
             try:
                 oid = oid_m.get(str(cid).strip(), "") if cid else ""
                 url = _oid_url(base_u, oid) if oid else "（您的专属 OID 尚未生成，请联系 COO。）"
-                body_one = (
-                    body_live.replace("{{oid_link}}", url).replace("{{warrant_info}}", warrant_body)
+                if send_hot:
+                    amt_f = float(row_alloc) if row_alloc is not None else fallback_amt
+                    alloc_disp = _format_allocated_currency(amt_f)
+                else:
+                    ck = str(cid).strip()
+                    if ck and ck in locked_alloc_map:
+                        alloc_disp = _format_allocated_currency(float(locked_alloc_map[ck]))
+                    else:
+                        alloc_disp = soft_alloc_txt
+                body_one = _personalize_distribution_body(
+                    body_live,
+                    oid_url=url,
+                    warrant_body=warrant_body,
+                    allocated_display=alloc_disp,
                 )
                 msg = _build_message(from_addr, [email], subj_live, body_one, attachments=att or None)
                 _send_smtp(cfg, from_addr, [email], msg)
                 ok += 1
+                if send_hot:
+                    log_rows.append(
+                        {
+                            "recorded_at": datetime.now(timezone.utc).isoformat(),
+                            "project_id": str(pid),
+                            "client_id": str(cid).strip(),
+                            "allocated_amount": float(row_alloc) if row_alloc is not None else fallback_amt,
+                            "allocation_source": "COO_hot_deal_mail",
+                            "email": str(email).strip(),
+                        }
+                    )
             except Exception as exc:
                 errs.append(f"{email}: {exc}")
+        if log_rows:
+            _append_manual_allocations(log_rows)
         if ok:
             st.success(f"已发送 {ok}/{len(uniq)} 封。")
+            if send_hot and log_rows:
+                st.caption(f"已将 {len(log_rows)} 条手工额度写入 `{MANUAL_ALLOCATIONS_CSV}`（供 Action Center 区分 COO 指定与投资人自报）。")
         if errs:
             st.error("\n".join(errs))
 
     with st.expander("说明"):
         st.markdown(
             f"- OID 基础 URL：`{base_u or '（未配置 investflow.base_url）'}`\n"
-            "- `{{warrant_info}}` 等未在自动注入列表中的占位符，请在主编辑器中手动填写或删除。"
+            "- `{{warrant_info}}` 等未在自动注入列表中的占位符，请在主编辑器中手动填写或删除。\n"
+            f"- **Hot Deal** 群发成功后，COO 手工额度会追加到 `{MANUAL_ALLOCATIONS_CSV}`（含 `project_id`、`client_id`、`allocated_amount`、`allocation_source`）。\n"
+            "- **Action Center** 锁定的方案见 `data/allocations.csv`（`final_allocated_amount`），本页会预填并在邮件中替换 `{{allocated_amount}}`。"
         )
 
 

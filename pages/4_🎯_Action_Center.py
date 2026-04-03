@@ -7,6 +7,7 @@ import pandas as pd
 import streamlit as st
 
 import app as app_mod
+from alloc_decision_center import render_allocations_decision_center
 from hot_deal_dispatch_v21 import COMMITMENT_COLUMNS, render_hot_deal_dispatch_v21
 from investflow_data import COMMITMENTS_CSV
 
@@ -31,9 +32,18 @@ def _render_oid_summary() -> None:
         st.dataframe(ct, use_container_width=True, hide_index=True)
 
 
-t1, t2, t3, t4, t5 = st.tabs(
-    ["分配计算器", "Hot Deal · OID 工作台", "OID 统计", "动态分池", "项目周期"]
+t0, t1, t2, t3, t4, t5 = st.tabs(
+    [
+        "📊 分配决策台",
+        "分配计算器",
+        "Hot Deal · OID 工作台",
+        "OID 统计",
+        "动态分池",
+        "项目周期",
+    ]
 )
+with t0:
+    render_allocations_decision_center()
 with t1:
     app_mod.render_allocation_calculator()
 with t2:
