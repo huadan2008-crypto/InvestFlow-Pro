@@ -8,6 +8,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
@@ -20,7 +21,12 @@ from utils.allocations_io import (
     save_allocations_replace_project,
 )
 from utils.mail_dispatch_log import clients_with_mail_already_sent
-from utils.oid_feedback_io import RESPONSE_INTENT, clients_with_portal_confirmation, read_oid_feedback_df
+from utils.oid_feedback_io import (
+    RESPONSE_INTENT,
+    clients_with_portal_confirmation,
+    latest_confirmation_amounts_for_project,
+    read_oid_feedback_df,
+)
 
 
 def _p(*parts: str) -> str:
@@ -73,6 +79,158 @@ def _read_crm_df() -> pd.DataFrame:
         if os.path.isfile(path):
             return pd.read_csv(path)
     return pd.DataFrame()
+
+
+def _read_crm_household_df() -> pd.DataFrame:
+    """优先 crm.csv（家族字段），否则回退 client_master 等。"""
+    for path in (
+        _p(DATA_DIR, "crm.csv"),
+        _p(ROOT_DIR, "data", "crm.csv"),
+        _p(ROOT_DIR, "crm.csv"),
+        _p(ROOT_DIR, "Data", "crm.csv"),
+    ):
+        if os.path.isfile(path):
+            try:
+                df = pd.read_csv(path)
+            except (OSError, UnicodeDecodeError, pd.errors.EmptyDataError):
+                continue
+            if not df.empty:
+                return df
+    return _read_crm_df()
+
+
+def _latest_intent_amount_by_client(pid: str, fb: pd.DataFrame) -> Dict[str, float]:
+    """当前项目下各客户最新一条意向金额（Intent 或空 response_type）；金额列兼容 Selected_Amount / feedback_amount 等。"""
+    if fb.empty or "client_id" not in fb.columns:
+        return {}
+    pcol = None
+    for c in fb.columns:
+        if str(c).strip().lower() in ("project_id", "projectid"):
+            pcol = c
+            break
+    if pcol is None:
+        return {}
+    sub = fb[fb[pcol].astype(str).str.strip() == str(pid).strip()].copy()
+    if sub.empty:
+        return {}
+    if "response_type" in sub.columns:
+        rt = sub["response_type"].fillna("").astype(str).str.strip().str.lower()
+        sub = sub[rt.isin(("", RESPONSE_INTENT.lower()))]
+    amt_col = None
+    for c in sub.columns:
+        cl = str(c).strip().lower()
+        if cl in (
+            "selected_amount",
+            "feedback_amount",
+            "amount",
+            "submitted_amount",
+            "desired_amount",
+            "意向金额",
+        ):
+            amt_col = c
+            break
+    if amt_col is None:
+        return {}
+    ts_col = "submitted_at" if "submitted_at" in sub.columns else None
+    latest: Dict[str, tuple] = {}
+    for _, r in sub.iterrows():
+        cid = str(r.get("client_id", "")).strip()
+        if not cid:
+            continue
+        v = pd.to_numeric(r.get(amt_col), errors="coerce")
+        if pd.isna(v):
+            continue
+        ts = str(r.get(ts_col, "")) if ts_col else ""
+        prev = latest.get(cid)
+        if prev is None or ts >= prev[1]:
+            latest[cid] = (float(v), ts)
+    return {k: v[0] for k, v in latest.items()}
+
+
+def _render_household_concentration_analysis(pid: str, proj_row: pd.Series, hard_cap: float) -> None:
+    """家族意向汇总（oid_feedback 意向 × crm household），水平柱图；超 Hard Cap 15% 橙红高亮。"""
+    with st.expander("Household Concentration Analysis（家族意向集中度）", expanded=False):
+        st.caption(
+            "按 `oid_feedback.csv` 中意向金额（Selected_Amount / feedback_amount 等）汇总到 `crm.csv` 的 household_id；"
+            "缺 household_id 时暂用 client_id。超过 **项目 Hard Cap 的 15%** 的家族柱体为橙红色。"
+        )
+        fb = read_oid_feedback_df()
+        intent_by_c = _latest_intent_amount_by_client(str(pid), fb)
+        if not intent_by_c:
+            st.info("当前项目暂无 Portal 意向记录，或 oid_feedback 中无可用金额列。")
+            return
+        crm = _read_crm_household_df()
+        if crm.empty or "client_id" not in crm.columns:
+            st.warning("未找到含 client_id 的 CRM（请配置 `crm.csv` 或 client_master）。")
+            return
+        crm = crm.copy()
+        crm["client_id"] = crm["client_id"].astype(str).str.strip()
+        hh_col = None
+        for c in crm.columns:
+            if str(c).strip().lower() in ("household_id", "householdid"):
+                hh_col = c
+                break
+        if hh_col is None:
+            crm["_household_id"] = crm["client_id"]
+        else:
+            crm["_household_id"] = crm[hh_col].astype(str).str.strip()
+            crm.loc[crm["_household_id"] == "", "_household_id"] = crm["client_id"]
+        name_col = None
+        for c in crm.columns:
+            if str(c).strip().lower() == "name":
+                name_col = c
+                break
+        rows: List[Dict[str, Any]] = []
+        for cid, amt in intent_by_c.items():
+            hit = crm[crm["client_id"] == str(cid).strip()]
+            if hit.empty:
+                continue
+            r0 = hit.iloc[0]
+            hid = str(r0.get("_household_id", cid)).strip() or cid
+            nm = str(r0.get(name_col, "") or "").strip() if name_col else ""
+            rows.append({"client_id": cid, "household_id": hid, "name": nm, "intent": float(amt)})
+        if not rows:
+            st.info("意向中的客户无法在 CRM 中匹配 client_id。")
+            return
+        part = pd.DataFrame(rows)
+        agg = part.groupby("household_id", as_index=False).agg(intent_total=("intent", "sum"))
+        # 家族展示名：优先取该族中第一条非空 name，否则用 household_id
+        lbl_map: Dict[str, str] = {}
+        for hid, sub in part.groupby("household_id"):
+            names = [str(x).strip() for x in sub["name"].tolist() if str(x).strip()]
+            lbl_map[str(hid)] = names[0] if names else str(hid)
+        agg["Household"] = agg["household_id"].map(lambda x: lbl_map.get(str(x), str(x)))
+        agg["Total Intent Amount"] = agg["intent_total"]
+        thr = float(hard_cap) * 0.15 if float(hard_cap) > 0 else None
+        if thr is not None:
+            agg["over_cap15"] = agg["intent_total"] > thr
+        else:
+            agg["over_cap15"] = False
+        agg["color"] = agg["over_cap15"].map(lambda x: "#e85d04" if x else "#2563eb")
+        show = agg.sort_values("Total Intent Amount", ascending=True)
+        st.dataframe(
+            show[["Household", "household_id", "Total Intent Amount", "over_cap15"]].rename(
+                columns={"over_cap15": "超15% Hard Cap"}
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+        chart = (
+            alt.Chart(show)
+            .mark_bar()
+            .encode(
+                x=alt.X("Total Intent Amount:Q", title="Total Intent Amount（意向总额）"),
+                y=alt.Y("Household:N", sort="-x", title="Household"),
+                color=alt.Color(
+                    "over_cap15:N",
+                    scale=alt.Scale(domain=[True, False], range=["#e85d04", "#2563eb"]),
+                    legend=alt.Legend(title="> 15% Hard Cap"),
+                ),
+                tooltip=["Household", "household_id", "Total Intent Amount"],
+            )
+            .properties(height=max(120, 28 * len(show)))
+        )
+        st.altair_chart(chart, use_container_width=True)
 
 
 def _read_commitments_df() -> pd.DataFrame:
@@ -325,7 +483,14 @@ def render_allocations_decision_center() -> None:
         return
 
     pids = projects[pid_col].astype(str).tolist()
-    pid = st.selectbox("选择项目", pids, key="ac_alloc_proj_pick")
+    row_top = st.columns([4, 1])
+    with row_top[0]:
+        pid = st.selectbox("选择项目", pids, key="ac_alloc_proj_pick")
+    with row_top[1]:
+        st.write("")
+        if st.button("刷新实时数据", key="ac_refresh_oid_fb", help="重新读取 oid_feedback.csv / 邮件发送记录等"):
+            st.rerun()
+
     try:
         proj_row = _select_project_row(projects, str(pid))
     except KeyError:
@@ -344,23 +509,43 @@ def render_allocations_decision_center() -> None:
     cap = _project_cap(proj_row)
     min_amt = _min_subscription_amount(proj_row)
 
+    _render_household_concentration_analysis(str(pid), proj_row, cap)
+
     crm = _read_crm_df()
     commits = _read_commitments_df()
     base = _build_allocation_base_table(str(pid), proj_row, crm, commits, soft)
     base = _merge_locked_into_table(base, str(pid))
     portal_ok = clients_with_portal_confirmation(str(pid))
-    base["Portal状态"] = base["client_id"].astype(str).str.strip().map(
-        lambda c: "🟢 已确认" if c in portal_ok else "—"
-    )
     mail_sent = clients_with_mail_already_sent(str(pid))
+
+    def _status_icon(cid: str) -> str:
+        c = str(cid).strip()
+        if c in portal_ok:
+            return "🟢 已确认"
+        if c in mail_sent:
+            return "🟡 已发送/待确认"
+        return "⚪ 未发信"
+
+    base["Status_Icon"] = base["client_id"].astype(str).str.strip().map(_status_icon)
     base["📧 已发送"] = base["client_id"].astype(str).str.strip().map(
         lambda c: "Already Sent" if c in mail_sent else "—"
     )
+
+    conf_amounts = latest_confirmation_amounts_for_project(str(pid))
+
+    def _amount_mismatch_note(cid: str, alloc: float) -> str:
+        c = str(cid).strip()
+        if c not in conf_amounts:
+            return ""
+        if abs(float(conf_amounts[c]) - float(alloc)) > 0.51:
+            return "⚠️ 与Portal确认不一致"
+        return ""
+
     _col_order = [
         c
         for c in (
             "client_id",
-            "Portal状态",
+            "Status_Icon",
             "📧 已发送",
             "客户姓名",
             "投资人类型",
@@ -379,11 +564,13 @@ def render_allocations_decision_center() -> None:
         st.warning("没有可展示的客户行（请检查 commitments 或 CRM）。")
         return
 
+    summary_slot = st.empty()
+
     edited = st.data_editor(
         base,
         column_config={
             "client_id": st.column_config.TextColumn("client_id", disabled=True),
-            "Portal状态": st.column_config.TextColumn("Portal状态", disabled=True),
+            "Status_Icon": st.column_config.TextColumn("Status_Icon", disabled=True),
             "📧 已发送": st.column_config.TextColumn("📧 已发送", disabled=True),
             "客户姓名": st.column_config.TextColumn("客户姓名", disabled=True),
             "投资人类型": st.column_config.TextColumn("投资人类型", disabled=True),
@@ -403,7 +590,50 @@ def render_allocations_decision_center() -> None:
         key=ed_key,
     )
 
+    cids_tbl = edited["client_id"].astype(str).str.strip()
+    n_total = int(len(edited))
+    n_confirmed = int(sum(1 for c in cids_tbl if c in portal_ok))
+    conf_sum = float(
+        sum(conf_amounts.get(c, 0.0) for c in cids_tbl.unique() if c in conf_amounts)
+    )
+
     sum_alloc = float(pd.to_numeric(edited["最终分配额度"], errors="coerce").fillna(0).sum())
+    with summary_slot.container():
+        s0, s1, s2, s3 = st.columns(4)
+        s0.metric("总客户数", n_total)
+        s1.metric("已确认人数", n_confirmed)
+        s2.metric("确认总金额", f"${conf_sum:,.0f}")
+        if cap > 0:
+            s3.metric("剩余 Cap", f"${cap - sum_alloc:,.0f}")
+        else:
+            s3.metric("剩余 Cap", "—")
+
+    mis_rows = []
+    for _, r in edited.iterrows():
+        cid = str(r.get("client_id", "")).strip()
+        alloc = float(pd.to_numeric(r.get("最终分配额度"), errors="coerce") or 0.0)
+        if _amount_mismatch_note(cid, alloc):
+            mis_rows.append(
+                {
+                    "client_id": cid,
+                    "客户姓名": r.get("客户姓名", ""),
+                    "COO分配": alloc,
+                    "Portal确认金额": conf_amounts.get(cid),
+                }
+            )
+    if mis_rows:
+        st.markdown("##### 异常提醒：Portal 确认金额与 COO 分配不一致")
+        mdisp = pd.DataFrame(mis_rows)
+
+        def _orange_row(_row: pd.Series) -> List[str]:
+            return ["background-color: #ffe4cc; color: #663300"] * len(_row)
+
+        st.dataframe(
+            mdisp.style.apply(_orange_row, axis=1),
+            use_container_width=True,
+            hide_index=True,
+        )
+
     buffer = float(cap) - sum_alloc
     admin_fill = max(0.0, buffer)
     over = max(0.0, sum_alloc - float(cap)) if cap > 0 else 0.0

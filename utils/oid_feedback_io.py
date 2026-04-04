@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Optional, Set
 
 import pandas as pd
 
@@ -124,3 +124,36 @@ def client_has_submitted_intent(project_id: str, client_id: str) -> bool:
     """最新一条反馈为 Intent（未随后确认时用于 Soft Circle 已提交提示）。"""
     last = latest_feedback_for_client(project_id, client_id)
     return last.get("response_type") == RESPONSE_INTENT
+
+
+def latest_confirmation_amounts_for_project(project_id: str) -> Dict[str, float]:
+    """该项目下各客户最新一条 Confirmation 的 feedback_amount（按 submitted_at）。"""
+    df = read_oid_feedback_df()
+    if df.empty:
+        return {}
+    pid = str(project_id).strip()
+    sub = df[df["project_id"].astype(str).str.strip() == pid].copy()
+    if sub.empty:
+        return {}
+    sub = sub[sub["response_type"].astype(str).str.strip() == RESPONSE_CONFIRMATION]
+    if sub.empty:
+        return {}
+    ts_col = "submitted_at" if "submitted_at" in sub.columns else None
+    latest: Dict[str, tuple] = {}
+    for _, r in sub.iterrows():
+        cid = str(r.get("client_id", "")).strip()
+        if not cid:
+            continue
+        v = pd.to_numeric(r.get("feedback_amount"), errors="coerce")
+        if pd.isna(v):
+            continue
+        ts = str(r.get(ts_col, "")) if ts_col else ""
+        prev = latest.get(cid)
+        if prev is None or ts >= prev[1]:
+            latest[cid] = (float(v), ts)
+    return {k: v[0] for k, v in latest.items()}
+
+
+def latest_confirmation_amount_for_client(project_id: str, client_id: str) -> Optional[float]:
+    m = latest_confirmation_amounts_for_project(project_id)
+    return m.get(str(client_id).strip())

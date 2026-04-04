@@ -5,18 +5,18 @@ InvestFlow — Distribution：完整模板分发（本页自包含）+ 通用 CO
 from __future__ import annotations
 
 import copy
+import html as html_module
 import json
 import os
 import re
 import urllib.parse
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
 
 from coo_mailer import (
-    plain_text_to_html_email,
     render_coo_mailer,
     resolve_mail_transport_config,
     send_email,
@@ -321,15 +321,75 @@ def _portal_base_url() -> str:
     return "http://localhost:8501"
 
 
-def _investment_portal_link(base: str, project_id: str, client_id: str) -> str:
-    """正式/测试邮件中的 {{oid_link}}：Investment Portal 深链。"""
+def _dist_link_ttl_hours() -> float:
+    """认购链接有效期（小时）；控件未渲染前默认 72。"""
+    v = st.session_state.get("dist_portal_link_ttl_hours")
+    try:
+        return float(v) if v is not None else 72.0
+    except (TypeError, ValueError):
+        return 72.0
+
+
+def _dist_portal_expires_ts() -> int:
+    hrs = _dist_link_ttl_hours()
+    return int((datetime.now(timezone.utc) + timedelta(hours=hrs)).timestamp())
+
+
+def _investment_portal_link(
+    base: str,
+    project_id: str,
+    client_id: str,
+    *,
+    expires_at: Optional[int] = None,
+) -> str:
+    """正式/测试邮件中的 {{oid_link}}：Investment Portal 深链；可选 expires_at（UTC Unix 秒）。"""
     b = (base or "").strip().rstrip("/") or "http://localhost:8501"
     cid = str(client_id or "").strip()
     pid = str(project_id or "").strip()
     if not cid:
         return "（未绑定 client_id，无法生成专属门户链接。）"
-    q = urllib.parse.urlencode({"project_id": pid, "client_id": cid})
+    qd: Dict[str, str] = {"project_id": pid, "client_id": cid}
+    if expires_at is not None:
+        qd["expires_at"] = str(int(expires_at))
+    q = urllib.parse.urlencode(qd)
     return f"{b}/Investment_Portal?{q}"
+
+
+def _portal_subscribe_button_html(url: str, label: str) -> str:
+    return (
+        '<a href="'
+        + html_module.escape(url, quote=True)
+        + '" style="display:inline-block;padding:12px 24px;background-color:#004a99;color:#ffffff;'
+        'text-decoration:none;border-radius:6px;font-weight:600;">'
+        + html_module.escape(label)
+        + "</a>"
+    )
+
+
+def _distribution_body_to_html_email(body: str) -> str:
+    """纯文本/Markdown 正文转 HTML：含 Investment_Portal 的 [文字](链接) 替换为品牌色按钮，其余转义。"""
+    pattern = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+    out: List[str] = []
+    pos = 0
+    raw = body or ""
+    for m in pattern.finditer(raw):
+        out.append(html_module.escape(raw[pos : m.start()], quote=False))
+        label, url = m.group(1), m.group(2).strip()
+        if "Investment_Portal" in url or "investment_portal" in url.lower():
+            if url.startswith("http://") or url.startswith("https://"):
+                out.append(_portal_subscribe_button_html(url, label))
+            else:
+                out.append(html_module.escape(m.group(0), quote=False))
+        else:
+            out.append(html_module.escape(m.group(0), quote=False))
+        pos = m.end()
+    out.append(html_module.escape(raw[pos:], quote=False))
+    inner = "".join(out)
+    return (
+        "<!DOCTYPE html><html><head><meta charset='utf-8'></head>"
+        "<body style='font-family:system-ui,Segoe UI,sans-serif;font-size:15px;line-height:1.5;'>"
+        f"<div style='white-space:pre-wrap;'>{inner}</div></body></html>"
+    )
 
 
 def _unresolved_vars(text: str) -> List[str]:
@@ -522,7 +582,9 @@ def render_distribution_tab_full() -> None:
     if oid_m:
         first_cid = next(iter(oid_m.keys()), "")
         if first_cid:
-            oid_preview = _investment_portal_link(portal_base, str(pid), first_cid)
+            oid_preview = _investment_portal_link(
+                portal_base, str(pid), first_cid, expires_at=_dist_portal_expires_ts()
+            )
 
     min_sub_amt = _min_subscription_amount(row)
     locked_alloc_map: Dict[str, float] = latest_allocation_map_for_project(str(pid))
@@ -786,10 +848,45 @@ def render_distribution_tab_full() -> None:
         uniq.append(t)
     if uniq:
         st.caption(f"将发送 **{len(uniq)}** 位收件人")
+        inv_portal_root = f"{portal_base.rstrip('/')}/Investment_Portal"
+        test_link_rows: List[Dict[str, str]] = []
+        for em, nm, cid, _fa in uniq:
+            cid_s = str(cid).strip()
+            exp_ts = _dist_portal_expires_ts()
+            portal_ln = (
+                _investment_portal_link(portal_base, str(pid), cid_s, expires_at=exp_ts)
+                if cid_s
+                else "（无 client_id，无法生成门户深链）"
+            )
+            oid_v = oid_m.get(cid_s, "") if cid_s else ""
+            oid_ln = _oid_url(inv_portal_root, oid_v) if oid_v else "—"
+            test_link_rows.append(
+                {
+                    "客户": (str(nm).strip() or cid_s or em).strip(),
+                    "client_id": cid_s or "—",
+                    "Portal 深链 (project_id+client_id)": portal_ln,
+                    "OID 深链 (?oid=)": oid_ln,
+                }
+            )
+        with st.expander(
+            "🧪 测试闭环：已选客户专属链接（与正式群发一致，可复制）",
+            expanded=True,
+        ):
+            st.caption(
+                "勾选「发送」后即可复制链接，在本机打开 Investment Portal 走完整确认/意向流程，无需先SMTP发信。"
+                " OID 列仅在 `commitments.csv` 中已写入 OID 时有值；否则请用 Portal 深链测试。"
+            )
+            st.dataframe(
+                pd.DataFrame(test_link_rows),
+                use_container_width=True,
+                hide_index=True,
+            )
     if hot_alloc_mode and uniq:
         fe0, _fn0, fc0, fa0 = uniq[0]
         url0 = (
-            _investment_portal_link(portal_base, str(pid), str(fc0).strip())
+            _investment_portal_link(
+                portal_base, str(pid), str(fc0).strip(), expires_at=_dist_portal_expires_ts()
+            )
             if fc0
             else "（未绑定 client_id，无法生成门户链接。）"
         )
@@ -820,6 +917,16 @@ def render_distribution_tab_full() -> None:
         "SMTP：优先 `secrets.toml` 的 `[smtp]`，否则使用 `[gmail]`（应用专用密码）。"
         " 门户基址：`_portal_base_url()`（secrets `investflow.portal_base_url` / 环境变量 / 当前 Host）。"
     )
+    if "dist_portal_link_ttl_hours" not in st.session_state:
+        st.session_state["dist_portal_link_ttl_hours"] = 72
+    st.number_input(
+        "认购门户链接有效期（小时；每次发送/重发按当前时间重新计算 expires_at）",
+        min_value=1,
+        max_value=30 * 24,
+        step=1,
+        key="dist_portal_link_ttl_hours",
+        help="链接追加 `expires_at`（UTC Unix 秒）。测试/群发/预览均使用该设置。",
+    )
 
     test_inbox = st.text_input(
         "单封测试 · 收件邮箱",
@@ -847,7 +954,12 @@ def render_distribution_tab_full() -> None:
                 if uniq:
                     _e, _nm, demo_cid, fa_demo = uniq[0]
                     if demo_cid:
-                        demo_link = _investment_portal_link(portal_base, str(pid), str(demo_cid).strip())
+                        demo_link = _investment_portal_link(
+                            portal_base,
+                            str(pid),
+                            str(demo_cid).strip(),
+                            expires_at=_dist_portal_expires_ts(),
+                        )
                     if send_hot:
                         demo_alloc_disp = _format_allocated_currency(
                             float(fa_demo) if fa_demo is not None else fallback_amt
@@ -861,7 +973,9 @@ def render_distribution_tab_full() -> None:
                 elif oid_m:
                     demo_cid = next(iter(oid_m.keys()), "")
                     if demo_cid:
-                        demo_link = _investment_portal_link(portal_base, str(pid), demo_cid)
+                        demo_link = _investment_portal_link(
+                            portal_base, str(pid), demo_cid, expires_at=_dist_portal_expires_ts()
+                        )
                     demo_alloc_disp = (
                         _format_allocated_currency(fallback_amt) if send_hot else soft_alloc_txt
                     )
@@ -874,7 +988,7 @@ def render_distribution_tab_full() -> None:
                     allocated_display=demo_alloc_disp,
                     warrant_body=warrant_txt,
                 )
-                html_body = plain_text_to_html_email(body_demo)
+                html_body = _distribution_body_to_html_email(body_demo)
                 try:
                     send_email(
                         cfg,
@@ -928,8 +1042,11 @@ def render_distribution_tab_full() -> None:
                         status_slot.caption(f"发送进度：{i + 1} / {total}")
                         prog.progress(min(1.0, (i + 1) / max(total, 1)))
                         try:
+                            exp_ts = _dist_portal_expires_ts()
                             portal_link = (
-                                _investment_portal_link(portal_base, str(pid), str(cid).strip())
+                                _investment_portal_link(
+                                    portal_base, str(pid), str(cid).strip(), expires_at=exp_ts
+                                )
                                 if cid
                                 else "（未绑定 client_id，无法生成专属门户链接。）"
                             )
@@ -951,7 +1068,7 @@ def render_distribution_tab_full() -> None:
                                 allocated_display=alloc_disp,
                                 warrant_body=warrant_body,
                             )
-                            html_one = plain_text_to_html_email(body_one)
+                            html_one = _distribution_body_to_html_email(body_one)
                             send_email(
                                 cfg,
                                 from_addr,
