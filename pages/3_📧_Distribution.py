@@ -22,7 +22,7 @@ from coo_mailer import (
     send_email,
 )
 from utils.mail_dispatch_log import append_mail_dispatch_record
-from utils.allocations_io import latest_allocation_map_for_project
+from utils.final_allocations_io import merged_allocation_map_for_project
 from utils.constants import COO_DISTRIBUTION_DEFAULT_SUBJECT, DEFAULT_MAIL_TEMPLATE
 
 st.set_page_config(page_title="Distribution", layout="wide", page_icon="📧")
@@ -587,7 +587,7 @@ def render_distribution_tab_full() -> None:
             )
 
     min_sub_amt = _min_subscription_amount(row)
-    locked_alloc_map: Dict[str, float] = latest_allocation_map_for_project(str(pid))
+    locked_alloc_map: Dict[str, float] = merged_allocation_map_for_project(str(pid))
     ctx_base: Dict[str, str] = {
         "ticker": ticker,
         "company_name": company_name,
@@ -759,7 +759,7 @@ def render_distribution_tab_full() -> None:
     st.subheader("收件人")
     if locked_alloc_map:
         st.caption(
-            f"已从 **allocations.csv** 加载 **{len(locked_alloc_map)}** 条锁定额度：Hot Deal 下将预填 `Allocated_Amount`；"
+            f"已从 **allocations.csv** / **final_allocations.csv** 合并加载 **{len(locked_alloc_map)}** 条额度：Hot Deal 下将预填 `Allocated_Amount`；"
             "Soft Circle 下若正文含 `{{allocated_amount}}`，仍会对有锁定记录的客户填入具体金额。"
         )
     alloc_mode = st.radio(

@@ -228,8 +228,14 @@ def _project_effective_cap(row: pd.Series, deal: str, status: str) -> Optional[f
     if deal == DEAL_SOFT and status == STATUS_OPEN:
         return None
     if deal == DEAL_SOFT and status in (STATUS_PROCESSING, STATUS_CLOSED):
-        v = float(pd.to_numeric(row.get("Negotiated_Final_Cap"), errors="coerce") or 0.0)
-        return v if v > 0 else None
+        v_neg = float(pd.to_numeric(row.get("Negotiated_Final_Cap"), errors="coerce") or 0.0)
+        if v_neg > 0:
+            return v_neg
+        v_tgt = float(pd.to_numeric(row.get("Target_Total_Cap"), errors="coerce") or 0.0)
+        if v_tgt > 0:
+            return v_tgt
+        v_fc = float(pd.to_numeric(row.get("Final_Cap"), errors="coerce") or 0.0)
+        return v_fc if v_fc > 0 else None
     if deal == DEAL_HOT:
         v = float(pd.to_numeric(row.get("Target_Total_Cap"), errors="coerce") or 0.0)
         if v <= 0:
@@ -462,7 +468,7 @@ def render_project_control_tower() -> None:
                         "Close_Date": hard_d.strftime("%Y-%m-%d"),
                         "Soft_Deadline": soft_d.strftime("%Y-%m-%d"),
                         "Hard_Deadline": hard_d.strftime("%Y-%m-%d"),
-                        "Target_Total_Cap": float(target_cap) if deal == DEAL_HOT else 0.0,
+                        "Target_Total_Cap": float(target_cap),
                         "Negotiated_Final_Cap": 0.0,
                         "Status": STATUS_OPEN,
                         "Deal_Type": deal,

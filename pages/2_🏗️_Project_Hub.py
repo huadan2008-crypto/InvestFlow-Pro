@@ -243,7 +243,7 @@ def render_project_hub() -> None:
     )
     deal = c2.selectbox("Deal_Type (模式)", [DEAL_SOFT, DEAL_HOT], key="hub_deal")
     target_cap = c3.number_input(
-        "Hard Cap / Target_Total_Cap（模式 B 必填）",
+        "Hard Cap / Target_Total_Cap（Hot Deal 必填；Soft Circle 填后写入项目供分配决策台使用）",
         min_value=0.0,
         step=10_000.0,
         format="%.2f",
@@ -320,7 +320,8 @@ def render_project_hub() -> None:
             pname_auto = f"{t_clean}_{name_date.strftime('%Y-%m-%d')}"
             tc_val = float(st.session_state.get("hub_target_cap", 0.0) or 0.0)
             final_cap = float(tc_val) if deal == DEAL_HOT else 0.0
-            target_total = float(tc_val) if deal == DEAL_HOT else 0.0
+            # Soft / Hot 均写入 Target_Total_Cap，供 Action Center 权重分配与 Cap 展示（谈回额另存在 Negotiated_Final_Cap）
+            target_total = float(tc_val)
 
             if is_new:
                 pid_clean = str(st.session_state.get("hub_new_pid", "")).strip()
@@ -388,7 +389,7 @@ def render_project_hub() -> None:
                     prev_ttc = float(pd.to_numeric(prev.get("Target_Total_Cap"), errors="coerce") or 0.0)
                     if deal == DEAL_SOFT:
                         fc_save = prev_fc
-                        ttc_save = prev_ttc
+                        ttc_save = float(tc_val)
                     else:
                         fc_save = final_cap
                         ttc_save = target_total

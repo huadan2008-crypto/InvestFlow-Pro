@@ -23,7 +23,7 @@ import pandas as pd
 import streamlit as st
 
 from investflow_data import COMMITMENTS_CSV, resolved_commitments_csv_path
-from utils.allocations_io import latest_allocation_map_for_project
+from utils.final_allocations_io import merged_allocation_map_for_project
 from utils.oid_feedback_io import (
     RESPONSE_CONFIRMATION,
     RESPONSE_INTENT,
@@ -431,7 +431,7 @@ def _show_client_view(oid: str) -> None:
     if expiry_dt is not None:
         st.caption(f"链接有效至：{expiry_dt.isoformat(sep=' ', timespec='seconds')}")
 
-    alloc_map = latest_allocation_map_for_project(project_id)
+    alloc_map = merged_allocation_map_for_project(project_id)
     reserved_csv = alloc_map.get(client_id)
     if reserved_csv is not None and not pd.isna(reserved_csv) and float(reserved_csv) > 0:
         reserved = float(reserved_csv)

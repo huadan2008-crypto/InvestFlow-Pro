@@ -184,8 +184,8 @@ def allocation_lookup(alloc_map: Dict[str, float], cid: str) -> Optional[float]:
 
 
 def merged_allocation_for_client(pid_url: str, pid_canon: str, cid: str) -> Optional[float]:
-    """合并 URL 与表内 canonical project_id 的 allocations 查询。"""
-    from utils.allocations_io import latest_allocation_map_for_project as load_map
+    """合并 URL 与表内 canonical project_id 的 allocations + final_allocations 查询。"""
+    from utils.final_allocations_io import merged_allocation_map_for_project as load_map
 
     for p in {str(pid_url).strip(), str(pid_canon).strip()}:
         if not p:
