@@ -1,6 +1,6 @@
 """
 InvestFlow — Distribution：完整模板分发（本页自包含）+ 通用 COO 邮件
-完整模板：data/mail_templates.json CRUD、项目/日期变量注入、主编辑器、OID、附件。
+完整模板：data/mail_templates.json CRUD、项目/日期变量注入、主编辑器、OID、云端 Drive 链接。
 """
 from __future__ import annotations
 
@@ -20,6 +20,11 @@ from coo_mailer import (
     render_coo_mailer,
     resolve_mail_transport_config,
     send_email,
+)
+from utils.cloud_drive_links import (
+    appendix_plaintext_lines,
+    multiselect_label,
+    parse_drive_links_cell,
 )
 from utils.mail_dispatch_log import append_mail_dispatch_record
 from utils.final_allocations_io import merged_allocation_map_for_project
@@ -380,6 +385,11 @@ def _distribution_body_to_html_email(body: str) -> str:
                 out.append(_portal_subscribe_button_html(url, label))
             else:
                 out.append(html_module.escape(m.group(0), quote=False))
+        elif url.startswith("http://") or url.startswith("https://"):
+            out.append(
+                f"<a href=\"{html_module.escape(url, quote=True)}\">"
+                f"{html_module.escape(label, quote=False)}</a>"
+            )
         else:
             out.append(html_module.escape(m.group(0), quote=False))
         pos = m.end()
@@ -505,6 +515,20 @@ def _new_template_id_from_display_name(name: str, existing: set) -> str:
     return f"{base}_{n}"
 
 
+def _dist_append_cloud_links_to_body(base: str, project_id: str, items: List[Dict[str, str]]) -> str:
+    """在 seal 占位符之后追加 Hub 维护的 Google Drive 链接段（纯文本 Markdown 链接）。"""
+    if not items:
+        return base or ""
+    key = f"dist_cloud_pick_{project_id}"
+    sel = st.session_state.get(key)
+    if sel is None:
+        sel = list(range(len(items)))
+    chosen = [items[int(i)] for i in sel if 0 <= int(i) < len(items)]
+    if not chosen:
+        return base or ""
+    return (base or "") + appendix_plaintext_lines(chosen)
+
+
 def _init_email_session_from_template() -> None:
     """首次进入页面：从 mail_templates.json 当前活动模板注入 email_body / email_subj。"""
     p = _load_mail_templates()
@@ -545,6 +569,9 @@ def render_distribution_tab_full() -> None:
         )
 
     projects = _read_projects_df()
+    sess_proj = st.session_state.get("projects_data")
+    if isinstance(sess_proj, pd.DataFrame) and not sess_proj.empty and "Project_ID" in sess_proj.columns:
+        projects = sess_proj.copy()
     commits = _read_commitments_df()
     crm = _read_crm_df()
     cfg = resolve_mail_transport_config()
@@ -750,6 +777,37 @@ def render_distribution_tab_full() -> None:
 
     st.text_area("邮件预览与编辑", height=500, key="email_body")
 
+    st.subheader("本项目云端附件（Google Drive）")
+    cloud_items_all = parse_drive_links_cell(
+        _row_get(row, "cloud_drive_links_json", "Cloud_Drive_Links_JSON")
+    )
+    if not cloud_items_all:
+        st.caption(
+            "尚未配置链接时，请在 **Project Hub** 用表格维护「文件描述 + URL」，保存后写入 `projects.csv` 的 **Cloud_Drive_Links_JSON**，"
+            "并同步到会话 **projects_data**。"
+        )
+        st.info("当前项目无云端链接；发信正文不会追加附件段落。")
+    else:
+        idx_opts = list(range(len(cloud_items_all)))
+        st.multiselect(
+            "本次发信在正文「附件」部分包含的链接（插入到正文末尾，Markdown 超链接）",
+            options=idx_opts,
+            default=idx_opts,
+            format_func=lambda i: multiselect_label(cloud_items_all[int(i)]),
+            key=f"dist_cloud_pick_{pid}",
+        )
+        _pv_base = str(st.session_state.get("email_body", "") or "")
+        with st.expander("查看含云端附件段的完整正文预览", expanded=False):
+            st.text(_dist_append_cloud_links_to_body(_pv_base, str(pid), cloud_items_all))
+        st.caption("逐条在新标签页打开核对：")
+        _vcols = st.columns(min(4, max(1, len(cloud_items_all))))
+        for j, it in enumerate(cloud_items_all):
+            u = str(it.get("url", "") or "").strip()
+            if not u.startswith("http"):
+                continue
+            with _vcols[j % len(_vcols)]:
+                st.link_button(f"验证 ·{j + 1}", u)
+
     st.subheader("发送主题")
     st.caption("与上方「默认主题」联动；也可直接改。批量发送以本框与 **邮件预览与编辑** 为准。")
     st.text_input("主题", key="email_subj")
@@ -812,7 +870,7 @@ def render_distribution_tab_full() -> None:
                         "Allocated_Amount",
                         help="COO 手工预留认购额度（默认=本项目最低档位）",
                         min_value=0.0,
-                        format="%.0f",
+                        format="%,.0f",
                         step=1000.0,
                     ),
                 },
@@ -906,18 +964,14 @@ def render_distribution_tab_full() -> None:
                 warrant_body=warrant_txt,
                 allocated_display=disp0,
             )
+            prev_body = _dist_append_cloud_links_to_body(prev_body, str(pid), cloud_items_all)
             st.text_area(
-                "合并 OID / warrant / allocated_amount 后的正文",
+                "合并 OID / warrant / allocated_amount / 云端附件 后的正文",
                 value=prev_body,
                 height=300,
                 disabled=True,
                 key="dist_hot_preview_first_recipient",
             )
-
-    pdf = st.file_uploader("Presentation（PDF 附件）", type=["pdf"], accept_multiple_files=False, key="dist_pdf")
-    att: List[Tuple[str, bytes, str]] = []
-    if pdf is not None:
-        att.append((pdf.name, pdf.getvalue(), str(getattr(pdf, "type", None) or "application/pdf")))
 
     st.subheader("发送")
     st.caption(
@@ -995,6 +1049,7 @@ def render_distribution_tab_full() -> None:
                     allocated_display=demo_alloc_disp,
                     warrant_body=warrant_txt,
                 )
+                body_demo = _dist_append_cloud_links_to_body(body_demo, str(pid), cloud_items_all)
                 html_body = _distribution_body_to_html_email(body_demo)
                 try:
                     send_email(
@@ -1004,7 +1059,7 @@ def render_distribution_tab_full() -> None:
                         subj_demo,
                         html_body,
                         text_plain=body_demo,
-                        attachments=att or None,
+                        attachments=None,
                     )
                     st.success(f"测试邮件已发送至 {str(test_inbox).strip()}（演示数据：链接与额度见正文）。")
                 except Exception as exc:
@@ -1075,6 +1130,7 @@ def render_distribution_tab_full() -> None:
                                 allocated_display=alloc_disp,
                                 warrant_body=warrant_body,
                             )
+                            body_one = _dist_append_cloud_links_to_body(body_one, str(pid), cloud_items_all)
                             html_one = _distribution_body_to_html_email(body_one)
                             send_email(
                                 cfg,
@@ -1083,7 +1139,7 @@ def render_distribution_tab_full() -> None:
                                 subj_one,
                                 html_one,
                                 text_plain=body_one,
-                                attachments=att or None,
+                                attachments=None,
                             )
                             ok += 1
                             if str(cid).strip():

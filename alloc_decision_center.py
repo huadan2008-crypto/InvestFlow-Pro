@@ -213,10 +213,14 @@ def _render_household_concentration_analysis_from_df(show: Optional[pd.DataFrame
         if show is None or show.empty:
             st.info("当前项目暂无 Portal 意向记录、无 CRM 匹配，或 oid_feedback 中无可用金额列。")
             return
+        _hh_show = show[["Household", "household_id", "Total Intent Amount", "over_cap15"]].rename(
+            columns={"over_cap15": "超15% Hard Cap"}
+        ).copy()
+        _hh_show["Total Intent Amount"] = pd.to_numeric(_hh_show["Total Intent Amount"], errors="coerce").map(
+            lambda x: "" if pd.isna(x) else f"{float(x):,.2f}"
+        )
         st.dataframe(
-            show[["Household", "household_id", "Total Intent Amount", "over_cap15"]].rename(
-                columns={"over_cap15": "超15% Hard Cap"}
-            ),
+            _hh_show,
             use_container_width=True,
             hide_index=True,
         )
@@ -1270,17 +1274,17 @@ def render_allocations_decision_center() -> None:
             "client_id": st.column_config.TextColumn("client_id", disabled=True),
             "客户姓名": st.column_config.TextColumn("客户姓名", disabled=True),
             "认购额度": st.column_config.NumberColumn(
-                "认购额度 (CAD)", format="%.0f", disabled=True, help="意向（只读）。"
+                "认购额度 (CAD)", format="%,.0f", disabled=True, help="意向（只读）。"
             ),
             "Suggested_Shares": st.column_config.NumberColumn(
                 "Suggested_Shares",
-                format="%.0f",
+                format="%,.0f",
                 disabled=True,
                 help="由下方加元金额按股价/Lot反推。",
             ),
             "Suggested_Amount": st.column_config.NumberColumn(
                 "Suggested_Amount (CAD)",
-                format="%.0f",
+                format="%,.0f",
                 min_value=0.0,
                 step=1.0,
                 disabled=False,

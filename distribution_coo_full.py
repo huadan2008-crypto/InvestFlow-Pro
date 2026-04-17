@@ -64,9 +64,8 @@ def _price_scalar(row: pd.Series) -> str:
         return "—"
     v = float(sp)
     if abs(v - round(v)) < 1e-9:
-        return str(int(round(v)))
-    s = f"{v:.6f}".rstrip("0").rstrip(".")
-    return s
+        return f"{int(round(v)):,}"
+    return f"{v:,.6f}".rstrip("0").rstrip(".").rstrip(",")
 
 
 def _company_display(row: pd.Series) -> str:

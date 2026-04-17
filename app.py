@@ -9,7 +9,9 @@ import streamlit as st
 
 from investflow_data import DATA_DIR, PROJECTS_CSV, ROOT_DIR, ensure_data_subdirs, resolved_commitments_csv_path
 from utils.final_allocations_io import merged_allocation_map_for_project
+from utils.financial_display import dataframe_financial_display
 from utils.oid_feedback_io import clients_with_portal_confirmation
+from utils.cloud_drive_links import appendix_plaintext_lines, multiselect_label, parse_drive_links_cell
 
 DEFAULT_SUBSCRIPTION_FILES = ["private_equity_workflow.csv", "my_investments.csv"]
 # CRM 主数据仅使用 CSV，请在应用内维护，以便 client_id 自动生成与唯一性校验一致。
@@ -48,6 +50,7 @@ PROJECT_COLUMNS = [
     "warrant_info",
     "deadline_date",
     "Created_Date",
+    "Cloud_Drive_Links_JSON",
 ]
 POOL_COLUMNS = [
     "Project_ID",
@@ -303,6 +306,9 @@ def _load_or_init_projects():
     df["deadline_date"] = df["deadline_date"].fillna("").astype(str)
     if "Created_Date" in df.columns:
         df["Created_Date"] = df["Created_Date"].fillna("").astype(str)
+    if "Cloud_Drive_Links_JSON" not in df.columns:
+        df["Cloud_Drive_Links_JSON"] = ""
+    df["Cloud_Drive_Links_JSON"] = df["Cloud_Drive_Links_JSON"].fillna("").astype(str)
     if "Project_ID" in df.columns:
         df["Project_ID"] = df["Project_ID"].map(lambda x: "" if pd.isna(x) else str(x).strip())
     return df[PROJECT_COLUMNS].copy()
@@ -689,7 +695,14 @@ def render_allocation_calculator():
     col3.metric("Allocated", f"{grouped['Final_Allocation'].sum():,.2f}")
 
     st.subheader("按 Household_ID 汇总")
-    st.dataframe(grouped, use_container_width=True)
+    st.dataframe(
+        dataframe_financial_display(
+            grouped,
+            money_2dp=["Desired_Amount", "Final_Allocation"],
+            int_comma=["Investors"],
+        ),
+        use_container_width=True,
+    )
 
     st.subheader("明细结果")
     detail_cols = ["User", "Household_ID", "Tier", "Unit_Price", "Desired_Amount", "Final_Allocation"]
@@ -701,7 +714,26 @@ def render_allocation_calculator():
         detail_cols.append("Chosen_Option_Shares")
     if "Final_Shares" in detailed.columns:
         detail_cols.append("Final_Shares")
-    st.dataframe(detailed[detail_cols], use_container_width=True)
+    _money_detail = [
+        c
+        for c in (
+            "Desired_Amount",
+            "Final_Allocation",
+            "Requested_Amount",
+            "Chosen_Option_Amount",
+            "Chosen_Option_Shares",
+            "Final_Shares",
+        )
+        if c in detail_cols
+    ]
+    st.dataframe(
+        dataframe_financial_display(
+            detailed[detail_cols],
+            money_2dp=_money_detail,
+            price_4dp=[c for c in ("Unit_Price",) if c in detail_cols],
+        ),
+        use_container_width=True,
+    )
 
 
 def _load_default_subscriptions():
@@ -793,6 +825,7 @@ def render_project_lifecycle():
                         "warrant_info": "",
                         "deadline_date": close_date.strftime("%Y-%m-%d"),
                         "Created_Date": date.today().strftime("%Y-%m-%d"),
+                        "Cloud_Drive_Links_JSON": "[]",
                     }
                     merged = pd.concat([projects, pd.DataFrame([new_row])], ignore_index=True)
                     merged = merged.drop_duplicates(subset=["Project_ID"], keep="last")
@@ -819,7 +852,29 @@ def render_project_lifecycle():
                            pd.to_numeric(display["Final_Cap"], errors="coerce").replace(0, pd.NA)).fillna(0.0)
 
     st.write(f"认购数据源: `{subs_src or '未找到'}`")
-    st.dataframe(display, use_container_width=True)
+    _disp_money = [
+        c
+        for c in (
+            "Final_Cap",
+            "Target_Total_Cap",
+            "Negotiated_Final_Cap",
+            "Allocated",
+        )
+        if c in display.columns
+    ]
+    _disp_price = [c for c in ("Share_Price",) if c in display.columns]
+    _disp_int = [c for c in ("Lot_Size", "Hold_Period_Months") if c in display.columns]
+    _disp_pct = [c for c in ("Progress",) if c in display.columns]
+    st.dataframe(
+        dataframe_financial_display(
+            display,
+            money_2dp=_disp_money,
+            price_4dp=_disp_price,
+            int_comma=_disp_int,
+            ratio_pct_2dp=_disp_pct,
+        ),
+        use_container_width=True,
+    )
 
     st.subheader("状态操作")
     st.caption("当前项目请在**左侧边栏**选择（展示完整 Project_ID）。")
@@ -877,7 +932,7 @@ def render_dynamic_pool():
             evalue = c2.text_input("Eligibility_Value", value="")
             priority = c2.number_input("Priority (1=最高)", min_value=1, value=1, step=1)
             cap_type = c3.selectbox("Cap_Type", ["Percent", "Amount"])
-            cap_value = c3.number_input("Cap_Value", min_value=0.0, value=50.0, step=1.0)
+            cap_value = c3.number_input("Cap_Value", min_value=0.0, value=50.0, step=1.0, format="%.2f")
             submitted = st.form_submit_button("添加规则")
             if submitted:
                 new_row = {
@@ -895,7 +950,15 @@ def render_dynamic_pool():
 
     prj_rules = rules[rules["Project_ID"].astype(str) == str(project_id)].copy()
     st.subheader("当前项目分池规则")
-    prj_rules_edited = st.data_editor(prj_rules, use_container_width=True, num_rows="dynamic")
+    prj_rules_edited = st.data_editor(
+        prj_rules,
+        use_container_width=True,
+        num_rows="dynamic",
+        column_config={
+            "Cap_Value": st.column_config.NumberColumn("Cap_Value", format="%,.2f"),
+            "Priority": st.column_config.NumberColumn("Priority", format="%,d", step=1),
+        },
+    )
     if st.button("保存规则修改"):
         others = rules[rules["Project_ID"].astype(str) != str(project_id)].copy()
         merged = pd.concat([others, prj_rules_edited[POOL_COLUMNS]], ignore_index=True)
@@ -946,7 +1009,14 @@ def render_dynamic_pool():
 
     if caps:
         st.subheader("池容量预览")
-        st.dataframe(pd.DataFrame(caps), use_container_width=True)
+        st.dataframe(
+            dataframe_financial_display(
+                pd.DataFrame(caps),
+                money_2dp=["Cap_Amount"],
+                int_comma=["Client_Count"],
+            ),
+            use_container_width=True,
+        )
 
 
 def render_crm_module():
@@ -1234,35 +1304,18 @@ def _closing_apply_template(body: str, *, name: str, amount: float, project_labe
     )
 
 
-def _closing_attachments_dir(pid: str) -> str:
-    ensure_data_subdirs()
-    safe_pid = str(pid).strip().replace("..", "").replace("/", "").replace("\\", "")
-    d = os.path.join(DATA_DIR, "closing_attachments", safe_pid)
-    os.makedirs(d, exist_ok=True)
-    return d
-
-
-def _closing_list_attachment_filenames(pid: str) -> List[str]:
-    root = _closing_attachments_dir(pid)
-    if not os.path.isdir(root):
-        return []
-    names: List[str] = []
-    for fn in sorted(os.listdir(root)):
-        p = os.path.join(root, fn)
-        if os.path.isfile(p) and not fn.startswith("."):
-            names.append(fn)
-    return names
-
-
-def _closing_attachment_footer_lines(filenames: List[str]) -> str:
-    if not filenames:
+def _closing_cloud_appendix_block(projects: pd.DataFrame, pid: str) -> str:
+    """Closing 批量预览：从 Project Hub 的 Cloud_Drive_Links_JSON 追加 Markdown 链接段。"""
+    sub = projects[projects["Project_ID"].astype(str).str.strip() == str(pid).strip()]
+    items = parse_drive_links_cell(sub.iloc[0].get("Cloud_Drive_Links_JSON")) if not sub.empty else []
+    if not items:
         return ""
-    lines = "\n".join(f"- {n}" for n in filenames)
-    return (
-        "\n\n---\n"
-        "【请在邮件客户端中附带以下文件】（本页已上传保存，可点击侧栏下载核对）\n"
-        f"{lines}\n"
-    )
+    key = f"closing_cloud_pick_{pid}"
+    sel = st.session_state.get(key)
+    if sel is None:
+        sel = list(range(len(items)))
+    chosen = [items[int(i)] for i in sel if 0 <= int(i) < len(items)]
+    return appendix_plaintext_lines(chosen) if chosen else ""
 
 
 def _closing_export_excel_bytes(df: pd.DataFrame) -> Optional[bytes]:
@@ -1346,7 +1399,7 @@ def render_closing_stats() -> None:
             "client_id": st.column_config.TextColumn("client_id", disabled=True, help="内部主键"),
             "姓名": st.column_config.TextColumn("投资人姓名", disabled=True),
             "邮件": st.column_config.TextColumn("邮件", disabled=True),
-            "分配额度": st.column_config.NumberColumn("分配额度 (CAD)", disabled=True, format="%.2f"),
+            "分配额度": st.column_config.NumberColumn("分配额度 (CAD)", disabled=True, format="%,.2f"),
             "签署状态": st.column_config.SelectboxColumn(
                 "签署状态",
                 options=CLOSING_SIGN_OPTIONS,
@@ -1368,65 +1421,38 @@ def render_closing_stats() -> None:
     with st.expander("📄 查看 Closing 邮件模板内容", expanded=False):
         st.code(CLOSING_EMAIL_TEMPLATE, language=None)
 
-        st.markdown("**Closing 邮件附件**")
+        st.markdown("**Closing 邮件 — 云端附件链接**")
         st.caption(
-            "文件保存至本机 `data/closing_attachments/<项目ID>/`；正式发信时请在邮件客户端中**手动添加**这些附件。"
+            "链接由 **Project Hub** 写入 `projects.csv` 的 **Cloud_Drive_Links_JSON**；此处仅勾选预览段落，"
+            "不处理任何本机二进制附件。"
         )
-        uploaded_files = st.file_uploader(
-            "选择文件后点击「保存到附件库」（可多选）",
-            accept_multiple_files=True,
-            key=f"closing_att_upload_{pid}",
-            help="支持 PDF / Office / 图片 / 压缩包等；同名文件将被覆盖。",
+        sub_cl = projects[projects["Project_ID"].astype(str).str.strip() == str(pid).strip()]
+        closing_drive_items = (
+            parse_drive_links_cell(sub_cl.iloc[0].get("Cloud_Drive_Links_JSON")) if not sub_cl.empty else []
         )
-        if uploaded_files and st.button("💾 保存到附件库", key=f"closing_att_save_{pid}"):
-            dest_root = _closing_attachments_dir(str(pid))
-            saved = 0
-            for uf in uploaded_files:
-                safe_name = os.path.basename(str(getattr(uf, "name", "") or ""))
-                if not safe_name or safe_name.startswith("."):
-                    continue
-                out_path = os.path.join(dest_root, safe_name)
-                with open(out_path, "wb") as f:
-                    f.write(uf.getvalue())
-                saved += 1
-            if saved:
-                st.success(f"已保存 **{saved}** 个附件。")
-                st.rerun()
-
-        att_names = _closing_list_attachment_filenames(str(pid))
-        if att_names:
-            st.markdown("**已保存的附件**")
-            for i, fn in enumerate(att_names):
-                fp = os.path.join(_closing_attachments_dir(str(pid)), fn)
-                c1, c2, c3 = st.columns([4, 1, 1])
-                with c1:
-                    st.text(fn)
-                with c2:
-                    try:
-                        with open(fp, "rb") as fb:
-                            blob = fb.read()
-                    except OSError:
-                        blob = b""
-                    st.download_button(
-                        "下载",
-                        data=blob,
-                        file_name=fn,
-                        key=f"closing_att_dl_{pid}_{i}",
-                        mime="application/octet-stream",
-                    )
-                with c3:
-                    if st.button("删除", key=f"closing_att_rm_{pid}_{i}"):
-                        try:
-                            os.remove(fp)
-                        except OSError:
-                            pass
-                        st.rerun()
+        if not closing_drive_items:
+            st.info("当前项目无云端链接；批量预览正文将不含附件附录。")
         else:
-            st.info("尚未上传附件；批量预览中的正文将不含「拟附附件清单」段落。")
+            idx_opts = list(range(len(closing_drive_items)))
+            st.multiselect(
+                "批量预览中包含的链接（Markdown 超链接追加至正文末尾）",
+                options=idx_opts,
+                default=idx_opts,
+                format_func=lambda i: multiselect_label(closing_drive_items[int(i)]),
+                key=f"closing_cloud_pick_{pid}",
+            )
+            st.caption("新标签页核对：")
+            _ccols = st.columns(min(4, max(1, len(closing_drive_items))))
+            for j, it in enumerate(closing_drive_items):
+                u = str(it.get("url", "") or "").strip()
+                if not u.startswith("http"):
+                    continue
+                with _ccols[j % len(_ccols)]:
+                    st.link_button(f"验证 ·{j + 1}", u)
 
     if st.button("📧 批量生成邮件预览", key=f"closing_batch_preview_btn_{pid}"):
         previews: List[dict[str, str]] = []
-        att_block = _closing_attachment_footer_lines(_closing_list_attachment_filenames(str(pid)))
+        att_block = _closing_cloud_appendix_block(projects, str(pid))
         for _, row in edited.iterrows():
             if str(row.get("签署状态", "")).strip() != "待发送":
                 continue

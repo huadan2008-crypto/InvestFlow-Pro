@@ -1,7 +1,6 @@
 """InvestFlow v2.5 — Project Hub：新建 / 编辑共用完整登记表单 + Control Tower 工作台（仅本页）"""
 from __future__ import annotations
 
-import os
 from datetime import date
 from typing import Any
 
@@ -10,7 +9,6 @@ import streamlit as st
 
 import app as app_mod
 from hot_deal_dispatch_v21 import _ticker_last_price, _yahoo_finance_search_quotes
-from investflow_data import ATTACHMENTS_DIR, ensure_data_subdirs
 from project_control_tower import (
     COO_CLIENT_ID,
     DEAL_HOT,
@@ -33,6 +31,13 @@ from project_control_tower import (
     _project_effective_cap,
     _save_commitments,
 )
+from utils.cloud_drive_links import (
+    coerce_drive_editor_value_to_df,
+    dataframe_to_drive_items,
+    drive_links_to_dataframe,
+    parse_drive_links_cell,
+    serialize_drive_links,
+)
 
 st.set_page_config(page_title="Project Hub", layout="wide", page_icon="🏗️")
 
@@ -43,6 +48,25 @@ HUB_PROJECTS_DATA_KEY = "projects_data"
 def _hub_sync_projects_session(projects: pd.DataFrame) -> None:
     """与 projects.csv 对齐的会话镜像，供汇总表与其它组件读取。"""
     st.session_state[HUB_PROJECTS_DATA_KEY] = projects.copy()
+
+
+def _hub_drive_initial_dataframe(pick: str, projects: pd.DataFrame) -> pd.DataFrame:
+    """供 st.data_editor 首参：不得写入与该 editor 相同的 session_state key（Streamlit 禁止）。"""
+    if pick == NEW_LABEL:
+        return drive_links_to_dataframe([])
+    sub = projects[projects["Project_ID"].astype(str) == str(pick)]
+    raw = sub.iloc[0].get("Cloud_Drive_Links_JSON") if not sub.empty else ""
+    return drive_links_to_dataframe(parse_drive_links_cell(raw))
+
+
+def _hub_clear_drive_editor_widget_keys() -> None:
+    """仅删除各 `hub_drive_ed_*` widget 键；下一轮由 `_hub_drive_initial_dataframe` 提供 data_editor 首参。"""
+    for k in list(st.session_state.keys()):
+        if isinstance(k, str) and k.startswith("hub_drive_ed_"):
+            try:
+                del st.session_state[k]
+            except KeyError:
+                pass
 
 
 def _hub_notes_preview(val: Any, *, max_chars: int = 20) -> str:
@@ -73,11 +97,12 @@ def _hub_portfolio_summary_df(projects: pd.DataFrame) -> pd.DataFrame:
         created = str(row.get("Created_Date", "") or "").strip()
         if not created:
             created = str(row.get("Open_Date", "") or "").strip()
+        cap_v = _hub_total_allocation_cap(row)
         rows.append(
             {
                 "Project ID": str(row.get("Project_ID", "") or "").strip(),
                 "Project Name": str(row.get("Project_Name", "") or "").strip(),
-                "Total Allocation": _hub_total_allocation_cap(row),
+                "Total Allocation": f"{cap_v:,.2f}",
                 "Status": str(row.get("Status", "") or "").strip(),
                 "Created Date": created,
                 "Notes": _hub_notes_preview(row.get("Notes")),
@@ -152,10 +177,12 @@ def _apply_hub_seed(pick: str, projects: pd.DataFrame) -> None:
                 st.session_state["hub_new_pid"] = ""
         else:
             st.session_state["hub_new_pid"] = ""
+        _hub_clear_drive_editor_widget_keys()
         return
 
     sub = projects[projects["Project_ID"].astype(str) == str(pick)]
     if sub.empty:
+        _hub_clear_drive_editor_widget_keys()
         return
     row = sub.iloc[0]
     st.session_state["tower_company_name"] = str(row.get("Company_Name") or "")
@@ -193,6 +220,8 @@ def _apply_hub_seed(pick: str, projects: pd.DataFrame) -> None:
             st.session_state["hub_deadline_date"] = _coerce_date_val(row.get("Hard_Deadline") or row.get("Close_Date"))
     else:
         st.session_state["hub_deadline_date"] = _coerce_date_val(row.get("Hard_Deadline") or row.get("Close_Date"))
+
+    _hub_clear_drive_editor_widget_keys()
 
 
 def render_project_hub() -> None:
@@ -325,7 +354,7 @@ def render_project_hub() -> None:
             step=0.01,
             format="%.4f",
             key="hub_sp",
-            help="存储为数值；展示使用千分位格式。",
+            help="存储为数值；下方有千分位预览。",
         )
         deal = c2.selectbox("Deal_Type (模式)", [DEAL_SOFT, DEAL_HOT], key="hub_deal")
         target_cap = c3.number_input(
@@ -378,15 +407,40 @@ def render_project_hub() -> None:
         _pr_live = str(st.session_state.get("hub_preset_raw", "") or "")
         st.caption(f"档位预览（千分位）：**{_preset_options_display(_pr_live)}**")
 
-        attach_help = (
-            "可选。Soft Circle 路演材料等将保存至 data/attachments/，文件名前缀为 Project_ID。"
+        st.markdown("**云端资料链接（Google Drive）**")
+        st.caption(
+            "与当前项目绑定，保存至 `projects.csv` 的 **Cloud_Drive_Links_JSON**，并同步到会话 **projects_data**；"
+            "Smart Distribution 发信前可勾选插入正文。无二进制上传，不受 Streamlit 文件大小限制。"
         )
-        uploaded_project_files = st.file_uploader(
-            "项目附件上传（可选）",
-            accept_multiple_files=True,
-            help=attach_help,
-            key="hub_project_files",
+        _drive_tbl_key = f"hub_drive_ed_{pick}"
+        _drive_seed = _hub_drive_initial_dataframe(pick, projects)
+        _drive_raw = st.session_state.get(_drive_tbl_key)
+        _drive_df = coerce_drive_editor_value_to_df(_drive_raw, _drive_seed)
+        drive_edited = st.data_editor(
+            _drive_df,
+            num_rows="dynamic",
+            hide_index=True,
+            use_container_width=True,
+            key=_drive_tbl_key,
+            column_config={
+                "description": st.column_config.TextColumn("文件描述", required=False),
+                "url": st.column_config.TextColumn("Google Drive URL", required=False),
+            },
         )
+        drive_edited = coerce_drive_editor_value_to_df(drive_edited, _drive_seed)
+        _drive_items = dataframe_to_drive_items(drive_edited)
+        if _drive_items:
+            st.caption("逐条核对：「验证链接」在**新标签页**打开。")
+            for j, it in enumerate(_drive_items):
+                u = str(it.get("url", "") or "").strip()
+                lab = str(it.get("description", "") or "").strip() or u or f"链接 {j + 1}"
+                cva, cvb = st.columns([5, 1])
+                with cva:
+                    st.text(f"{j + 1}. {lab}")
+                with cvb:
+                    if u.startswith("http://") or u.startswith("https://"):
+                        # 旧版 Streamlit 的 link_button 不支持 key=；用唯一文案区分组件
+                        st.link_button(f"验证链接 ·{j + 1}", u)
 
         t_clean = str(st.session_state.get("tower_form_ticker", "")).strip()
         company_saved = str(st.session_state.get("tower_company_name", "")).strip()
@@ -397,6 +451,7 @@ def render_project_hub() -> None:
         deadline_date_str = hub_deadline_d.strftime("%Y-%m-%d")
         warrant_save = str(st.session_state.get("hub_warrant_info", "") or "")
         project_notes = str(st.session_state.get("hub_project_notes", "") or "")
+        cloud_links_json = serialize_drive_links(dataframe_to_drive_items(drive_edited))
 
         if is_new:
             submitted = st.button("🚀 创建新项目", type="primary", key="hub_btn_create")
@@ -456,6 +511,7 @@ def render_project_hub() -> None:
                             "warrant_info": warrant_save,
                             "deadline_date": deadline_date_str,
                             "Created_Date": date.today().strftime("%Y-%m-%d"),
+                            "Cloud_Drive_Links_JSON": cloud_links_json,
                         }
                         merged = pd.concat([projects, pd.DataFrame([row])], ignore_index=True)
                         merged = merged.drop_duplicates(subset=["Project_ID"], keep="last")
@@ -465,19 +521,7 @@ def render_project_hub() -> None:
                             f" Project_Name=`{pname_auto}` · Hard Cap={_fmt_money2(tc_val)} · "
                             f"Options={_preset_options_display(preset_norm)} · Hold={int(hold_m)}mo."
                         )
-                        if uploaded_project_files:
-                            ensure_data_subdirs()
-                            for uf in uploaded_project_files:
-                                safe = os.path.basename(str(uf.name))
-                                dest = os.path.join(ATTACHMENTS_DIR, f"{pid_clean}_{safe}")
-                                with open(dest, "wb") as out:
-                                    out.write(uf.getbuffer())
-                            st.success(
-                                f"项目已创建；已保存 {len(uploaded_project_files)} 个附件至 data/attachments/。"
-                                + msg_extra
-                            )
-                        else:
-                            st.success("项目已创建。" + msg_extra)
+                        st.success("项目已创建。" + msg_extra)
                         st.session_state["_hub_seeded_for"] = None
                         st.session_state["_hub_reseed"] = True
                         st.rerun()
@@ -521,23 +565,13 @@ def render_project_hub() -> None:
                         projects.at[row_idx, "Notes"] = project_notes.strip()
                         projects.at[row_idx, "warrant_info"] = warrant_save
                         projects.at[row_idx, "deadline_date"] = deadline_date_str
+                        projects.at[row_idx, "Cloud_Drive_Links_JSON"] = cloud_links_json
                         prev_cd = str(prev.get("Created_Date", "") or "").strip()
                         if not prev_cd:
                             projects.at[row_idx, "Created_Date"] = soft_d.strftime("%Y-%m-%d")
                         save_projects(projects)
                         _hub_sync_projects_session(load_projects())
-                        if uploaded_project_files:
-                            ensure_data_subdirs()
-                            for uf in uploaded_project_files:
-                                safe = os.path.basename(str(uf.name))
-                                dest = os.path.join(ATTACHMENTS_DIR, f"{str(pick).strip()}_{safe}")
-                                with open(dest, "wb") as out:
-                                    out.write(uf.getbuffer())
-                            st.success(
-                                f"已更新项目信息；另保存 {len(uploaded_project_files)} 个附件至 data/attachments/。"
-                            )
-                        else:
-                            st.success("已更新项目信息。")
+                        st.success("已更新项目信息。")
                         _invalidate_action_bench(pick)
                         st.session_state["_hub_seeded_for"] = None
                         st.session_state["_hub_reseed"] = True
@@ -546,28 +580,8 @@ def render_project_hub() -> None:
         st.divider()
 
         if projects.empty:
-            st.info("暂无已保存项目。创建第一个项目后，将在此显示附件上传与分配工作台。")
+            st.info("暂无已保存项目。创建第一个项目后，将在此显示分配工作台。")
             return
-
-        with st.expander("向已有项目追加附件（保存至 data/attachments）", expanded=False):
-            apid = st.selectbox(
-                "项目",
-                pid_list,
-                key="tower_attach_project_pick",
-                format_func=app_mod.project_id_select_format_func(projects),
-            )
-            more_files = st.file_uploader("选择文件", accept_multiple_files=True, key="tower_attach_more_files")
-            if st.button("保存附件", key="tower_attach_more_save"):
-                if not more_files:
-                    st.warning("请先选择文件。")
-                else:
-                    ensure_data_subdirs()
-                    for uf in more_files:
-                        safe = os.path.basename(str(uf.name))
-                        dest = os.path.join(ATTACHMENTS_DIR, f"{str(apid).strip()}_{safe}")
-                        with open(dest, "wb") as out:
-                            out.write(uf.getbuffer())
-                    st.success(f"已保存 {len(more_files)} 个文件。")
 
         if is_new:
             st.info("当前为「新建项目」模式：请选择上方已有项目以进入状态、意向与分配工作台。")
@@ -653,7 +667,7 @@ def render_project_hub() -> None:
                 key=f"tower_open_editor_{selected}",
                 column_config={
                     "client_id": st.column_config.TextColumn("client_id"),
-                    "Desired_Amount": st.column_config.NumberColumn("Desired_Amount", format="%.2f"),
+                    "Desired_Amount": st.column_config.NumberColumn("Desired_Amount", format="%,.2f"),
                 },
             )
             if st.button("保存意向 (Open)", key=f"tower_save_open_{selected}"):
@@ -806,14 +820,14 @@ def render_project_hub() -> None:
             st.session_state[bk] = _apply_final_shares(st.session_state[bk], share_price, True)
 
         cfg = {
-            "Desired_Amount": st.column_config.NumberColumn("Desired_Amount", format="%.2f", disabled=True),
-            "Suggested_Amount": st.column_config.NumberColumn("Suggested_Amount", format="%.2f", disabled=True),
+            "Desired_Amount": st.column_config.NumberColumn("Desired_Amount", format="%,.2f", disabled=True),
+            "Suggested_Amount": st.column_config.NumberColumn("Suggested_Amount", format="%,.2f", disabled=True),
             "Final_Allocation": st.column_config.NumberColumn(
                 "Final_Allocation",
-                format="%.2f",
+                format="%,.2f",
                 disabled=(status == STATUS_CLOSED or dispatch_lock_edit),
             ),
-            "Final_Shares": st.column_config.NumberColumn("Final_Shares", format="%.4f", disabled=True),
+            "Final_Shares": st.column_config.NumberColumn("Final_Shares", format="%,.4f", disabled=True),
             "Tier": st.column_config.TextColumn("Tier", disabled=True),
             "Name_Household": st.column_config.TextColumn("Name/Household", disabled=True),
         }

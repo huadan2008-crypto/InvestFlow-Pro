@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from investflow_data import ATTACHMENTS_DIR, COMMITMENTS_CSV, ensure_data_subdirs
+from investflow_data import COMMITMENTS_CSV
 from hot_deal_dispatch_v21 import _ticker_last_price, _yahoo_finance_search_quotes
 
 COMMITMENTS_FILE = COMMITMENTS_CSV
@@ -416,7 +416,7 @@ def render_project_control_tower() -> None:
                 value=0.50,
                 step=0.01,
                 format="%.4f",
-                help="存储为数值；展示使用千分位格式。",
+                help="存储为数值；下方有千分位预览。",
             )
             deal = c2.selectbox("Deal_Type (模式)", [DEAL_SOFT, DEAL_HOT], index=0)
             target_cap = c3.number_input(
@@ -446,13 +446,8 @@ def render_project_control_tower() -> None:
             )
             st.caption(f"档位预览（千分位）：**{_preset_options_display(preset_raw)}**")
             notes = c3.text_input("Notes", value="")
-            attach_help = (
-                "可选。Soft Circle 路演材料等将保存至 data/attachments/，文件名前缀为 Project_ID。"
-            )
-            uploaded_project_files = st.file_uploader(
-                "项目附件上传（可选）",
-                accept_multiple_files=True,
-                help=attach_help,
+            st.caption(
+                "路演材料等请使用 **Project Hub** 页的「云端资料链接（Google Drive）」维护；此处不再上传二进制文件。"
             )
             submitted = st.form_submit_button("创建项目")
             if submitted:
@@ -502,6 +497,7 @@ def render_project_control_tower() -> None:
                                 "warrant_info": "",
                                 "deadline_date": hard_d.strftime("%Y-%m-%d"),
                                 "Created_Date": date.today().strftime("%Y-%m-%d"),
+                                "Cloud_Drive_Links_JSON": "[]",
                             }
                             merged = pd.concat([projects, pd.DataFrame([row])], ignore_index=True)
                             merged = merged.drop_duplicates(subset=["Project_ID"], keep="last")
@@ -510,19 +506,7 @@ def render_project_control_tower() -> None:
                                 f" Project_Name=`{pname_auto}` · Hard Cap={_fmt_money2(target_cap)} · "
                                 f"Options={_preset_options_display(preset_norm)} · Hold={int(hold_m)}mo."
                             )
-                            if uploaded_project_files:
-                                ensure_data_subdirs()
-                                for uf in uploaded_project_files:
-                                    safe = os.path.basename(str(uf.name))
-                                    dest = os.path.join(ATTACHMENTS_DIR, f"{pid_clean}_{safe}")
-                                    with open(dest, "wb") as out:
-                                        out.write(uf.getbuffer())
-                                st.success(
-                                    f"项目已创建；已保存 {len(uploaded_project_files)} 个附件至 data/attachments/。"
-                                    + msg_extra
-                                )
-                            else:
-                                st.success("项目已创建。" + msg_extra)
+                            st.success("项目已创建。" + msg_extra)
                             st.rerun()
 
     if projects.empty:
@@ -531,26 +515,6 @@ def render_project_control_tower() -> None:
 
     pid_list = projects["Project_ID"].astype(str).tolist()
     _pid_fmt = app.project_id_select_format_func(projects)
-
-    with st.expander("向已有项目追加附件（保存至 data/attachments）", expanded=False):
-        apid = st.selectbox(
-            "项目",
-            pid_list,
-            key="tower_attach_project_pick",
-            format_func=_pid_fmt,
-        )
-        more_files = st.file_uploader("选择文件", accept_multiple_files=True, key="tower_attach_more_files")
-        if st.button("保存附件", key="tower_attach_more_save"):
-            if not more_files:
-                st.warning("请先选择文件。")
-            else:
-                ensure_data_subdirs()
-                for uf in more_files:
-                    safe = os.path.basename(str(uf.name))
-                    dest = os.path.join(ATTACHMENTS_DIR, f"{str(apid).strip()}_{safe}")
-                    with open(dest, "wb") as out:
-                        out.write(uf.getbuffer())
-                st.success(f"已保存 {len(more_files)} 个文件。")
 
     selected = st.selectbox(
         "选择项目",
@@ -659,7 +623,7 @@ def render_project_control_tower() -> None:
             key=f"tower_open_editor_{selected}",
             column_config={
                 "client_id": st.column_config.TextColumn("client_id"),
-                "Desired_Amount": st.column_config.NumberColumn("Desired_Amount", format="%.2f"),
+                "Desired_Amount": st.column_config.NumberColumn("Desired_Amount", format="%,.2f"),
             },
         )
         if st.button("保存意向 (Open)", key=f"tower_save_open_{selected}"):
@@ -811,14 +775,14 @@ def render_project_control_tower() -> None:
         st.session_state[bk] = _apply_final_shares(st.session_state[bk], share_price, True)
 
     cfg = {
-        "Desired_Amount": st.column_config.NumberColumn("Desired_Amount", format="%.2f", disabled=True),
-        "Suggested_Amount": st.column_config.NumberColumn("Suggested_Amount", format="%.2f", disabled=True),
+        "Desired_Amount": st.column_config.NumberColumn("Desired_Amount", format="%,.2f", disabled=True),
+        "Suggested_Amount": st.column_config.NumberColumn("Suggested_Amount", format="%,.2f", disabled=True),
         "Final_Allocation": st.column_config.NumberColumn(
             "Final_Allocation",
-            format="%.2f",
+            format="%,.2f",
             disabled=(status == STATUS_CLOSED or dispatch_lock_edit),
         ),
-        "Final_Shares": st.column_config.NumberColumn("Final_Shares", format="%.4f", disabled=True),
+        "Final_Shares": st.column_config.NumberColumn("Final_Shares", format="%,.4f", disabled=True),
         "Tier": st.column_config.TextColumn("Tier", disabled=True),
         "Name_Household": st.column_config.TextColumn("Name/Household", disabled=True),
     }
