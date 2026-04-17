@@ -1,8 +1,36 @@
-# Streamlit secrets — never commit
+# Streamlit — 切勿提交密钥
 .streamlit/secrets.toml
 
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
+.Python
 .venv/
 venv/
+env/
+.env
+.env.*
+!.env.example
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# 本地运行产生的快照目录（若曾启用过应用内节点保存）
+data/distribution_nodes/
