@@ -575,7 +575,13 @@ def render_hot_deal_dispatch_v21() -> None:
     commits_all = _load_commitments()
     rules = _load_rules()
 
-    selected_pid = st.selectbox("选择项目", hot_projects["Project_ID"].astype(str).tolist(), key="hd_pid")
+    _fmt_hd = app.project_id_select_format_func(hot_projects)
+    selected_pid = st.selectbox(
+        "选择项目",
+        hot_projects["Project_ID"].astype(str).tolist(),
+        key="hd_pid",
+        format_func=_fmt_hd,
+    )
     prj_row = hot_projects[hot_projects["Project_ID"].astype(str) == str(selected_pid)].iloc[0]
 
     share_price = float(pd.to_numeric(prj_row.get("Share_Price"), errors="coerce") or 0.0) or 0.0001

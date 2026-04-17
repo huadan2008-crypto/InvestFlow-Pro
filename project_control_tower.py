@@ -389,16 +389,26 @@ def render_project_control_tower() -> None:
                 st.caption(f"yfinance · `{_tk_preview}` 参考价：**{_fmt_money2(_px)}**（延迟行情，仅供参考）")
 
         with st.form("tower_create_project"):
-            pid = st.text_input("Project_ID", value=f"P{len(projects)+1:04d}")
             ticker = st.text_input("Ticker（可搜索填入或手输）", key="tower_form_ticker")
             name_date = st.date_input(
-                "命名日期（用于 Project_Name = Ticker_YYYY-MM-DD）",
+                "命名日期（用于 Project_Name = Ticker_YYYY-MM-DD；并参与 Project_ID 的年月）",
                 value=date.today(),
             )
             t_clean_preview = str(st.session_state.get("tower_form_ticker", "")).strip()
             if t_clean_preview:
                 auto_name = f"{t_clean_preview}_{name_date.strftime('%Y-%m-%d')}"
                 st.caption(f"将保存的 **Project_Name**：`{auto_name}`")
+                ab_prev = app.sanitize_project_id_abbrev(t_clean_preview)
+                if ab_prev:
+                    try:
+                        _prev_id = app.next_project_id_for_month(
+                            ab_prev,
+                            projects["Project_ID"].astype(str).tolist(),
+                            name_date,
+                        )
+                        st.caption(f"将生成的 **Project_ID**：`{_prev_id}`（Ticker 清洗为缩写 + 年月 + 当月流水）")
+                    except ValueError as exc:
+                        st.caption(f"Project_ID 预览不可用：{exc}")
             c1, c2, c3 = st.columns(3)
             sp = c1.number_input(
                 "Share_Price",
@@ -455,58 +465,80 @@ def render_project_control_tower() -> None:
                     pname_auto = f"{t_clean}_{name_date.strftime('%Y-%m-%d')}"
                     preset_norm = _normalize_preset_options_csv(preset_raw)
                     final_cap = float(target_cap) if deal == DEAL_HOT else 0.0
-                    pid_clean = str(pid).strip()
-                    company_saved = str(st.session_state.get("tower_company_name", "")).strip()
-                    row = {
-                        "Project_ID": pid_clean,
-                        "Project_Name": pname_auto,
-                        "Company_Name": company_saved,
-                        "Ticker": t_clean,
-                        "Share_Price": float(sp),
-                        "Final_Cap": final_cap,
-                        "Open_Date": soft_d.strftime("%Y-%m-%d"),
-                        "Close_Date": hard_d.strftime("%Y-%m-%d"),
-                        "Soft_Deadline": soft_d.strftime("%Y-%m-%d"),
-                        "Hard_Deadline": hard_d.strftime("%Y-%m-%d"),
-                        "Target_Total_Cap": float(target_cap),
-                        "Negotiated_Final_Cap": 0.0,
-                        "Status": STATUS_OPEN,
-                        "Deal_Type": deal,
-                        "Lot_Size": int(lot_sz),
-                        "Preset_Options": preset_norm,
-                        "Hold_Period_Months": int(hold_m),
-                        "Notes": str(notes).strip(),
-                    }
-                    merged = pd.concat([projects, pd.DataFrame([row])], ignore_index=True)
-                    merged = merged.drop_duplicates(subset=["Project_ID"], keep="last")
-                    save_projects(merged)
-                    msg_extra = (
-                        f" Project_Name=`{pname_auto}` · Hard Cap={_fmt_money2(target_cap)} · "
-                        f"Options={_preset_options_display(preset_norm)} · Hold={int(hold_m)}mo."
-                    )
-                    if uploaded_project_files:
-                        ensure_data_subdirs()
-                        for uf in uploaded_project_files:
-                            safe = os.path.basename(str(uf.name))
-                            dest = os.path.join(ATTACHMENTS_DIR, f"{pid_clean}_{safe}")
-                            with open(dest, "wb") as out:
-                                out.write(uf.getbuffer())
-                        st.success(
-                            f"项目已创建；已保存 {len(uploaded_project_files)} 个附件至 data/attachments/。"
-                            + msg_extra
-                        )
+                    abbr = app.sanitize_project_id_abbrev(t_clean)
+                    if not abbr:
+                        st.error("无法生成 Project_ID：Ticker 需包含字母或数字。")
                     else:
-                        st.success("项目已创建。" + msg_extra)
-                    st.rerun()
+                        try:
+                            pid_clean = app.next_project_id_for_month(
+                                abbr,
+                                projects["Project_ID"].astype(str).tolist(),
+                                name_date,
+                            )
+                        except ValueError as exc:
+                            st.error(str(exc))
+                        else:
+                            company_saved = str(st.session_state.get("tower_company_name", "")).strip()
+                            row = {
+                                "Project_ID": pid_clean,
+                                "Project_Name": pname_auto,
+                                "Company_Name": company_saved,
+                                "Ticker": t_clean,
+                                "Share_Price": float(sp),
+                                "Final_Cap": final_cap,
+                                "Open_Date": soft_d.strftime("%Y-%m-%d"),
+                                "Close_Date": hard_d.strftime("%Y-%m-%d"),
+                                "Soft_Deadline": soft_d.strftime("%Y-%m-%d"),
+                                "Hard_Deadline": hard_d.strftime("%Y-%m-%d"),
+                                "Target_Total_Cap": float(target_cap),
+                                "Negotiated_Final_Cap": 0.0,
+                                "Status": STATUS_OPEN,
+                                "Deal_Type": deal,
+                                "Lot_Size": int(lot_sz),
+                                "Preset_Options": preset_norm,
+                                "preset_options": preset_norm,
+                                "Hold_Period_Months": int(hold_m),
+                                "Notes": str(notes).strip(),
+                                "warrant_info": "",
+                                "deadline_date": hard_d.strftime("%Y-%m-%d"),
+                                "Created_Date": date.today().strftime("%Y-%m-%d"),
+                            }
+                            merged = pd.concat([projects, pd.DataFrame([row])], ignore_index=True)
+                            merged = merged.drop_duplicates(subset=["Project_ID"], keep="last")
+                            save_projects(merged)
+                            msg_extra = (
+                                f" Project_Name=`{pname_auto}` · Hard Cap={_fmt_money2(target_cap)} · "
+                                f"Options={_preset_options_display(preset_norm)} · Hold={int(hold_m)}mo."
+                            )
+                            if uploaded_project_files:
+                                ensure_data_subdirs()
+                                for uf in uploaded_project_files:
+                                    safe = os.path.basename(str(uf.name))
+                                    dest = os.path.join(ATTACHMENTS_DIR, f"{pid_clean}_{safe}")
+                                    with open(dest, "wb") as out:
+                                        out.write(uf.getbuffer())
+                                st.success(
+                                    f"项目已创建；已保存 {len(uploaded_project_files)} 个附件至 data/attachments/。"
+                                    + msg_extra
+                                )
+                            else:
+                                st.success("项目已创建。" + msg_extra)
+                            st.rerun()
 
     if projects.empty:
         st.info("暂无项目，请先创建。")
         return
 
     pid_list = projects["Project_ID"].astype(str).tolist()
+    _pid_fmt = app.project_id_select_format_func(projects)
 
     with st.expander("向已有项目追加附件（保存至 data/attachments）", expanded=False):
-        apid = st.selectbox("项目", pid_list, key="tower_attach_project_pick")
+        apid = st.selectbox(
+            "项目",
+            pid_list,
+            key="tower_attach_project_pick",
+            format_func=_pid_fmt,
+        )
         more_files = st.file_uploader("选择文件", accept_multiple_files=True, key="tower_attach_more_files")
         if st.button("保存附件", key="tower_attach_more_save"):
             if not more_files:
@@ -520,7 +552,12 @@ def render_project_control_tower() -> None:
                         out.write(uf.getbuffer())
                 st.success(f"已保存 {len(more_files)} 个文件。")
 
-    selected = st.selectbox("选择项目", pid_list, key="tower_pick_project")
+    selected = st.selectbox(
+        "选择项目",
+        pid_list,
+        key="tower_pick_project",
+        format_func=_pid_fmt,
+    )
     idx = projects.index[projects["Project_ID"].astype(str) == selected]
     if len(idx) == 0:
         return

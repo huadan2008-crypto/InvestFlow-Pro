@@ -556,7 +556,14 @@ def render_distribution_tab_full() -> None:
         return
 
     pids = projects[pid_col].astype(str).tolist()
-    pid = st.selectbox("选择项目", pids, key="dist_proj_pick")
+    import app as _app_pid_fmt
+
+    pid = st.selectbox(
+        "选择项目",
+        pids,
+        key="dist_proj_pick",
+        format_func=_app_pid_fmt.project_id_select_format_func(projects),
+    )
     try:
         row = _select_project_row(projects, str(pid))
     except KeyError:

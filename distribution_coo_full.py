@@ -120,7 +120,12 @@ def render_distribution_coo_full() -> None:
         st.error("筛选后无项目，请取消勾选或维护项目状态。")
         return
 
-    pid = st.selectbox("选择项目", disp["Project_ID"].astype(str).tolist(), key="dist_coo_pid")
+    pid = st.selectbox(
+        "选择项目",
+        disp["Project_ID"].astype(str).tolist(),
+        key="dist_coo_pid",
+        format_func=app_mod.project_id_select_format_func(disp),
+    )
     row = disp[disp["Project_ID"].astype(str) == str(pid)].iloc[0]
 
     ticker = str(row.get("Ticker", "") or "").strip() or "—"

@@ -420,7 +420,12 @@ def render_project_email_dispatch_v24() -> None:
         return
 
     pid_list = eligible["Project_ID"].astype(str).tolist()
-    sel_pid = st.selectbox("选择项目（Status 为 Open，含 Hot Deal / Soft Circle）", pid_list, key="v24_project_select")
+    sel_pid = st.selectbox(
+        "选择项目（Status 为 Open，含 Hot Deal / Soft Circle）",
+        pid_list,
+        key="v24_project_select",
+        format_func=app_mod.project_id_select_format_func(eligible),
+    )
 
     row = eligible[eligible["Project_ID"].astype(str) == str(sel_pid)].iloc[0]
     company_name = str(row.get("Project_Name", "") or "").strip() or "—"

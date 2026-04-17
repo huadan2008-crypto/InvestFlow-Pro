@@ -1,14 +1,19 @@
 import os
-from io import StringIO
+import re
+from io import BytesIO, StringIO
 from datetime import date
+from typing import Any, Callable, List, Optional
+
 import pandas as pd
 import streamlit as st
-from crm_mgmt import render_crm_mgmt
 
-from investflow_data import PROJECTS_CSV
+from investflow_data import DATA_DIR, PROJECTS_CSV, ROOT_DIR, ensure_data_subdirs, resolved_commitments_csv_path
+from utils.final_allocations_io import merged_allocation_map_for_project
+from utils.oid_feedback_io import clients_with_portal_confirmation
 
 DEFAULT_SUBSCRIPTION_FILES = ["private_equity_workflow.csv", "my_investments.csv"]
-CRM_FILE = os.path.join("Data", "client_master.csv")
+# CRM 主数据仅使用 CSV，请在应用内维护，以便 client_id 自动生成与唯一性校验一致。
+CRM_FILE = os.path.join(ROOT_DIR, "Data", "client_master.csv")
 PROJECT_FILE = PROJECTS_CSV
 POOL_RULES_FILE = "pool_rules.csv"
 CRM_COLUMNS = [
@@ -42,6 +47,7 @@ PROJECT_COLUMNS = [
     "Notes",
     "warrant_info",
     "deadline_date",
+    "Created_Date",
 ]
 POOL_COLUMNS = [
     "Project_ID",
@@ -118,8 +124,104 @@ def _pick_column(df, candidates):
     return None
 
 
+def sanitize_project_id_abbrev(raw: str, *, max_len: int = 16) -> str:
+    """
+    项目缩写：仅保留字母与数字并转大写（用于 Project_ID 前缀）。
+    Yahoo 类代码中的点号等符号会去掉，例如 BRK.B -> BRKB。
+    """
+    s = re.sub(r"[^A-Za-z0-9]", "", str(raw or "")).upper()
+    return s[:max_len] if s else ""
+
+
+def next_project_id_for_month(abbrev: str, existing_project_ids: List[str], ref: date) -> str:
+    """
+    生成 Project_ID：ABBREV-YYMM-NN（NN 为当月同前缀流水，01 起）。
+    existing_project_ids 中凡符合同前缀+同年月的 ID 均参与取最大流水 +1。
+    """
+    ab = sanitize_project_id_abbrev(abbrev)
+    if not ab:
+        raise ValueError("项目缩写无效：请至少包含字母或数字。")
+    yymm = ref.strftime("%y%m")
+    rx = re.compile("^" + re.escape(ab) + r"-" + re.escape(yymm) + r"-(\d{2})$", re.IGNORECASE)
+    max_n = 0
+    for pid in existing_project_ids:
+        m = rx.match(str(pid).strip())
+        if m:
+            max_n = max(max_n, int(m.group(1)))
+    seq = max_n + 1
+    if seq > 99:
+        raise ValueError("当月同前缀项目编号已超过 99，请更换缩写或月份后再试。")
+    return f"{ab}-{yymm}-{seq:02d}"
+
+
+def _project_id_column_name(df: pd.DataFrame) -> Optional[str]:
+    for c in df.columns:
+        if str(c).strip().lower() == "project_id":
+            return str(c)
+    return None
+
+
+def project_id_select_format_func(projects: pd.DataFrame) -> Callable[[str], str]:
+    """下拉框展示「完整 Project_ID · 名称或 Ticker」，便于识别。"""
+    labels: dict[str, str] = {}
+    pid_col = _project_id_column_name(projects)
+    if not projects.empty and pid_col:
+        for _, row in projects.iterrows():
+            pid = str(row.get(pid_col, "")).strip()
+            if not pid:
+                continue
+            nm = str(row.get("Project_Name") or row.get("project_name") or "").strip()
+            tk = str(row.get("Ticker") or row.get("ticker") or "").strip()
+            extra = nm or tk
+            labels[pid] = f"{pid} · {extra}" if extra else pid
+
+    def _fmt(pid: str) -> str:
+        key = str(pid).strip()
+        return labels.get(key, key)
+
+    return _fmt
+
+
+INVESTFLOW_PROJECT_SELECTOR_KEY = "investflow_project_selector"
+
+
+def _ensure_project_selector_state(pids: List[str]) -> None:
+    """保证全局项目选择器的 session 值落在当前项目列表内。"""
+    if not pids:
+        st.session_state.pop(INVESTFLOW_PROJECT_SELECTOR_KEY, None)
+        st.session_state["current_project"] = ""
+        return
+    cur = st.session_state.get(INVESTFLOW_PROJECT_SELECTOR_KEY)
+    if cur is None or str(cur).strip() not in pids:
+        st.session_state[INVESTFLOW_PROJECT_SELECTOR_KEY] = pids[-1]
+    st.session_state["current_project"] = str(st.session_state[INVESTFLOW_PROJECT_SELECTOR_KEY]).strip()
+
+
+def render_sidebar_current_project(projects: Optional[pd.DataFrame] = None) -> None:
+    """侧边栏：当前操作项目（单一数据源 investflow_project_selector，展示完整 ID）。"""
+    df = projects if projects is not None else _load_or_init_projects()
+    pid_col = _project_id_column_name(df)
+    with st.sidebar:
+        st.markdown("##### 当前操作项目")
+        if df.empty or not pid_col:
+            st.caption("暂无项目，请先在 Project Hub 创建。")
+            st.session_state.pop(INVESTFLOW_PROJECT_SELECTOR_KEY, None)
+            st.session_state["current_project"] = ""
+            return
+        pids = [str(x).strip() for x in df[pid_col].astype(str).tolist() if str(x).strip()]
+        _ensure_project_selector_state(pids)
+        fmt = project_id_select_format_func(df)
+        st.selectbox(
+            "Project_ID",
+            options=pids,
+            key=INVESTFLOW_PROJECT_SELECTOR_KEY,
+            format_func=fmt,
+        )
+    st.session_state["current_project"] = str(st.session_state.get(INVESTFLOW_PROJECT_SELECTOR_KEY, "")).strip()
+
+
 def _load_or_init_crm():
-    legacy_file = "crm_clients.csv"
+    legacy_file = os.path.join(ROOT_DIR, "crm_clients.csv")
     if not os.path.exists(CRM_FILE) and os.path.exists(legacy_file):
         legacy = pd.read_csv(legacy_file)
         migrated = pd.DataFrame()
@@ -130,11 +232,18 @@ def _load_or_init_crm():
         migrated["tier"] = legacy.get("Tier", legacy.get("tier", "Public"))
         migrated["tag"] = legacy.get("Tag", legacy.get("tag", ""))
         migrated["entity_name"] = legacy.get("entity_name", legacy.get("Entity_Name", ""))
+        os.makedirs(os.path.dirname(CRM_FILE), exist_ok=True)
         migrated.to_csv(CRM_FILE, index=False)
 
     if not os.path.exists(CRM_FILE):
+        os.makedirs(os.path.dirname(CRM_FILE), exist_ok=True)
         pd.DataFrame(columns=CRM_COLUMNS).to_csv(CRM_FILE, index=False)
-    df = pd.read_csv(CRM_FILE)
+    try:
+        df = pd.read_csv(CRM_FILE)
+    except PermissionError as exc:
+        raise RuntimeError(
+            "无法读取 CRM 文件：可能被其他程序独占打开。请先关闭该文件后再试。"
+        ) from exc
     for col in CRM_COLUMNS:
         if col not in df.columns:
             df[col] = ""
@@ -146,7 +255,13 @@ def _save_crm(df):
     for col in CRM_COLUMNS:
         if col not in out.columns:
             out[col] = ""
-    out[CRM_COLUMNS].to_csv(CRM_FILE, index=False)
+    os.makedirs(os.path.dirname(CRM_FILE), exist_ok=True)
+    try:
+        out[CRM_COLUMNS].to_csv(CRM_FILE, index=False)
+    except PermissionError as exc:
+        raise RuntimeError(
+            "无法保存 CRM：文件可能被其他程序占用。请关闭占用该 CSV 的程序后重试。"
+        ) from exc
 
 
 def _load_or_init_projects():
@@ -186,6 +301,10 @@ def _load_or_init_projects():
         df.loc[empty_p, "Preset_Options"] = p2.loc[empty_p]
     df["warrant_info"] = df["warrant_info"].fillna("").astype(str)
     df["deadline_date"] = df["deadline_date"].fillna("").astype(str)
+    if "Created_Date" in df.columns:
+        df["Created_Date"] = df["Created_Date"].fillna("").astype(str)
+    if "Project_ID" in df.columns:
+        df["Project_ID"] = df["Project_ID"].map(lambda x: "" if pd.isna(x) else str(x).strip())
     return df[PROJECT_COLUMNS].copy()
 
 
@@ -194,6 +313,8 @@ def _save_projects(df):
     for col in PROJECT_COLUMNS:
         if col not in out.columns:
             out[col] = pd.NA if col == "Hold_Period_Months" else ""
+    if "Project_ID" in out.columns:
+        out["Project_ID"] = out["Project_ID"].map(lambda x: "" if pd.isna(x) else str(x).strip())
     out[PROJECT_COLUMNS].to_csv(PROJECT_FILE, index=False)
 
 
@@ -616,48 +737,67 @@ def render_project_lifecycle():
     st.caption("管理项目全生命周期：Draft / Upcoming / Active / Closed / Expired")
 
     projects = _load_or_init_projects()
+    render_sidebar_current_project(projects)
     subs_df, subs_src = _load_default_subscriptions()
 
     with st.expander("创建新项目", expanded=False):
         with st.form("create_project_form"):
             c1, c2, c3 = st.columns(3)
-            project_id = c1.text_input("Project_ID", value=f"P{len(projects)+1:04d}")
-            project_name = c1.text_input("Project_Name", value="")
-            ticker = c2.text_input("Ticker", value="")
-            share_price = c2.number_input("Share_Price", min_value=0.0, value=0.50, step=0.01, format="%.4f")
-            final_cap = c3.number_input("Final_Cap", min_value=0.0, value=1_000_000.0, step=10_000.0)
-            open_date = c1.date_input("Open_Date", value=date.today())
-            close_date = c2.date_input("Close_Date", value=date.today())
-            deal_type = c3.selectbox("Deal_Type", ["Soft Circle", "Hot Deal"], index=0)
-            lot_size = c1.number_input("Lot_Size", min_value=1, value=100, step=1)
-            preset = c2.text_input("Preset_Options(金额档位,逗号分隔)", value="10000,15000,20000")
-            notes = c3.text_input("Notes", value="")
-            submitted = st.form_submit_button("创建项目")
+            project_abbrev = c1.text_input(
+                "项目缩写（用于生成 Project_ID，如 WML）",
+                value="",
+                help="仅字母与数字；与 Open_Date 的年月 (YYMM) 及当月流水组成 ID，例如 WML-2604-01。",
+            )
+            project_name = c2.text_input("Project_Name", value="")
+            ticker = c3.text_input("Ticker", value="")
+            share_price = c1.number_input("Share_Price", min_value=0.0, value=0.50, step=0.01, format="%.4f")
+            final_cap = c2.number_input("Final_Cap", min_value=0.0, value=1_000_000.0, step=10_000.0)
+            open_date = c3.date_input("Open_Date（决定 ID 中的年月）", value=date.today())
+            close_date = c1.date_input("Close_Date", value=date.today())
+            deal_type = c2.selectbox("Deal_Type", ["Soft Circle", "Hot Deal"], index=0)
+            lot_size = c3.number_input("Lot_Size", min_value=1, value=100, step=1)
+            preset = c1.text_input("Preset_Options(金额档位,逗号分隔)", value="10000,15000,20000")
+            notes = c2.text_input("Notes", value="")
+            submitted = c3.form_submit_button("创建项目")
             if submitted:
-                new_row = {
-                    "Project_ID": str(project_id).strip(),
-                    "Project_Name": str(project_name).strip(),
-                    "Company_Name": "",
-                    "Ticker": str(ticker).strip(),
-                    "Share_Price": float(share_price),
-                    "Final_Cap": float(final_cap),
-                    "Open_Date": open_date.strftime("%Y-%m-%d"),
-                    "Close_Date": close_date.strftime("%Y-%m-%d"),
-                    "Soft_Deadline": open_date.strftime("%Y-%m-%d"),
-                    "Hard_Deadline": close_date.strftime("%Y-%m-%d"),
-                    "Target_Total_Cap": float(final_cap) if str(deal_type).strip() == "Hot Deal" else 0.0,
-                    "Negotiated_Final_Cap": 0.0,
-                    "Status": "Draft",
-                    "Deal_Type": deal_type,
-                    "Lot_Size": int(lot_size),
-                    "Preset_Options": str(preset).strip(),
-                    "Hold_Period_Months": pd.NA,
-                    "Notes": str(notes).strip(),
-                }
-                merged = pd.concat([projects, pd.DataFrame([new_row])], ignore_index=True)
-                merged = merged.drop_duplicates(subset=["Project_ID"], keep="last")
-                _save_projects(merged)
-                st.success("项目已创建。")
+                ab_src = str(project_abbrev).strip() or str(ticker).strip() or str(project_name).strip()
+                try:
+                    project_id = next_project_id_for_month(
+                        ab_src,
+                        projects["Project_ID"].astype(str).tolist(),
+                        open_date,
+                    )
+                except ValueError as exc:
+                    st.error(str(exc))
+                else:
+                    new_row = {
+                        "Project_ID": project_id,
+                        "Project_Name": str(project_name).strip(),
+                        "Company_Name": "",
+                        "Ticker": str(ticker).strip(),
+                        "Share_Price": float(share_price),
+                        "Final_Cap": float(final_cap),
+                        "Open_Date": open_date.strftime("%Y-%m-%d"),
+                        "Close_Date": close_date.strftime("%Y-%m-%d"),
+                        "Soft_Deadline": open_date.strftime("%Y-%m-%d"),
+                        "Hard_Deadline": close_date.strftime("%Y-%m-%d"),
+                        "Target_Total_Cap": float(final_cap) if str(deal_type).strip() == "Hot Deal" else 0.0,
+                        "Negotiated_Final_Cap": 0.0,
+                        "Status": "Draft",
+                        "Deal_Type": deal_type,
+                        "Lot_Size": int(lot_size),
+                        "Preset_Options": str(preset).strip(),
+                        "preset_options": str(preset).strip(),
+                        "Hold_Period_Months": pd.NA,
+                        "Notes": str(notes).strip(),
+                        "warrant_info": "",
+                        "deadline_date": close_date.strftime("%Y-%m-%d"),
+                        "Created_Date": date.today().strftime("%Y-%m-%d"),
+                    }
+                    merged = pd.concat([projects, pd.DataFrame([new_row])], ignore_index=True)
+                    merged = merged.drop_duplicates(subset=["Project_ID"], keep="last")
+                    _save_projects(merged)
+                    st.success(f"项目已创建，Project_ID = `{project_id}`。")
 
     if projects.empty:
         st.info("暂无项目，请先创建。")
@@ -682,14 +822,18 @@ def render_project_lifecycle():
     st.dataframe(display, use_container_width=True)
 
     st.subheader("状态操作")
+    st.caption("当前项目请在**左侧边栏**选择（展示完整 Project_ID）。")
     c1, c2 = st.columns(2)
-    selected_pid = c1.selectbox(
-        "选择项目", display["Project_ID"].tolist(), key="lifecycle_status_project_select"
-    )
+    selected_pid = str(st.session_state.get(INVESTFLOW_PROJECT_SELECTOR_KEY) or "").strip()
+    with c1:
+        st.markdown(f"**已选 Project_ID：** `{selected_pid}`" if selected_pid else "（未选择项目）")
     action = c2.selectbox(
         "操作", ["Force Close", "Reopen as Active"], key="lifecycle_status_action_select"
     )
     if st.button("执行状态更新"):
+        if not selected_pid:
+            st.error("请先在左侧边栏选择项目。")
+            return
         idx = projects.index[projects["Project_ID"].astype(str) == str(selected_pid)]
         if len(idx) > 0:
             if action == "Force Close":
@@ -706,9 +850,10 @@ def _split_tags(text):
 
 def render_dynamic_pool():
     st.header("动态分池")
-    st.caption("按 Tier/Tag/优先级配置池规则，预览客户落池与池容量。")
+    st.caption("按 Tier/Tag/优先级配置池规则，预览客户落池与池容量。当前项目在左侧边栏选择。")
 
     projects = _load_or_init_projects()
+    render_sidebar_current_project(projects)
     crm = _load_or_init_crm()
     rules = _load_or_init_pool_rules()
 
@@ -716,11 +861,11 @@ def render_dynamic_pool():
         st.info("请先在“项目周期”创建项目。")
         return
 
-    project_id = st.selectbox(
-        "选择项目",
-        projects["Project_ID"].astype(str).tolist(),
-        key="dynamic_pool_project_select",
-    )
+    project_id = str(st.session_state.get(INVESTFLOW_PROJECT_SELECTOR_KEY) or "").strip()
+    pids_set = set(projects["Project_ID"].astype(str).str.strip())
+    if not project_id or project_id not in pids_set:
+        st.info("请在左侧边栏选择一个项目。")
+        return
     prj = projects[projects["Project_ID"].astype(str) == str(project_id)].iloc[0]
     final_cap = float(pd.to_numeric(pd.Series([prj["Final_Cap"]]), errors="coerce").fillna(0.0).iloc[0])
 
@@ -806,9 +951,16 @@ def render_dynamic_pool():
 
 def render_crm_module():
     st.header("CRM 模块")
-    st.caption("先标准化客户主数据，再用于分配与档位约束。")
+    st.caption(
+        "先标准化客户主数据，再用于分配与档位约束。"
+        " 建议在页面内新增、导入或表格编辑并保存；留空 client_id 时会自动生成编号，手工改磁盘上的 CSV 易造成编号与约束不一致。"
+    )
 
-    df_crm = _load_or_init_crm()
+    try:
+        df_crm = _load_or_init_crm()
+    except RuntimeError as exc:
+        st.error(str(exc))
+        return
 
     col1, col2, col3 = st.columns(3)
     col1.metric("客户数", f"{len(df_crm):,}")
@@ -922,25 +1074,441 @@ def render_crm_module():
     )
 
 
+# —— Closing Deal / 签署统计 ——
+CLOSING_SIGN_OPTIONS = ["待发送", "已发待签", "已签署", "已作废"]
+CLOSING_FUND_OPTIONS = ["未到账", "已收 Receipt", "已入账"]
+
+CLOSING_EMAIL_TEMPLATE = """主题：[Closing] {{project_label}} — 认购文件与签署指引
+
+尊敬的 {{investor_name}}，
+
+您好！
+
+现进入 **Closing** 阶段，请查收与本项目相关的法律及认购文件。您在 **{{project_label}}** 项下的当前分配额度为 **{{allocation_cad}} CAD**（以最终锁定文件为准）。
+
+请您在核对附件后，按指引完成电子签署；完成签署或资金划出后，请通过邮件回复或按 Portal 提示操作。
+
+**随附核对清单（COO 侧）：**
+- AUCU Subs
+- Client Info
+- EDE RDI
+- AUCU Disclosure
+
+如有疑问请联系您的客户经理。
+
+此致
+EDE / COO 团队
+"""
+
+
+def _closing_mock_investors_df() -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "client_id": "DEMO_C001",
+                "姓名": "演示投资人甲",
+                "邮件": "investor.a@example.com",
+                "分配额度": 250000.0,
+                "签署状态": "待发送",
+                "资金状态": "未到账",
+                "备注": "（模拟数据：无 commitments 时展示）",
+            },
+            {
+                "client_id": "DEMO_C002",
+                "姓名": "演示投资人乙",
+                "邮件": "investor.b@example.com",
+                "分配额度": 180000.0,
+                "签署状态": "已发待签",
+                "资金状态": "未到账",
+                "备注": "",
+            },
+            {
+                "client_id": "DEMO_C003",
+                "姓名": "演示投资人丙",
+                "邮件": "investor.c@example.com",
+                "分配额度": 95000.0,
+                "签署状态": "已签署",
+                "资金状态": "已收 Receipt",
+                "备注": "Portal 已确认",
+            },
+        ]
+    )
+
+
+def _project_label_for_closing(projects: pd.DataFrame, pid: str) -> str:
+    sub = projects[projects["Project_ID"].astype(str).str.strip() == str(pid).strip()]
+    if sub.empty:
+        return str(pid)
+    row = sub.iloc[0]
+    nm = str(row.get("Project_Name") or "").strip()
+    tk = str(row.get("Ticker") or "").strip()
+    if nm and tk:
+        return f"{nm} ({tk})"
+    return nm or tk or str(pid)
+
+
+def _build_closing_deal_base_df(pid: str) -> pd.DataFrame:
+    """合并 commitments + CRM + final/allocation 映射；Portal 已确认则默认「已签署」。"""
+    cpath = resolved_commitments_csv_path()
+    commits = pd.read_csv(cpath) if os.path.isfile(cpath) else pd.DataFrame()
+    crm = _load_or_init_crm()
+    alloc_map = merged_allocation_map_for_project(str(pid))
+    confirmed = clients_with_portal_confirmation(str(pid))
+
+    rows: List[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    if not commits.empty and "Project_ID" in commits.columns and "client_id" in commits.columns:
+        sub = commits[commits["Project_ID"].astype(str).str.strip() == str(pid).strip()]
+        for _, r in sub.iterrows():
+            cid = str(r.get("client_id", "")).strip()
+            if not cid or cid.startswith("__"):
+                continue
+            seen.add(cid)
+            nm = str(r.get("Name_Household", "") or "").strip()
+            email = ""
+            if not crm.empty and "client_id" in crm.columns:
+                hit = crm[crm["client_id"].astype(str).str.strip() == cid]
+                if not hit.empty:
+                    if (not nm) and "name" in hit.columns:
+                        nm = str(hit.iloc[0].get("name") or "").strip()
+                    if "email" in hit.columns:
+                        email = str(hit.iloc[0].get("email") or "").strip()
+            amt = pd.to_numeric(r.get("Final_Allocation"), errors="coerce")
+            if pd.isna(amt) or float(amt) <= 0:
+                amt = pd.to_numeric(r.get("Suggested_Amount"), errors="coerce")
+            if pd.isna(amt) or float(amt) <= 0:
+                amt = float(alloc_map.get(cid, 0.0))
+            else:
+                amt = float(amt)
+
+            sign_st = "已签署" if cid in confirmed else "待发送"
+            rows.append(
+                {
+                    "client_id": cid,
+                    "姓名": nm or cid,
+                    "邮件": email,
+                    "分配额度": round(float(amt), 2),
+                    "签署状态": sign_st,
+                    "资金状态": "未到账",
+                    "备注": "",
+                }
+            )
+
+    for cid, amt in alloc_map.items():
+        c = str(cid).strip()
+        if not c or c.startswith("__") or c in seen:
+            continue
+        nm, email = c, ""
+        if not crm.empty and "client_id" in crm.columns:
+            hit = crm[crm["client_id"].astype(str).str.strip() == c]
+            if not hit.empty:
+                if "name" in hit.columns:
+                    nm = str(hit.iloc[0].get("name") or "").strip() or c
+                if "email" in hit.columns:
+                    email = str(hit.iloc[0].get("email") or "").strip()
+        sign_st = "已签署" if c in confirmed else "待发送"
+        rows.append(
+            {
+                "client_id": c,
+                "姓名": nm,
+                "邮件": email,
+                "分配额度": round(float(amt), 2),
+                "签署状态": sign_st,
+                "资金状态": "未到账",
+                "备注": "（来自锁定分配表，无 commitments 行）",
+            }
+        )
+
+    if not rows:
+        return _closing_mock_investors_df()
+    return pd.DataFrame(rows)
+
+
+def _closing_apply_template(body: str, *, name: str, amount: float, project_label: str) -> str:
+    amt_s = f"{amount:,.2f}"
+    return (
+        body.replace("{{investor_name}}", name)
+        .replace("{{allocation_cad}}", amt_s)
+        .replace("{{project_label}}", project_label)
+    )
+
+
+def _closing_attachments_dir(pid: str) -> str:
+    ensure_data_subdirs()
+    safe_pid = str(pid).strip().replace("..", "").replace("/", "").replace("\\", "")
+    d = os.path.join(DATA_DIR, "closing_attachments", safe_pid)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _closing_list_attachment_filenames(pid: str) -> List[str]:
+    root = _closing_attachments_dir(pid)
+    if not os.path.isdir(root):
+        return []
+    names: List[str] = []
+    for fn in sorted(os.listdir(root)):
+        p = os.path.join(root, fn)
+        if os.path.isfile(p) and not fn.startswith("."):
+            names.append(fn)
+    return names
+
+
+def _closing_attachment_footer_lines(filenames: List[str]) -> str:
+    if not filenames:
+        return ""
+    lines = "\n".join(f"- {n}" for n in filenames)
+    return (
+        "\n\n---\n"
+        "【请在邮件客户端中附带以下文件】（本页已上传保存，可点击侧栏下载核对）\n"
+        f"{lines}\n"
+    )
+
+
+def _closing_export_excel_bytes(df: pd.DataFrame) -> Optional[bytes]:
+    cols = [c for c in ["姓名", "邮件", "分配额度", "签署状态", "资金状态", "备注"] if c in df.columns]
+    out = df[cols].copy() if cols else df.copy()
+    try:
+        buf = BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            out.to_excel(writer, index=False, sheet_name="Closing")
+        return buf.getvalue()
+    except ImportError:
+        return None
+
+
+def render_closing_stats() -> None:
+    st.header("Closing Deal · 签署与关账")
+    st.caption("手工维护签署/资金状态，批量预览 Closing 邮件，并导出报表。当前项目在左侧边栏选择。")
+
+    projects = _load_or_init_projects()
+    render_sidebar_current_project(projects)
+    if projects.empty:
+        st.info("暂无项目。")
+        return
+
+    pid = str(st.session_state.get(INVESTFLOW_PROJECT_SELECTOR_KEY) or "").strip()
+    if not pid or pid not in set(projects["Project_ID"].astype(str).str.strip()):
+        st.warning("请在左侧边栏选择一个有效项目。")
+        return
+    project_label = _project_label_for_closing(projects, str(pid))
+    df_key = f"closing_deal_df_{pid}"
+
+    st.warning(
+        "**Closing 附件核对（COO）** 请确认以下 4 份材料齐备并已按需发送：  \n"
+        "1. **AUCU Subs**  · 2. **Client Info**  · 3. **EDE RDI**  · 4. **AUCU Disclosure**"
+    )
+    docusign_ok = st.checkbox(
+        "已在 ZohoSign / Docusign 中手工填妥额度并发出",
+        key=f"closing_docusign_ack_{pid}",
+    )
+    if not docusign_ok:
+        st.caption("建议完成电子签发出后再批量发送 Closing 邮件。")
+
+    c_refresh, _ = st.columns([1, 3])
+    if c_refresh.button("从数据源刷新清单", key=f"closing_refresh_{pid}"):
+        st.session_state[df_key] = _build_closing_deal_base_df(str(pid))
+        st.session_state.pop(f"closing_email_previews_{pid}", None)
+        st.rerun()
+
+    if df_key not in st.session_state:
+        st.session_state[df_key] = _build_closing_deal_base_df(str(pid))
+
+    work: pd.DataFrame = st.session_state[df_key].copy()
+    for col in ("姓名", "邮件", "备注", "client_id"):
+        if col not in work.columns:
+            work[col] = ""
+    if "签署状态" not in work.columns:
+        work["签署状态"] = CLOSING_SIGN_OPTIONS[0]
+    if "资金状态" not in work.columns:
+        work["资金状态"] = CLOSING_FUND_OPTIONS[0]
+    work["签署状态"] = work["签署状态"].astype(str).apply(
+        lambda x: x if x in CLOSING_SIGN_OPTIONS else CLOSING_SIGN_OPTIONS[0]
+    )
+    work["资金状态"] = work["资金状态"].astype(str).apply(
+        lambda x: x if x in CLOSING_FUND_OPTIONS else CLOSING_FUND_OPTIONS[0]
+    )
+    if "分配额度" not in work.columns:
+        work["分配额度"] = 0.0
+    work["分配额度"] = pd.to_numeric(work["分配额度"], errors="coerce").fillna(0.0)
+
+    signed_n = int((work["签署状态"].astype(str) == "已签署").sum())
+    total_n = len(work)
+    m1, m2, m3 = st.columns(3)
+    m1.metric("签署进度", f"{signed_n} / {total_n}", help="状态为「已签署」的人数")
+    m2.metric("待发送", int((work["签署状态"].astype(str) == "待发送").sum()))
+    m3.metric("已发待签", int((work["签署状态"].astype(str) == "已发待签").sum()))
+
+    st.subheader("投资人清单（Data Editor）")
+    edited = st.data_editor(
+        work,
+        column_config={
+            "client_id": st.column_config.TextColumn("client_id", disabled=True, help="内部主键"),
+            "姓名": st.column_config.TextColumn("投资人姓名", disabled=True),
+            "邮件": st.column_config.TextColumn("邮件", disabled=True),
+            "分配额度": st.column_config.NumberColumn("分配额度 (CAD)", disabled=True, format="%.2f"),
+            "签署状态": st.column_config.SelectboxColumn(
+                "签署状态",
+                options=CLOSING_SIGN_OPTIONS,
+                required=True,
+            ),
+            "资金状态": st.column_config.SelectboxColumn(
+                "资金状态",
+                options=CLOSING_FUND_OPTIONS,
+                required=True,
+            ),
+            "备注": st.column_config.TextColumn("备注"),
+        },
+        hide_index=True,
+        use_container_width=True,
+        num_rows="fixed",
+    )
+    st.session_state[df_key] = edited.copy()
+
+    with st.expander("📄 查看 Closing 邮件模板内容", expanded=False):
+        st.code(CLOSING_EMAIL_TEMPLATE, language=None)
+
+        st.markdown("**Closing 邮件附件**")
+        st.caption(
+            "文件保存至本机 `data/closing_attachments/<项目ID>/`；正式发信时请在邮件客户端中**手动添加**这些附件。"
+        )
+        uploaded_files = st.file_uploader(
+            "选择文件后点击「保存到附件库」（可多选）",
+            accept_multiple_files=True,
+            key=f"closing_att_upload_{pid}",
+            help="支持 PDF / Office / 图片 / 压缩包等；同名文件将被覆盖。",
+        )
+        if uploaded_files and st.button("💾 保存到附件库", key=f"closing_att_save_{pid}"):
+            dest_root = _closing_attachments_dir(str(pid))
+            saved = 0
+            for uf in uploaded_files:
+                safe_name = os.path.basename(str(getattr(uf, "name", "") or ""))
+                if not safe_name or safe_name.startswith("."):
+                    continue
+                out_path = os.path.join(dest_root, safe_name)
+                with open(out_path, "wb") as f:
+                    f.write(uf.getvalue())
+                saved += 1
+            if saved:
+                st.success(f"已保存 **{saved}** 个附件。")
+                st.rerun()
+
+        att_names = _closing_list_attachment_filenames(str(pid))
+        if att_names:
+            st.markdown("**已保存的附件**")
+            for i, fn in enumerate(att_names):
+                fp = os.path.join(_closing_attachments_dir(str(pid)), fn)
+                c1, c2, c3 = st.columns([4, 1, 1])
+                with c1:
+                    st.text(fn)
+                with c2:
+                    try:
+                        with open(fp, "rb") as fb:
+                            blob = fb.read()
+                    except OSError:
+                        blob = b""
+                    st.download_button(
+                        "下载",
+                        data=blob,
+                        file_name=fn,
+                        key=f"closing_att_dl_{pid}_{i}",
+                        mime="application/octet-stream",
+                    )
+                with c3:
+                    if st.button("删除", key=f"closing_att_rm_{pid}_{i}"):
+                        try:
+                            os.remove(fp)
+                        except OSError:
+                            pass
+                        st.rerun()
+        else:
+            st.info("尚未上传附件；批量预览中的正文将不含「拟附附件清单」段落。")
+
+    if st.button("📧 批量生成邮件预览", key=f"closing_batch_preview_btn_{pid}"):
+        previews: List[dict[str, str]] = []
+        att_block = _closing_attachment_footer_lines(_closing_list_attachment_filenames(str(pid)))
+        for _, row in edited.iterrows():
+            if str(row.get("签署状态", "")).strip() != "待发送":
+                continue
+            name = str(row.get("姓名", "") or "").strip()
+            amt = float(pd.to_numeric(row.get("分配额度"), errors="coerce") or 0.0)
+            body = _closing_apply_template(
+                CLOSING_EMAIL_TEMPLATE,
+                name=name or "投资人",
+                amount=amt,
+                project_label=project_label,
+            )
+            body = body + att_block
+            previews.append({"to": str(row.get("邮件", "") or "").strip(), "subject_in_body": body.split("\n")[0], "body": body})
+        st.session_state[f"closing_email_previews_{pid}"] = previews
+        st.rerun()
+
+    prev_key = f"closing_email_previews_{pid}"
+    if st.session_state.get(prev_key):
+        st.subheader("邮件预览（仅「待发送」）")
+        for i, p in enumerate(st.session_state[prev_key]):
+            with st.expander(f"预览 #{i + 1} · {p.get('to') or '（无邮箱）'}", expanded=False):
+                st.text(p.get("body", ""))
+
+    st.divider()
+    export_cols = [c for c in ["姓名", "邮件", "分配额度", "签署状态", "资金状态", "备注"] if c in edited.columns]
+    export_df = edited[export_cols].copy() if export_cols else edited.copy()
+    xlsx_bytes = _closing_export_excel_bytes(edited)
+    csv_bytes = export_df.to_csv(index=False).encode("utf-8-sig")
+
+    b1, b2 = st.columns(2)
+    with b1:
+        if xlsx_bytes:
+            st.download_button(
+                "📥 导出最终 Excel 报表",
+                data=xlsx_bytes,
+                file_name=f"closing_{pid}_report.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"closing_dl_xlsx_{pid}",
+            )
+        else:
+            st.download_button(
+                "📥 导出报表（安装 openpyxl 后可导出 .xlsx）",
+                data=csv_bytes,
+                file_name=f"closing_{pid}_report.csv",
+                mime="text/csv",
+                key=f"closing_dl_xlsx_fallback_{pid}",
+            )
+    with b2:
+        st.download_button(
+            "📥 导出 CSV",
+            data=csv_bytes,
+            file_name=f"closing_{pid}_report.csv",
+            mime="text/csv",
+            key=f"closing_dl_csv_{pid}",
+        )
+    if xlsx_bytes is None:
+        st.caption("安装 **openpyxl** 后左侧主按钮将导出 Excel：`pip install openpyxl`")
+
+    if st.button("🏁 启动关账程序", key=f"closing_launch_{pid}"):
+        st.success("关账检查已记录（占位）。建议确认：签署进度、资金状态、附件与 Docusign 勾选。")
+
+
 def main():
     """
-    InvestFlow v2.5 主页。侧边栏模块请使用 `pages/` 下四个入口：
-    1_👤_CRM · 2_🏗️_Project_Hub · 3_📧_Distribution · 4_🎯_Action_Center
+    InvestFlow 主页。业务模块一律从左侧 Streamlit **Pages** 菜单进入（单一导航，无重复侧栏）。
     """
-    st.set_page_config(page_title="InvestFlow v2.5", layout="wide")
-    st.title("InvestFlow v2.5")
+    st.set_page_config(page_title="InvestFlow", layout="wide", page_icon="📊")
+    st.title("InvestFlow")
     st.markdown(
         """
-从左侧 **Pages** 菜单进入四大模块：
+从左侧 **app** 菜单进入各模块（仅此一套导航）：
 
 | # | 模块 | 说明 |
 |---|------|------|
-| 1 | **CRM** | 客户主数据（`crm_mgmt`） |
-| 2 | **Project Hub** | Hot Deal / Soft Circle 项目创建、附件、`project_control_tower` |
-| 3 | **Distribution** | COO 完整模板分发（constants）+ 通用 COO 邮件 |
-| 4 | **Action Center** | 分配计算器、Hot Deal OID 工作台、OID 统计、动态分池、项目周期 |
+| 1 | **CRM** | 客户主数据 |
+| 2 | **Project Hub** | 项目创建与 Control Tower |
+| 3 | **Distribution** | COO 邮件与模板分发 |
+| 4 | **Allocation Center** | 分配决策台、同步锁定、**余额对冲（GP 池）** |
+| 5 | **Investment Portal** | 投资人门户预览 |
+| 6 | **签署统计 · Closing** | Portal 签署进度、关账入口 |
 
-统一数据文件（根目录）：`projects.csv`、`commitments.csv`（由 `investflow_data` 定义路径）。
+数据：`projects.csv`、`commitments.csv`（路径由 `investflow_data` 解析）。
 """
     )
 

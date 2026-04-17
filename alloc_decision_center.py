@@ -1179,6 +1179,9 @@ def render_allocations_decision_center() -> None:
     st.subheader("分配决策台")
 
     projects = _read_projects_df()
+    import app as _app_alloc
+
+    _app_alloc.render_sidebar_current_project(projects)
     pid_col = _project_id_column(projects)
     if projects.empty or pid_col not in projects.columns:
         st.warning("未找到 projects.csv。")
@@ -1187,7 +1190,12 @@ def render_allocations_decision_center() -> None:
     pids = projects[pid_col].astype(str).tolist()
     row_top = st.columns([4, 1])
     with row_top[0]:
-        pid = st.selectbox("选择项目", pids, key="ac_alloc_proj_pick")
+        pid = st.selectbox(
+            "选择项目",
+            pids,
+            key="ac_alloc_proj_pick",
+            format_func=_app_alloc.project_id_select_format_func(projects),
+        )
     with row_top[1]:
         st.write("")
         if st.button("刷新实时数据", key="ac_refresh_oid_fb", help="重新读取 oid_feedback.csv / 邮件发送记录等"):
