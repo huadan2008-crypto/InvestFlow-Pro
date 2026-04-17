@@ -25,6 +25,7 @@ from utils.final_allocations_io import (
     SYNTHETIC_BUFFER_CLIENT_ID,
     save_final_allocations_replace_project,
 )
+from utils.activity_log import log_action
 from utils.oid_feedback_io import RESPONSE_INTENT, read_oid_feedback_df
 
 
@@ -1378,6 +1379,27 @@ def render_allocations_decision_center() -> None:
         st.session_state.df_alloc = df_alloc
         st.session_state[override_key] = df_alloc.copy()
         _save_final_allocations_including_buffer(str(pid), df_alloc, cap, _ed_price, _ed_lot)
+        if "Suggested_Amount" in df_alloc.columns:
+            try:
+                _sum_s = int(
+                    pd.to_numeric(df_alloc["Suggested_Amount"], errors="coerce").fillna(0).sum()
+                )
+            except Exception:
+                _sum_s = -1
+        else:
+            _sum_s = -1
+        log_action(
+            "allocation_sync_lock",
+            f"rows={len(df_alloc)}; sum_suggested_cad={_sum_s}",
+            project_id=str(pid),
+        )
+        from project_control_tower import STATUS_ALLOCATING
+
+        _app_alloc.update_project_status(
+            str(pid),
+            STATUS_ALLOCATING,
+            actor="system (Allocation Center: sync-lock final allocations)",
+        )
         st.success(
             f"已同步并写入 `{FINAL_ALLOCATIONS_CSV}`（投资人各行 + 尾差 `{SYNTHETIC_BUFFER_CLIENT_ID}`）。"
         )

@@ -64,6 +64,8 @@ COO_CLIENT_ID = "__COO_MANAGEMENT__"
 
 STATUS_OPEN = "募集中 (Open)"
 STATUS_PROCESSING = "谈判/分配中 (Processing)"
+STATUS_ALLOCATING = "分配中 (Allocating)"
+STATUS_CLOSING = "关账中 (Closing)"
 STATUS_CLOSED = "已结项 (Closed)"
 
 DEAL_SOFT = "Soft Circle"
@@ -212,12 +214,16 @@ def _save_commitments(df: pd.DataFrame) -> None:
 
 def _normalize_status(val: Any) -> str:
     s = str(val).strip()
-    if s in (STATUS_OPEN, STATUS_PROCESSING, STATUS_CLOSED):
+    if s in (STATUS_OPEN, STATUS_PROCESSING, STATUS_ALLOCATING, STATUS_CLOSING, STATUS_CLOSED):
         return s
     if s in ("Draft", "Active", "Upcoming", "Open"):
         return STATUS_OPEN
     if s in ("Processing", "Negotiating"):
         return STATUS_PROCESSING
+    if s in ("Allocating", "分配中", "分配中 (Allocating)"):
+        return STATUS_ALLOCATING
+    if s in ("Closing", "关账中", "关账中 (Closing)"):
+        return STATUS_CLOSING
     if s in ("Closed", "已结项 (Closed)"):
         return STATUS_CLOSED
     return STATUS_OPEN
@@ -227,7 +233,7 @@ def _project_effective_cap(row: pd.Series, deal: str, status: str) -> Optional[f
     """Effective hard cap for validation; None => skip allocation cap check (Mode A Open)."""
     if deal == DEAL_SOFT and status == STATUS_OPEN:
         return None
-    if deal == DEAL_SOFT and status in (STATUS_PROCESSING, STATUS_CLOSED):
+    if deal == DEAL_SOFT and status in (STATUS_PROCESSING, STATUS_ALLOCATING, STATUS_CLOSING, STATUS_CLOSED):
         v_neg = float(pd.to_numeric(row.get("Negotiated_Final_Cap"), errors="coerce") or 0.0)
         if v_neg > 0:
             return v_neg
@@ -533,7 +539,7 @@ def render_project_control_tower() -> None:
 
     st.subheader(f"{selected} · {deal}")
 
-    status_options = [STATUS_OPEN, STATUS_PROCESSING, STATUS_CLOSED]
+    status_options = [STATUS_OPEN, STATUS_PROCESSING, STATUS_ALLOCATING, STATUS_CLOSING, STATUS_CLOSED]
     cur_status = _normalize_status(prj.get("Status", STATUS_OPEN))
     if cur_status not in status_options:
         cur_status = STATUS_OPEN
@@ -698,7 +704,7 @@ def render_project_control_tower() -> None:
             key=f"tower_neg_{selected}",
         )
         st.caption(f"Negotiated_Final_Cap 展示：**{_fmt_money2(new_neg)}**")
-        if status == STATUS_PROCESSING:
+        if status in (STATUS_PROCESSING, STATUS_ALLOCATING, STATUS_CLOSING):
             live_cap = float(new_neg)
             cap_eff = live_cap if live_cap > 0 else cap_eff
             if cap_eff is not None and cap_eff <= 0:
@@ -731,9 +737,9 @@ def render_project_control_tower() -> None:
 
     if status != STATUS_OPEN and cap_eff is not None and cap_eff > 0:
         st.caption(f"分配工作台生效硬顶 Cap: **{cap_eff:,.2f}**（合计须 ≤ Cap 方可 Lock & Save）")
-    elif deal == DEAL_SOFT and status == STATUS_PROCESSING:
+    elif deal == DEAL_SOFT and status in (STATUS_PROCESSING, STATUS_ALLOCATING, STATUS_CLOSING):
         st.warning("请填写大于 0 的 Negotiated_Final_Cap，或使用右侧按钮写入项目后再进行 Lock & Save。")
-    elif deal == DEAL_HOT and status == STATUS_PROCESSING and (cap_eff is None or cap_eff <= 0):
+    elif deal == DEAL_HOT and status in (STATUS_PROCESSING, STATUS_ALLOCATING, STATUS_CLOSING) and (cap_eff is None or cap_eff <= 0):
         st.warning("模式 B 需有效的硬上限（Target_Total_Cap / Final_Cap）方可 Lock & Save。")
 
     if deal == DEAL_HOT:

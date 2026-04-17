@@ -1,8 +1,9 @@
-"""InvestFlow v2.5 — Project Hub：新建 / 编辑共用完整登记表单 + Control Tower 工作台（仅本页）"""
+"""InvestFlow v2.5 — Project Hub：新建 / 编辑 + Control Tower（独立多页入口；UI/CSS 在本文件维护，非 app.py）。"""
 from __future__ import annotations
 
 import html
 from datetime import date
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -14,7 +15,9 @@ from project_control_tower import (
     COO_CLIENT_ID,
     DEAL_HOT,
     DEAL_SOFT,
+    STATUS_ALLOCATING,
     STATUS_CLOSED,
+    STATUS_CLOSING,
     STATUS_OPEN,
     STATUS_PROCESSING,
     compute_soft_circle_suggested,
@@ -32,6 +35,7 @@ from project_control_tower import (
     _project_effective_cap,
     _save_commitments,
 )
+from utils.activity_log import log_action
 from utils.cloud_drive_links import (
     coerce_drive_editor_value_to_df,
     dataframe_to_drive_items,
@@ -44,42 +48,104 @@ st.set_page_config(page_title="Project Hub", layout="wide", page_icon="🏗️")
 
 NEW_LABEL = "(新建项目)"
 HUB_PROJECTS_DATA_KEY = "projects_data"
+# Allocation Center 多页文件名含 emoji，运行时解析路径供 st.switch_page 使用。
+_ALLOC_CENTER_REL: str | None = None
+try:
+    _p = next(Path(__file__).resolve().parent.glob("*Allocation_Center.py"))
+    _ALLOC_CENTER_REL = "pages/" + _p.name
+except StopIteration:
+    _ALLOC_CENTER_REL = None
+
+
+def _hub_sync_global_project_and_goto_alloc(project_id: str) -> None:
+    """不在本页写入 investflow_project_selector（侧栏已实例化会报错）；写入 pending 后 switch_page，由 Allocation Center 入口消费。"""
+    pid = str(project_id).strip()
+    st.session_state[app_mod.PENDING_ALLOC_NAV_FROM_HUB_KEY] = pid
+    st.session_state.pop(f"tower_open_editor_{pid}", None)
+    if _ALLOC_CENTER_REL:
+        try:
+            st.switch_page(_ALLOC_CENTER_REL)
+        except Exception:
+            st.session_state.pop(app_mod.PENDING_ALLOC_NAV_FROM_HUB_KEY, None)
+            st.warning(
+                "无法自动打开 Allocation Center（需 Streamlit ≥ 1.30 且多页路径可用）。"
+                "请从左侧菜单进入 **🎯 Allocation Center** 并手动选择项目。"
+            )
+    else:
+        st.session_state.pop(app_mod.PENDING_ALLOC_NAV_FROM_HUB_KEY, None)
+        st.warning("未找到 Allocation Center 页面文件；请从左侧菜单手动进入该模块。")
 
 HUB_SURFACE_CSS = """
 <style>
-    .hub-surface {
-        border-radius: 14px;
-        box-shadow: 0 2px 14px rgba(15, 23, 42, 0.07);
-        border: 1px solid rgba(148, 163, 184, 0.28);
-        padding: 0.85rem 1rem;
-        margin-bottom: 0.65rem;
-        background: rgba(255, 255, 255, 0.92);
-    }
-    .hub-card {
-        border-radius: 12px;
-        box-shadow: 0 2px 12px rgba(15, 23, 42, 0.08);
-        border: 1px solid rgba(148, 163, 184, 0.22);
-        padding: 1rem 1.15rem;
-        background: linear-gradient(165deg, #fafbfc 0%, #f1f5f9 100%);
-    }
-    .hub-badge {
+    .status-badge {
         display: inline-block;
-        padding: 0.2rem 0.65rem;
-        border-radius: 999px;
-        font-size: 0.82rem;
-        font-weight: 600;
-        letter-spacing: 0.02em;
+        min-width: 4.75rem;
+        text-align: center;
+        padding: 0.38rem 0.85rem;
+        border-radius: 8px;
+        font-size: 0.78rem;
+        font-weight: 700;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
     }
-    .hub-kpi-label { font-size: 0.8rem; margin-bottom: 0.2rem; }
-    .hub-kpi-value { font-size: 1.35rem; font-weight: 600; line-height: 1.2; }
-    .hub-kpi-box {
-        border-radius: 10px;
-        padding: 0.65rem 0.5rem;
-        background: #f8fafc;
-        border: 1px solid #e2e8f0;
+    .status-open { background: #ecfdf5; color: #047857; border: 1px solid #a7f3d0; }
+    .status-allocating { background: #eff6ff; color: #1d4ed8; border: 1px solid #bfdbfe; }
+    .status-closing { background: #fff7ed; color: #c2410c; border: 1px solid #fed7aa; }
+    .status-closed { background: #f1f5f9; color: #475569; border: 1px solid #e2e8f0; }
+    .metric-card {
+        background: #ffffff;
+        border-radius: 12px;
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+        border: 1px solid rgba(226, 232, 240, 0.95);
+        padding: 0.75rem 0.85rem;
         text-align: center;
     }
-    .hub-alert { color: #b91c1c !important; font-weight: 700 !important; }
+    .hub-kpi-label { font-size: 0.72rem; color: #64748b; margin-bottom: 0.25rem; font-weight: 600; }
+    .hub-kpi-value { font-size: 1.28rem; font-weight: 700; line-height: 1.15; color: #0f172a; }
+    .hub-alert { color: #b91c1c !important; }
+    .progress-bar-container {
+        height: 22px;
+        border-radius: 11px;
+        background: #e5e7eb;
+        overflow: hidden;
+        border: 1px solid #d1d5db;
+    }
+    .progress-bar-container.hub-pbc-xl { height: 26px; border-radius: 13px; }
+    .progress-bar-fill {
+        height: 100%;
+        border-radius: inherit;
+        transition: width 0.28s ease, background 0.2s ease;
+    }
+    .pbf-ok { background: linear-gradient(90deg, #1d4ed8, #3b82f6); }
+    .pbf-warn { background: linear-gradient(90deg, #c2410c, #fb923c); }
+    .pbf-danger { background: linear-gradient(90deg, #991b1b, #ef4444); }
+    .hub-glance-card {
+        background: #ffffff;
+        border-radius: 12px;
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+        border: 1px solid rgba(226, 232, 240, 0.95);
+        padding: 1rem 1.1rem;
+    }
+    .hub-glance-title {
+        font-size: 0.68rem;
+        color: #64748b;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        font-weight: 700;
+        margin-bottom: 0.65rem;
+    }
+    .hub-glance-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: baseline;
+        gap: 0.75rem;
+        padding: 0.35rem 0;
+        border-bottom: 1px solid #f1f5f9;
+        font-size: 0.88rem;
+    }
+    .hub-glance-row:last-of-type { border-bottom: none; }
+    .hub-glance-lbl { color: #64748b; font-weight: 600; flex: 0 0 auto; }
+    .hub-glance-val { color: #0f172a; font-weight: 700; text-align: right; word-break: break-all; }
 </style>
 """
 
@@ -88,26 +154,86 @@ def _hub_esc(x: Any) -> str:
     return html.escape(str(x if x is not None else ""), quote=True)
 
 
+def _hub_status_label_en(s: str) -> str:
+    if s == STATUS_OPEN:
+        return "Open"
+    if s == STATUS_PROCESSING:
+        return "Processing"
+    if s == STATUS_ALLOCATING:
+        return "Allocating"
+    if s == STATUS_CLOSING:
+        return "Closing"
+    if s == STATUS_CLOSED:
+        return "Closed"
+    return str(s)
+
+
 def _hub_status_badge_html(status_raw: Any) -> str:
     s = _normalize_status(status_raw)
     if s == STATUS_OPEN:
-        bg, fg = "#dcfce7", "#166534"
+        cls = "status-badge status-open"
+    elif s == STATUS_ALLOCATING:
+        cls = "status-badge status-allocating"
     elif s == STATUS_PROCESSING:
-        bg, fg = "#ffedd5", "#c2410c"
+        cls = "status-badge status-closing"
+    elif s == STATUS_CLOSING:
+        cls = "status-badge status-closing"
     elif s == STATUS_CLOSED:
-        bg, fg = "#e2e8f0", "#475569"
+        cls = "status-badge status-closed"
     else:
-        bg, fg = "#f1f5f9", "#334155"
-    return f'<span class="hub-badge" style="background:{bg};color:{fg};">{_hub_esc(s)}</span>'
+        cls = "status-badge status-open"
+    lab = _hub_status_label_en(s)
+    return f'<span class="{cls}">{_hub_esc(lab)}</span>'
 
 
 def _hub_kpi_box(label: str, value: str, *, label_alert: bool = False, value_alert: bool = False) -> str:
     lc = "hub-kpi-label hub-alert" if label_alert else "hub-kpi-label"
     vc = "hub-kpi-value hub-alert" if value_alert else "hub-kpi-value"
     return (
-        f'<div class="hub-kpi-box">'
+        f'<div class="metric-card">'
         f'<div class="{lc}">{_hub_esc(label)}</div>'
         f'<div class="{vc}">{_hub_esc(value)}</div>'
+        f"</div>"
+    )
+
+
+def _hub_progress_bar_html(ratio: float) -> str:
+    """ratio = desired / cap；>90% 橙色条，>100% 红色条；宽度封顶 100% 视觉。"""
+    r = max(0.0, float(ratio))
+    w = min(100.0, r * 100.0)
+    if r > 1.0 + 1e-9:
+        fill_cls = "progress-bar-fill pbf-danger"
+    elif r > 0.9 + 1e-9:
+        fill_cls = "progress-bar-fill pbf-warn"
+    else:
+        fill_cls = "progress-bar-fill pbf-ok"
+    return (
+        f'<div class="progress-bar-container hub-pbc-xl">'
+        f'<div class="{fill_cls}" style="width:{w:.2f}%"></div>'
+        f"</div>"
+    )
+
+
+def _hub_glance_card_html(
+    *,
+    ticker: str,
+    share_price_fmt: str,
+    cap_fmt: str,
+    deadline_txt: str,
+    badge_inner_html: str,
+) -> str:
+    return (
+        f'<div class="hub-glance-card">'
+        f'<div class="hub-glance-title">项目速览</div>'
+        f'<div class="hub-glance-row"><span class="hub-glance-lbl">Ticker</span>'
+        f'<span class="hub-glance-val">{_hub_esc(ticker)}</span></div>'
+        f'<div class="hub-glance-row"><span class="hub-glance-lbl">Share Price</span>'
+        f'<span class="hub-glance-val">{_hub_esc(share_price_fmt)}</span></div>'
+        f'<div class="hub-glance-row"><span class="hub-glance-lbl">Hard Cap</span>'
+        f'<span class="hub-glance-val">{_hub_esc(cap_fmt)}</span></div>'
+        f'<div class="hub-glance-row"><span class="hub-glance-lbl">距 Hard DL</span>'
+        f'<span class="hub-glance-val">{_hub_esc(deadline_txt)}</span></div>'
+        f'<div style="margin-top:0.85rem;text-align:center;">{badge_inner_html}</div>'
         f"</div>"
     )
 
@@ -322,7 +448,14 @@ def _apply_hub_seed(pick: str, projects: pd.DataFrame) -> None:
         st.session_state["hub_deadline_date"] = _coerce_date_val(row.get("Hard_Deadline") or row.get("Close_Date"))
 
     _st = _normalize_status(row.get("Status", STATUS_OPEN))
-    st.session_state["hub_project_status"] = _st if _st in (STATUS_OPEN, STATUS_PROCESSING, STATUS_CLOSED) else STATUS_OPEN
+    _allowed_hub = (
+        STATUS_OPEN,
+        STATUS_PROCESSING,
+        STATUS_ALLOCATING,
+        STATUS_CLOSING,
+        STATUS_CLOSED,
+    )
+    st.session_state["hub_project_status"] = _st if _st in _allowed_hub else STATUS_OPEN
 
     _hub_clear_drive_editor_widget_keys()
 
@@ -410,7 +543,13 @@ def render_project_hub() -> None:
                             deal_row = DEAL_SOFT
 
                         st.subheader(f"{selected} · {deal_row}")
-                        status_options = [STATUS_OPEN, STATUS_PROCESSING, STATUS_CLOSED]
+                        status_options = [
+                            STATUS_OPEN,
+                            STATUS_PROCESSING,
+                            STATUS_ALLOCATING,
+                            STATUS_CLOSING,
+                            STATUS_CLOSED,
+                        ]
                         cur_status = _normalize_status(prj.get("Status", STATUS_OPEN))
                         if cur_status not in status_options:
                             cur_status = STATUS_OPEN
@@ -469,105 +608,68 @@ def render_project_hub() -> None:
                                 unsafe_allow_html=True,
                             )
 
-                        dcol_l, dcol_r = st.columns([2, 1])
+                        _fr_ratio = (total_desired / cap_hard) if cap_hard > 0 else 0.0
+                        _cap_glance = _fmt_money2(cap_hard) if cap_hard > 0 else "—"
                         tk_card = str(prj.get("Ticker") or "").strip() or "—"
-                        with dcol_r:
-                            _card_html = (
-                                f'<div class="hub-card">'
-                                f'<div style="font-size:0.72rem;color:#64748b;text-transform:uppercase;letter-spacing:0.04em;">项目概览</div>'
-                                f'<div style="font-size:1.3rem;font-weight:700;margin:0.35rem 0;">{_hub_esc(tk_card)}</div>'
-                                f'<div style="color:#475569;font-size:0.9rem;">Share_Price <b>{_hub_esc(_fmt_share_price(share_price))}</b></div>'
-                                f'<div style="margin:0.55rem 0;">{_hub_status_badge_html(cur_status)}</div>'
-                                f'<div style="font-size:0.8rem;color:#64748b;line-height:1.4;">'
-                                f"{_hub_esc(deal_row)}<br/><span style='font-family:ui-monospace,monospace;'>{_hub_esc(selected)}</span>"
-                                f"</div></div>"
-                            )
-                            st.markdown(_card_html, unsafe_allow_html=True)
+                        dcol_l, dcol_r = st.columns([2, 1])
                         with dcol_l:
                             with st.container(border=True):
-                                st.caption("募集进度")
+                                st.markdown("##### 募集进度")
+                                st.markdown(_hub_progress_bar_html(_fr_ratio), unsafe_allow_html=True)
                                 if cap_hard > 0:
-                                    st.progress(min(1.0, total_desired / cap_hard))
                                     st.caption(
-                                        f"Σ Desired **{_fmt_money2(total_desired)}** / 硬顶 **{_fmt_money2(cap_hard)}**"
+                                        f"Σ Desired **{_fmt_money2(total_desired)}** / Hard Cap **{_fmt_money2(cap_hard)}** · 完成率 **{_pct_show}%**"
                                     )
                                 else:
-                                    st.progress(0)
-                                    st.caption("硬顶（Target_Total_Cap / Final_Cap）未设置，无法计算进度。")
+                                    st.caption("Hard Cap（Target_Total_Cap / Final_Cap）未设置。")
                                 comp_disp = str(prj.get("Company_Name", "") or "").strip()
                                 st.caption(
-                                    f"Project_Name **{str(prj.get('Project_Name', '') or '—')}** · Company **{comp_disp or '—'}** · 细则见「⚙️ 项目设置」"
+                                    f"**{str(prj.get('Project_Name', '') or '—')}** · {comp_disp or '—'} · {deal_row} · `{selected}`"
                                 )
 
                                 if status == STATUS_OPEN:
-                                    st.markdown("**Σ Desired 明细（可编辑）**")
-                                    intent_cols = ["client_id", "Name_Household", "Tier", "Desired_Amount"]
+                                    st.session_state.pop(f"tower_open_editor_{selected}", None)
+                                    st.markdown("##### 当前意向明细")
+                                    st.caption(
+                                        "此处仅显示最新同步/搜集的意向数据。如需进行额度切分或余额对冲，请前往 **Allocation Center**。"
+                                    )
+                                    intent_cols = [
+                                        "client_id",
+                                        "Name_Household",
+                                        "Tier",
+                                        "Desired_Amount",
+                                        "Suggested_Amount",
+                                        "Final_Allocation",
+                                    ]
                                     if sub.empty:
                                         intent_show = pd.DataFrame(columns=intent_cols)
                                     else:
-                                        intent_show = sub[[c for c in intent_cols if c in sub.columns]].copy()
+                                        take = [c for c in intent_cols if c in sub.columns]
+                                        intent_show = sub[take].copy()
                                         for c in intent_cols:
                                             if c not in intent_show.columns:
-                                                intent_show[c] = 0.0 if c == "Desired_Amount" else ""
-                                    edited_open = st.data_editor(
+                                                intent_show[c] = (
+                                                    0.0
+                                                    if c
+                                                    in ("Desired_Amount", "Suggested_Amount", "Final_Allocation")
+                                                    else ""
+                                                )
+                                    st.dataframe(
                                         intent_show,
                                         use_container_width=True,
                                         hide_index=True,
-                                        num_rows="dynamic",
-                                        key=f"tower_open_editor_{selected}",
-                                        column_config={
-                                            "client_id": st.column_config.TextColumn("client_id"),
-                                            "Desired_Amount": st.column_config.NumberColumn("Desired_Amount", format="%,.2f"),
-                                        },
                                     )
                                     if st.button(
-                                        "💾 保存意向 (Open)",
+                                        "⚖️ 前往分配中心调整额度",
                                         type="primary",
-                                        key=f"tower_save_open_{selected}",
+                                        key=f"tower_goto_alloc_{selected}",
                                     ):
-                                        rest = commits_all[commits_all["Project_ID"].astype(str) != str(selected)].copy()
-                                        merged_sub = sub.copy()
-                                        for _, r in edited_open.iterrows():
-                                            cid = str(r.get("client_id", "")).strip()
-                                            if not cid:
-                                                continue
-                                            mask = merged_sub["client_id"].astype(str) == cid
-                                            payload = {
-                                                "Name_Household": str(r.get("Name_Household", "")).strip(),
-                                                "Tier": str(r.get("Tier", "Public")).strip() or "Public",
-                                                "Desired_Amount": float(pd.to_numeric(r.get("Desired_Amount"), errors="coerce") or 0.0),
-                                            }
-                                            if mask.any():
-                                                for k, v in payload.items():
-                                                    merged_sub.loc[mask, k] = v
-                                            else:
-                                                merged_sub = pd.concat(
-                                                    [
-                                                        merged_sub,
-                                                        pd.DataFrame(
-                                                            [
-                                                                {
-                                                                    "Project_ID": selected,
-                                                                    "client_id": cid,
-                                                                    **payload,
-                                                                    "Suggested_Amount": 0.0,
-                                                                    "Final_Allocation": 0.0,
-                                                                    "Final_Shares": 0.0,
-                                                                    "Share_Price": share_price,
-                                                                    "Deal_Type": deal_row,
-                                                                }
-                                                            ]
-                                                        ),
-                                                    ],
-                                                    ignore_index=True,
-                                                )
-                                        full = pd.concat([rest, merged_sub], ignore_index=True)
-                                        _save_commitments(full)
-                                        _invalidate_action_bench(selected)
-                                        st.success("意向已写入 commitments.csv")
-                                        st.rerun()
+                                        _hub_sync_global_project_and_goto_alloc(str(selected))
 
-                                    st.info("募集中 (Open)：仅汇总意向金额；进入「谈判/分配中」后打开分配工作台。")
+                                    st.info(
+                                        "募集中 (Open)：Project Hub 仅做全景展示；意向与分配明细以 **commitments.csv** 为准，"
+                                        "在 Allocation Center 修改并保存后会反映于此表。"
+                                    )
                                 elif sub.empty:
                                     st.warning(
                                         "该项目尚无认购行。请先在「募集中」阶段录入意向，或在「⚙️ 项目设置」中从 CRM 同步。"
@@ -592,9 +694,10 @@ def render_project_hub() -> None:
                                             step=10_000.0,
                                             format="%.2f",
                                             key=f"tower_neg_{selected}",
+                                            disabled=status == STATUS_CLOSED,
                                         )
                                         st.caption(f"Negotiated_Final_Cap 展示：**{_fmt_money2(new_neg)}**")
-                                        if status == STATUS_PROCESSING:
+                                        if status in (STATUS_PROCESSING, STATUS_ALLOCATING, STATUS_CLOSING):
                                             live_cap = float(new_neg)
                                             cap_eff = live_cap if live_cap > 0 else cap_eff
                                             if cap_eff is not None and cap_eff <= 0:
@@ -602,10 +705,11 @@ def render_project_hub() -> None:
                                         c_neg, c_sug = st.columns(2)
                                         with c_neg:
                                             if st.button(
-                                        "💾 保存谈回额度到项目",
-                                        type="primary",
-                                        key=f"tower_save_neg_{selected}",
-                                    ):
+                                                "💾 保存谈回额度到项目",
+                                                type="primary",
+                                                key=f"tower_save_neg_{selected}",
+                                                disabled=status == STATUS_CLOSED,
+                                            ):
                                                 projects.at[row_idx, "Negotiated_Final_Cap"] = float(new_neg)
                                                 projects.at[row_idx, "Final_Cap"] = float(new_neg)
                                                 save_projects(projects)
@@ -613,7 +717,11 @@ def render_project_hub() -> None:
                                                 st.success("已更新 Negotiated_Final_Cap / Final_Cap。")
                                                 st.rerun()
                                         with c_sug:
-                                            if st.button("按权重重新计算 Suggested_Amount (模式 A)", key=f"tower_rec_sug_{selected}"):
+                                            if st.button(
+                                                "按权重重新计算 Suggested_Amount (模式 A)",
+                                                key=f"tower_rec_sug_{selected}",
+                                                disabled=status == STATUS_CLOSED,
+                                            ):
                                                 if new_neg <= 0:
                                                     st.error("请先填写大于 0 的 Negotiated_Final_Cap。")
                                                 else:
@@ -632,9 +740,9 @@ def render_project_hub() -> None:
 
                                     if status != STATUS_OPEN and cap_eff is not None and cap_eff > 0:
                                         st.caption(f"分配工作台生效硬顶 Cap: **{cap_eff:,.2f}**（合计须 ≤ Cap 方可 Lock & Save）")
-                                    elif deal_row == DEAL_SOFT and status == STATUS_PROCESSING:
+                                    elif deal_row == DEAL_SOFT and status in (STATUS_PROCESSING, STATUS_ALLOCATING, STATUS_CLOSING):
                                         st.warning("请填写大于 0 的 Negotiated_Final_Cap，或使用右侧按钮写入项目后再进行 Lock & Save。")
-                                    elif deal_row == DEAL_HOT and status == STATUS_PROCESSING and (cap_eff is None or cap_eff <= 0):
+                                    elif deal_row == DEAL_HOT and status in (STATUS_PROCESSING, STATUS_ALLOCATING, STATUS_CLOSING) and (cap_eff is None or cap_eff <= 0):
                                         st.warning("模式 B 需有效的硬上限（Target_Total_Cap / Final_Cap）方可 Lock & Save。")
 
                                     if deal_row == DEAL_HOT:
@@ -649,7 +757,12 @@ def render_project_hub() -> None:
                                                 "检测到该 Hot Deal 项目存在已 Sent/Confirmed/Reduced 的 OID 记录。请在『Hot Deal Dispatch v2.1』中完成后续确认/减额；此处将禁用 Final_Allocation 编辑。"
                                             )
 
-                                    auto_round = st.checkbox("Auto-round to Integer Shares", value=False, key=f"tower_autoround_{selected}")
+                                    auto_round = st.checkbox(
+                                        "Auto-round to Integer Shares",
+                                        value=False,
+                                        key=f"tower_autoround_{selected}",
+                                        disabled=status == STATUS_CLOSED,
+                                    )
 
                                     display_cols = [
                                         "Name_Household",
@@ -804,6 +917,18 @@ def render_project_hub() -> None:
                                     if status == STATUS_CLOSED:
                                         st.info("已结项：工作台只读。")
 
+                        with dcol_r:
+                            st.markdown(
+                                _hub_glance_card_html(
+                                    ticker=tk_card,
+                                    share_price_fmt=_fmt_share_price(share_price),
+                                    cap_fmt=_cap_glance,
+                                    deadline_txt=_hd_txt,
+                                    badge_inner_html=_hub_status_badge_html(cur_status),
+                                ),
+                                unsafe_allow_html=True,
+                            )
+
                         st.divider()
                         st.markdown("**Project Notes（预览）**")
                         _npv = str(st.session_state.get("hub_project_notes", "") or "").strip()
@@ -835,10 +960,11 @@ def render_project_hub() -> None:
                         "url": st.column_config.TextColumn("Google Drive URL", required=False),
                     },
                 )
-                try:
-                    drive_edited = st.data_editor(_drive_df, height=_drive_editor_h, **_ed_kw)
-                except TypeError:
-                    drive_edited = st.data_editor(_drive_df, **_ed_kw)
+                with st.container(border=True):
+                    try:
+                        drive_edited = st.data_editor(_drive_df, height=_drive_editor_h, **_ed_kw)
+                    except TypeError:
+                        drive_edited = st.data_editor(_drive_df, **_ed_kw)
                 drive_edited = coerce_drive_editor_value_to_df(drive_edited, _drive_seed)
                 _drive_items = dataframe_to_drive_items(drive_edited)
                 _bpv = f"hub_drive_pv_on_{pick}"
@@ -868,18 +994,26 @@ def render_project_hub() -> None:
                                     st.caption(f"📎 {_short}（URL 无效）")
 
             with tab_s:
+                _hub_settings_ro = False
+                if not is_new:
+                    _pix_ro = projects.index[projects["Project_ID"].astype(str) == str(pick)]
+                    if len(_pix_ro):
+                        _hub_settings_ro = _normalize_status(projects.iloc[int(_pix_ro[0])].get("Status")) == STATUS_CLOSED
                 st.subheader("项目参数与登记")
+                if _hub_settings_ro:
+                    st.info("该项目状态为 **已结项 (Closed)**：此处参数只读；系统自动状态变更见 **Project Notes** 中的时间戳审计行。")
                 st.markdown("#### 基础信息")
                 st.caption(
                     "**Project_Name** 由 `Ticker` + `命名日期` 自动生成；Ticker 可搜索或手输。"
                 )
-                q1, q2 = st.columns([4, 1])
+                q1, q2 = st.columns(2)
                 company_inp = q1.text_input(
                     "Company Name（公司名称，用于搜索 Ticker）",
                     key="tower_company_name",
                     placeholder="例如：Aurion Capital",
+                    disabled=_hub_settings_ro,
                 )
-                if q2.button("🔍 Search Ticker", key="tower_yahoo_search_btn"):
+                if q2.button("🔍 Search Ticker", key="tower_yahoo_search_btn", disabled=_hub_settings_ro):
                     hits = _yahoo_finance_search_quotes(company_inp)
                     st.session_state["tower_yahoo_hits"] = hits
                     if hits.empty:
@@ -902,10 +1036,11 @@ def render_project_hub() -> None:
                         options=list(range(len(hits_df))),
                         format_func=_sym_label,
                         key="tower_yahoo_pick_i",
+                        disabled=_hub_settings_ro,
                     )
                     sym_pick = str(hits_df.iloc[int(pick_i)].get("symbol", "")).strip()
                     ap1, ap2 = st.columns([1, 3])
-                    if ap1.button("填入 Ticker", key="tower_apply_yahoo_sym"):
+                    if ap1.button("填入 Ticker", type="primary", key="tower_apply_yahoo_sym", disabled=_hub_settings_ro):
                         st.session_state["tower_form_ticker"] = sym_pick
                         st.rerun()
                     ap2.caption(f"当前选中：**{sym_pick}**（含 .V / .CN / .TO 等后缀）")
@@ -917,24 +1052,35 @@ def render_project_hub() -> None:
                         "规则：`Ticker` 清洗为缩写 + 命名日期的年月 (YYMM) + 当月两位流水。"
                     )
                 else:
-                    st.caption(f"**Project_ID（不可改）**：`{pick}`")
-                    _pso = [STATUS_OPEN, STATUS_PROCESSING, STATUS_CLOSED]
-                    _cur_st = str(st.session_state.get("hub_project_status", STATUS_OPEN))
-                    if _cur_st not in _pso:
-                        _cur_st = STATUS_OPEN
-                    st.selectbox(
-                        "项目状态（募集中 / 谈判·分配中 / 已结项）",
-                        _pso,
-                        index=_pso.index(_cur_st),
-                        key="hub_project_status",
-                        help="写入 projects.csv；保存后「执行看板」与分配工作台会按新状态切换。",
-                    )
+                    _pid_st1, _pid_st2 = st.columns(2)
+                    with _pid_st1:
+                        st.caption(f"**Project_ID（不可改）**：`{pick}`")
+                    with _pid_st2:
+                        _pso = [
+                            STATUS_OPEN,
+                            STATUS_PROCESSING,
+                            STATUS_ALLOCATING,
+                            STATUS_CLOSING,
+                            STATUS_CLOSED,
+                        ]
+                        _cur_st = str(st.session_state.get("hub_project_status", STATUS_OPEN))
+                        if _cur_st not in _pso:
+                            _cur_st = STATUS_OPEN
+                        st.selectbox(
+                            "项目状态",
+                            _pso,
+                            index=_pso.index(_cur_st),
+                            key="hub_project_status",
+                            help="写入 projects.csv；保存后「执行看板」与分配工作台会按新状态切换。",
+                            disabled=_hub_settings_ro,
+                        )
 
                 _nd1, _nd2 = st.columns(2)
                 with _nd1:
                     name_date = st.date_input(
                         "命名日期（用于 Project_Name = Ticker_YYYY-MM-DD）",
                         key="hub_name_date",
+                        disabled=_hub_settings_ro,
                     )
                 with _nd2:
                     t_clean_preview = str(st.session_state.get("tower_form_ticker", "")).strip()
@@ -949,12 +1095,12 @@ def render_project_hub() -> None:
                                 f"yfinance · `{_tk_preview}` 参考价：**{_fmt_money2(_px)}**（延迟行情，仅供参考）"
                             )
 
-                st.text_input("Ticker（可搜索填入或手输）", key="tower_form_ticker")
+                st.text_input("Ticker（可搜索填入或手输）", key="tower_form_ticker", disabled=_hub_settings_ro)
 
                 st.divider()
                 st.markdown("#### 定价与规模")
-                px1, px2, px3, px4 = st.columns(4)
-                with px1:
+                pr1, pr2 = st.columns(2)
+                with pr1:
                     sp = st.number_input(
                         "Share_Price",
                         min_value=0.0001,
@@ -962,19 +1108,24 @@ def render_project_hub() -> None:
                         format="%.4f",
                         key="hub_sp",
                         help="存储为数值；下方有千分位预览。",
+                        disabled=_hub_settings_ro,
                     )
-                with px2:
-                    lot_sz = st.number_input("Lot_Size", min_value=1, step=1, key="hub_lot_sz")
-                with px3:
+                with pr2:
                     target_cap = st.number_input(
-                        "Hard Cap / Target_Total_Cap（Hot Deal 必填；Soft Circle 填后写入项目供分配决策台使用）",
+                        "Hard Cap / Target_Total_Cap（Hot Deal 必填；Soft 填后供分配台）",
                         min_value=0.0,
                         step=10_000.0,
                         format="%.2f",
                         key="hub_target_cap",
+                        disabled=_hub_settings_ro,
                     )
-                with px4:
-                    deal = st.selectbox("Deal_Type (模式)", [DEAL_SOFT, DEAL_HOT], key="hub_deal")
+                pr3, pr4 = st.columns(2)
+                with pr3:
+                    lot_sz = st.number_input("Lot_Size", min_value=1, step=1, key="hub_lot_sz", disabled=_hub_settings_ro)
+                with pr4:
+                    deal = st.selectbox(
+                        "Deal_Type (模式)", [DEAL_SOFT, DEAL_HOT], key="hub_deal", disabled=_hub_settings_ro
+                    )
 
                 _tc_live = float(st.session_state.get("hub_target_cap", 0.0) or 0.0)
                 _sp_live = float(st.session_state.get("hub_sp", 0.5) or 0.5)
@@ -984,11 +1135,12 @@ def render_project_hub() -> None:
 
                 st.divider()
                 st.markdown("#### 日期与时效")
-                dt1, dt2, dt3 = st.columns(3)
+                dt1, dt2 = st.columns(2)
                 with dt1:
-                    soft_d = st.date_input("Soft_Deadline", key="hub_soft_d")
+                    soft_d = st.date_input("Soft_Deadline", key="hub_soft_d", disabled=_hub_settings_ro)
                 with dt2:
-                    hard_d = st.date_input("Hard_Deadline", key="hub_hard_d")
+                    hard_d = st.date_input("Hard_Deadline", key="hub_hard_d", disabled=_hub_settings_ro)
+                dt3, dt4 = st.columns(2)
                 with dt3:
                     hold_m = st.number_input(
                         "Hold_Period (Months)",
@@ -997,18 +1149,19 @@ def render_project_hub() -> None:
                         step=1,
                         key="hub_hold_m",
                         help="写入 projects.csv · 供 Smart Distribution 邮件引用。",
+                        disabled=_hub_settings_ro,
                     )
-                dt4, dt5 = st.columns(2)
                 with dt4:
                     st.date_input(
-                        "deadline_date（回复截止日，写入 projects.csv；Distribution 默认取此日期）",
+                        "deadline_date（回复截止日；Distribution 默认）",
                         key="hub_deadline_date",
+                        disabled=_hub_settings_ro,
                     )
-                with dt5:
-                    preset_raw = st.text_input(
-                        "Preset_Options（金额档位，逗号分隔，可含千分位）",
-                        key="hub_preset_raw",
-                    )
+                st.text_input(
+                    "Preset_Options（金额档位，逗号分隔，可含千分位）",
+                    key="hub_preset_raw",
+                    disabled=_hub_settings_ro,
+                )
 
                 _pr_live = str(st.session_state.get("hub_preset_raw", "") or "")
                 st.caption(f"档位预览（千分位）：**{_preset_options_display(_pr_live)}**")
@@ -1020,11 +1173,13 @@ def render_project_hub() -> None:
                     key="hub_project_notes",
                     height=120,
                     help="保存至 projects.csv 的 Notes 列，并同步到会话 projects_data。",
+                    disabled=_hub_settings_ro,
                 )
                 st.text_area(
                     "warrant_info（定增附加条款，写入 projects.csv，邮件变量 {{warrant_info}}）",
                     key="hub_warrant_info",
                     height=80,
+                    disabled=_hub_settings_ro,
                 )
 
                 cloud_links_json = serialize_drive_links(dataframe_to_drive_items(drive_edited))
@@ -1041,7 +1196,9 @@ def render_project_hub() -> None:
                 if is_new:
                     submitted = st.button("🚀 创建新项目", type="primary", key="hub_btn_create")
                 else:
-                    submitted = st.button("💾 更新项目信息", type="primary", key="hub_btn_update")
+                    submitted = st.button(
+                        "💾 更新项目信息", type="primary", key="hub_btn_update", disabled=_hub_settings_ro
+                    )
 
                 if submitted:
                     if not t_clean:
@@ -1124,7 +1281,13 @@ def render_project_hub() -> None:
                                 )
                                 _raw_st = st.session_state.get("hub_project_status", prev.get("Status", STATUS_OPEN))
                                 stat_keep = _normalize_status(_raw_st)
-                                if stat_keep not in (STATUS_OPEN, STATUS_PROCESSING, STATUS_CLOSED):
+                                if stat_keep not in (
+                                    STATUS_OPEN,
+                                    STATUS_PROCESSING,
+                                    STATUS_ALLOCATING,
+                                    STATUS_CLOSING,
+                                    STATUS_CLOSED,
+                                ):
                                     stat_keep = STATUS_OPEN
                                 prev_fc = float(pd.to_numeric(prev.get("Final_Cap"), errors="coerce") or 0.0)
                                 prev_ttc = float(
@@ -1162,6 +1325,12 @@ def render_project_hub() -> None:
                                 if not prev_cd:
                                     projects_sv.at[row_idx, "Created_Date"] = soft_d.strftime("%Y-%m-%d")
                                 save_projects(projects_sv)
+                                _prev_st = _normalize_status(prev.get("Status", STATUS_OPEN))
+                                log_action(
+                                    "project_update",
+                                    f"Status: {_prev_st} -> {stat_keep}; Ticker={t_clean}; Deal_Type={deal}",
+                                    project_id=str(pick),
+                                )
                                 _hub_sync_projects_session(load_projects())
                                 st.success("已更新项目信息。")
                                 _invalidate_action_bench(pick)
@@ -1176,6 +1345,7 @@ def render_project_hub() -> None:
                         "🔄 从 CRM 同步未存在的客户行",
                         type="primary",
                         key=f"tower_sync_crm_inline_{pick}",
+                        disabled=_hub_settings_ro,
                     ):
                         _pl = load_projects()
                         _idx = _pl.index[_pl["Project_ID"].astype(str) == str(pick)]

@@ -1,9 +1,11 @@
 """
-投资人门户：支持 `?oid=`（旧版 Hot Deal 流程）与 `?project_id=&client_id=`（认购确认 / 意向收集）。
+投资人门户：支持 `?t=`（不透明 OID token）、`?oid=`（旧版 Hot Deal）与
+`?project_id=&client_id=`（旧版透明深链，兼容历史邮件）。
 """
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Optional
 
 import pandas as pd
 import streamlit as st
@@ -23,6 +25,7 @@ from utils.investment_portal_data import (
 )
 from utils.investor_portal_ui import inject_investor_chrome_hide, is_investor_portal_session
 from utils.link_logs_io import append_link_open
+from utils.oid_token_store import commit_oid_token, peek_oid_token
 from utils.oid_feedback_io import (
     RESPONSE_CONFIRMATION,
     RESPONSE_INTENT,
@@ -44,12 +47,24 @@ if is_investor_portal_session():
     inject_investor_chrome_hide()
 
 oid = _get_query_param("oid")
+tok_param = _get_query_param("t")
 project_id = _get_query_param("project_id")
 client_id = _get_query_param("client_id")
 
 if oid:
     _show_client_view(str(oid).strip())
     st.stop()
+
+_token_raw: Optional[str] = None
+if tok_param is not None and str(tok_param).strip() != "":
+    _token_raw = str(tok_param).strip()
+    _res = peek_oid_token(_token_raw)
+    if not _res:
+        st.title("Investment Portal")
+        st.error("链接已失效")
+        st.stop()
+    project_id = _res.get("project_id") or ""
+    client_id = _res.get("client_id") or ""
 
 if not project_id or not client_id:
     st.title("Investment Portal")
@@ -61,7 +76,9 @@ cid_url = str(client_id).strip()
 
 expires_raw = _get_query_param("expires_at")
 link_expired = False
-if expires_raw is not None and str(expires_raw).strip() != "":
+if _token_raw is not None:
+    link_expired = False
+elif expires_raw is not None and str(expires_raw).strip() != "":
     try:
         _exp_ts = float(str(expires_raw).strip())
         link_expired = datetime.now(timezone.utc).timestamp() > _exp_ts
@@ -74,6 +91,9 @@ prow = find_project_row(projects, pid_url)
 if prow is None:
     st.error("未找到该项目，请核对链接中的项目编号或联系管理人。")
     st.stop()
+
+if _token_raw is not None:
+    commit_oid_token(_token_raw)
 
 pid_canon = canonical_project_id(prow, projects)
 investor_name = client_display_name(crm, cid_url)

@@ -8,6 +8,8 @@ from typing import Any, Optional, Tuple
 import pandas as pd
 import streamlit as st
 
+from utils.activity_log import log_action
+
 GP_MANAGEMENT_POOL_CLIENT_ID = "GP_MANAGEMENT_POOL"
 GP_DISPLAY_NAME = "REMAINDER_A/C (GP Pool)"
 
@@ -110,6 +112,11 @@ def apply_gp_remainder_hedge(pid: str) -> Tuple[bool, str]:
         )
 
     adc._save_final_allocations_including_buffer(str(pid), synced, cap, price, lot)
+    log_action(
+        "hedge_gp_remainder",
+        f"gap_cad={gap}; gp_pool_client={GP_MANAGEMENT_POOL_CLIENT_ID}",
+        project_id=str(pid),
+    )
     ov_key = f"ac_editor_override_{str(pid)}"
     st.session_state[ov_key] = synced.copy()
     st.session_state["df_alloc"] = synced.copy()

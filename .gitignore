@@ -34,3 +34,14 @@ Thumbs.db
 
 # 本地运行产生的快照目录（若曾启用过应用内节点保存）
 data/distribution_nodes/
+
+# OID 不透明 token 映射（含客户与项目关联，勿提交到公开仓库）
+data/oid_tokens.json
+data/oid_tokens.json.tmp
+
+# COO 活动日志（本地追加；合规导出用应用内下载）
+data/activity_log.csv
+
+# 本地草稿 / 重复脚本副本
+*.copy.py
+*Copy*.py

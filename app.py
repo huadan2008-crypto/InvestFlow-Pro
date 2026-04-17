@@ -1,13 +1,14 @@
 import os
 import re
 from io import BytesIO, StringIO
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Any, Callable, List, Optional
 
 import pandas as pd
 import streamlit as st
 
 from investflow_data import DATA_DIR, PROJECTS_CSV, ROOT_DIR, ensure_data_subdirs, resolved_commitments_csv_path
+from project_control_tower import STATUS_CLOSED, STATUS_CLOSING, _normalize_status as _normalize_project_status
 from utils.final_allocations_io import merged_allocation_map_for_project
 from utils.financial_display import dataframe_financial_display
 from utils.oid_feedback_io import clients_with_portal_confirmation
@@ -17,6 +18,7 @@ DEFAULT_SUBSCRIPTION_FILES = ["private_equity_workflow.csv", "my_investments.csv
 # CRM 主数据仅使用 CSV，请在应用内维护，以便 client_id 自动生成与唯一性校验一致。
 CRM_FILE = os.path.join(ROOT_DIR, "Data", "client_master.csv")
 PROJECT_FILE = PROJECTS_CSV
+PROJECTS_DATA_SESSION_KEY = "projects_data"
 POOL_RULES_FILE = "pool_rules.csv"
 CRM_COLUMNS = [
     "client_id",
@@ -186,6 +188,26 @@ def project_id_select_format_func(projects: pd.DataFrame) -> Callable[[str], str
 
 
 INVESTFLOW_PROJECT_SELECTOR_KEY = "investflow_project_selector"
+# Project Hub「前往分配中心」深链：须在侧栏 selectbox 实例化之前写入（见 apply_pending_allocation_nav_from_hub）。
+PENDING_ALLOC_NAV_FROM_HUB_KEY = "_hub_pending_alloc_project_id"
+
+
+def apply_pending_allocation_nav_from_hub(projects: Optional[pd.DataFrame] = None) -> None:
+    """从 Project Hub 跳转 Allocation Center 时，预先同步侧栏与分配台的项目选择。"""
+    raw = st.session_state.pop(PENDING_ALLOC_NAV_FROM_HUB_KEY, None)
+    if raw is None or str(raw).strip() == "":
+        return
+    pid = str(raw).strip()
+    df = projects if projects is not None else _load_or_init_projects()
+    pid_col = _project_id_column_name(df)
+    if df.empty or not pid_col:
+        return
+    pids = [str(x).strip() for x in df[pid_col].astype(str).tolist() if str(x).strip()]
+    if pid not in pids:
+        return
+    st.session_state[INVESTFLOW_PROJECT_SELECTOR_KEY] = pid
+    st.session_state["current_project"] = pid
+    st.session_state["ac_alloc_proj_pick"] = pid
 
 
 def _ensure_project_selector_state(pids: List[str]) -> None:
@@ -201,26 +223,15 @@ def _ensure_project_selector_state(pids: List[str]) -> None:
 
 
 def render_sidebar_current_project(projects: Optional[pd.DataFrame] = None) -> None:
-    """侧边栏：当前操作项目（单一数据源 investflow_project_selector，展示完整 ID）。"""
+    """维护 `investflow_project_selector` / `current_project` 会话指纹；侧栏不再展示全局项目下拉（由各业务页内选择器承担）。"""
     df = projects if projects is not None else _load_or_init_projects()
     pid_col = _project_id_column_name(df)
-    with st.sidebar:
-        st.markdown("##### 当前操作项目")
-        if df.empty or not pid_col:
-            st.caption("暂无项目，请先在 Project Hub 创建。")
-            st.session_state.pop(INVESTFLOW_PROJECT_SELECTOR_KEY, None)
-            st.session_state["current_project"] = ""
-            return
-        pids = [str(x).strip() for x in df[pid_col].astype(str).tolist() if str(x).strip()]
-        _ensure_project_selector_state(pids)
-        fmt = project_id_select_format_func(df)
-        st.selectbox(
-            "Project_ID",
-            options=pids,
-            key=INVESTFLOW_PROJECT_SELECTOR_KEY,
-            format_func=fmt,
-        )
-    st.session_state["current_project"] = str(st.session_state.get(INVESTFLOW_PROJECT_SELECTOR_KEY, "")).strip()
+    if df.empty or not pid_col:
+        st.session_state.pop(INVESTFLOW_PROJECT_SELECTOR_KEY, None)
+        st.session_state["current_project"] = ""
+        return
+    pids = [str(x).strip() for x in df[pid_col].astype(str).tolist() if str(x).strip()]
+    _ensure_project_selector_state(pids)
 
 
 def _load_or_init_crm():
@@ -322,6 +333,44 @@ def _save_projects(df):
     if "Project_ID" in out.columns:
         out["Project_ID"] = out["Project_ID"].map(lambda x: "" if pd.isna(x) else str(x).strip())
     out[PROJECT_COLUMNS].to_csv(PROJECT_FILE, index=False)
+
+
+def update_project_status(project_id: str, new_status: str, *, actor: str = "system") -> bool:
+    """Update projects.csv Status, append an audit line to Notes, and refresh session ``projects_data``."""
+    pid = str(project_id or "").strip()
+    if not pid:
+        return False
+    df = _load_or_init_projects()
+    if df.empty or "Project_ID" not in df.columns:
+        return False
+    hit = df.index[df["Project_ID"].astype(str).str.strip() == pid].tolist()
+    if not hit:
+        return False
+    ri = int(hit[0])
+    old_n = _normalize_project_status(df.at[ri, "Status"])
+    new_n = _normalize_project_status(new_status)
+    if old_n == new_n:
+        return True
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    note_line = f"[{ts} UTC] Status changed from {old_n!r} to {new_n!r} by {actor}."
+    prev = df.at[ri, "Notes"]
+    if prev is None or (isinstance(prev, float) and pd.isna(prev)):
+        prev_s = ""
+    else:
+        prev_s = str(prev).strip()
+    df.at[ri, "Notes"] = f"{prev_s}\n{note_line}".strip() if prev_s else note_line
+    df.at[ri, "Status"] = new_n
+    _save_projects(df)
+    st.session_state[PROJECTS_DATA_SESSION_KEY] = df.copy()
+    return True
+
+
+def _closing_all_investors_signed_and_funded(df: pd.DataFrame) -> bool:
+    if df.empty or "签署状态" not in df.columns or "资金状态" not in df.columns:
+        return False
+    s_ok = (df["签署状态"].astype(str) == "已签署").all()
+    f_ok = df["资金状态"].astype(str).isin(["已收 Receipt", "已入账"]).all()
+    return bool(s_ok and f_ok)
 
 
 def _load_or_init_pool_rules():
@@ -1351,10 +1400,18 @@ def render_closing_stats() -> None:
         "**Closing 附件核对（COO）** 请确认以下 4 份材料齐备并已按需发送：  \n"
         "1. **AUCU Subs**  · 2. **Client Info**  · 3. **EDE RDI**  · 4. **AUCU Disclosure**"
     )
+    _ds_prev = bool(st.session_state.get(f"closing_ds_ack_prev_{pid}", False))
     docusign_ok = st.checkbox(
         "已在 ZohoSign / Docusign 中手工填妥额度并发出",
         key=f"closing_docusign_ack_{pid}",
     )
+    if docusign_ok and not _ds_prev:
+        update_project_status(
+            str(pid),
+            STATUS_CLOSING,
+            actor="system (Closing: DocuSign / ZohoSign acknowledged)",
+        )
+    st.session_state[f"closing_ds_ack_prev_{pid}"] = bool(docusign_ok)
     if not docusign_ok:
         st.caption("建议完成电子签发出后再批量发送 Closing 邮件。")
 
@@ -1418,6 +1475,22 @@ def render_closing_stats() -> None:
     )
     st.session_state[df_key] = edited.copy()
 
+    if _closing_all_investors_signed_and_funded(edited):
+        st.success(
+            "✅ **项目已具备关账条件**：全体投资人「已签署」，且资金状态均为「已收 Receipt」或「已入账」。"
+        )
+        if st.button(
+            "一键标为已结项 (Closed)",
+            type="primary",
+            key=f"closing_one_click_closed_{pid}",
+        ):
+            update_project_status(
+                str(pid),
+                STATUS_CLOSED,
+                actor="user (Closing: one-click close)",
+            )
+            st.rerun()
+
     with st.expander("📄 查看 Closing 邮件模板内容", expanded=False):
         st.code(CLOSING_EMAIL_TEMPLATE, language=None)
 
@@ -1467,6 +1540,11 @@ def render_closing_stats() -> None:
             body = body + att_block
             previews.append({"to": str(row.get("邮件", "") or "").strip(), "subject_in_body": body.split("\n")[0], "body": body})
         st.session_state[f"closing_email_previews_{pid}"] = previews
+        update_project_status(
+            str(pid),
+            STATUS_CLOSING,
+            actor="system (Closing: batch email preview generated)",
+        )
         st.rerun()
 
     prev_key = f"closing_email_previews_{pid}"
@@ -1531,8 +1609,9 @@ def main():
 | 2 | **Project Hub** | 项目创建与 Control Tower |
 | 3 | **Distribution** | COO 邮件与模板分发 |
 | 4 | **Allocation Center** | 分配决策台、同步锁定、**余额对冲（GP 池）** |
-| 5 | **Investment Portal** | 投资人门户预览 |
-| 6 | **签署统计 · Closing** | Portal 签署进度、关账入口 |
+| 5 | **活动日志** | COO 关键操作审计与 CSV 导出 |
+| 6 | **Investment Portal** | 投资人门户预览 |
+| 7 | **签署统计 · Closing** | Portal 签署进度、关账入口 |
 
 数据：`projects.csv`、`commitments.csv`（路径由 `investflow_data` 解析）。
 """
