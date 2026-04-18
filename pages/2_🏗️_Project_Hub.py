@@ -35,6 +35,7 @@ from project_control_tower import (
     _project_effective_cap,
     _save_commitments,
 )
+from utils.oid_funnel_metrics import confirmed_amount_total_cad, subscription_funnel_counts
 from utils.cloud_drive_links import (
     coerce_drive_editor_value_to_df,
     dataframe_to_drive_items,
@@ -44,6 +45,10 @@ from utils.cloud_drive_links import (
 )
 
 st.set_page_config(page_title="Project Hub", layout="wide", page_icon="🏗️")
+
+from utils.coo_session_chrome import render_coo_feedback_banner
+
+render_coo_feedback_banner()
 
 NEW_LABEL = "(新建项目)"
 HUB_PROJECTS_DATA_KEY = "projects_data"
@@ -621,6 +626,21 @@ def render_project_hub() -> None:
                                     )
                                 else:
                                     st.caption("Hard Cap（Target_Total_Cap / Final_Cap）未设置。")
+                                fc = subscription_funnel_counts(commits_all, str(selected))
+                                st.markdown("##### 认购进度汇总（OID / Portal）")
+                                st.caption(
+                                    f"Sent: **{fc['sent']}** · Clicked: **{fc['clicked']}** · "
+                                    f"Confirmed: **{fc['confirmed']}** · Paid: **{fc['paid']}**"
+                                )
+                                conf_amt = confirmed_amount_total_cad(str(selected), commits_all)
+                                if cap_hard > 0:
+                                    pct_conf = min(1.0, max(0.0, float(conf_amt) / float(cap_hard)))
+                                    st.caption(
+                                        f"已确认认购金额（闭环） **{_fmt_money2(conf_amt)}** / Hard Cap **{_fmt_money2(cap_hard)}**"
+                                    )
+                                    st.progress(pct_conf)
+                                else:
+                                    st.caption("已确认金额（闭环）可在设置 Hard Cap 后显示占比进度条。")
                                 comp_disp = str(prj.get("Company_Name", "") or "").strip()
                                 st.caption(
                                     f"**{str(prj.get('Project_Name', '') or '—')}** · {comp_disp or '—'} · {deal_row} · `{selected}`"
@@ -789,14 +809,14 @@ def render_project_hub() -> None:
                                         st.session_state[bk] = _apply_final_shares(st.session_state[bk], share_price, True)
 
                                     cfg = {
-                                        "Desired_Amount": st.column_config.NumberColumn("Desired_Amount", format="%,.2f", disabled=True),
-                                        "Suggested_Amount": st.column_config.NumberColumn("Suggested_Amount", format="%,.2f", disabled=True),
+                                        "Desired_Amount": st.column_config.NumberColumn("Desired_Amount", format="localized", disabled=True),
+                                        "Suggested_Amount": st.column_config.NumberColumn("Suggested_Amount", format="localized", disabled=True),
                                         "Final_Allocation": st.column_config.NumberColumn(
                                             "Final_Allocation",
-                                            format="%,.2f",
+                                            format="localized",
                                             disabled=(status == STATUS_CLOSED or dispatch_lock_edit),
                                         ),
-                                        "Final_Shares": st.column_config.NumberColumn("Final_Shares", format="%,.4f", disabled=True),
+                                        "Final_Shares": st.column_config.NumberColumn("Final_Shares", format="%.4f", disabled=True),
                                         "Tier": st.column_config.TextColumn("Tier", disabled=True),
                                         "Name_Household": st.column_config.TextColumn("Name/Household", disabled=True),
                                     }

@@ -29,6 +29,10 @@ from utils.constants import COO_DISTRIBUTION_DEFAULT_SUBJECT, DEFAULT_MAIL_TEMPL
 
 st.set_page_config(page_title="Distribution", layout="wide", page_icon="📧")
 
+from utils.coo_session_chrome import render_coo_feedback_banner
+
+render_coo_feedback_banner()
+
 # ----- 路径（优先 data/，回退仓库根目录，不改动 CSV 结构） -----
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(_THIS_DIR)
@@ -48,6 +52,39 @@ _DIST_SOFT_LABEL = "意向收集模式 (Soft Circle)"
 _DIST_HOT_LABEL = "确认分配模式 (Hot Deal)"
 _DIST_RECIP_INTENT = "意向收集模式"
 _DIST_RECIP_FORMAL = "正式分配模式"
+DIST_BULK_CC_EMAIL = "aaron.zhong@ede.com"
+
+_DIST_BULK_SEND_BTN_SCRIPT = """
+<script>
+(function () {
+  const doc = window.parent.document;
+  if (!doc) return;
+  const label = "执行正式群发";
+  doc.querySelectorAll("button").forEach(function (b) {
+    const t = (b.innerText || "").replace(/\\s+/g, " ").trim();
+    if (t !== label) return;
+    b.style.setProperty("background", "#1E3A8A", "important");
+    b.style.setProperty("color", "#f8fafc", "important");
+    b.style.setProperty("font-size", "1.18rem", "important");
+    b.style.setProperty("font-weight", "700", "important");
+    b.style.setProperty("letter-spacing", "0.07em", "important");
+    b.style.setProperty("min-height", "54px", "important");
+    b.style.setProperty("border-radius", "14px", "important");
+    b.style.setProperty("border", "none", "important");
+    b.style.setProperty("width", "100%", "important");
+    b.style.setProperty("box-shadow", "inset 0 3px 10px rgba(0,0,0,0.38), 0 4px 16px rgba(30,58,138,0.42)", "important");
+    b.onmouseenter = function () {
+      b.style.setProperty("filter", "brightness(1.14)", "important");
+      b.style.setProperty("box-shadow", "inset 0 2px 8px rgba(0,0,0,0.28), 0 6px 20px rgba(59,130,246,0.5)", "important");
+    };
+    b.onmouseleave = function () {
+      b.style.removeProperty("filter");
+      b.style.setProperty("box-shadow", "inset 0 3px 10px rgba(0,0,0,0.38), 0 4px 16px rgba(30,58,138,0.42)", "important");
+    };
+  });
+})();
+</script>
+"""
 
 
 def _p(*parts: str) -> str:
@@ -890,9 +927,15 @@ def _dist_sync_dispatch_cloud_config(project_id: str, n_links: int, widget_key: 
 
 
 def _dist_highlight_ctx_in_html(html: str, values: List[str]) -> str:
-    out = html
-    uniq = []
-    seen = set()
+    """预览 HTML 中将已代入的动态值用高亮 span 包裹（正则按字面量替换，长串优先）。"""
+    hl_open = (
+        '<span style="background-color: #e6fffa; color: #008080; padding: 2px 4px; '
+        'border-radius: 4px; font-weight: bold;">'
+    )
+    hl_close = "</span>"
+    out = html or ""
+    uniq: List[str] = []
+    seen: set[str] = set()
     for v in values:
         s = str(v).strip()
         if len(s) < 2 or s in seen:
@@ -900,13 +943,23 @@ def _dist_highlight_ctx_in_html(html: str, values: List[str]) -> str:
         seen.add(s)
         uniq.append(s)
     for ch in sorted(uniq, key=lambda x: -len(x)):
-        esc = html_module.escape(ch, quote=False)
-        if esc and esc in out:
-            out = out.replace(
-                esc,
-                f'<span style="color:#15803d;font-weight:800;">{esc}</span>',
-                1,
-            )
+        candidates = [ch, html_module.escape(ch, quote=False)]
+        for cand in candidates:
+            if len(cand) < 2 or cand not in out:
+                continue
+            inner = html_module.escape(cand, quote=False)
+            span = f"{hl_open}{inner}{hl_close}"
+            if span in out:
+                break
+            try:
+                pat = re.escape(cand)
+                max_rep = 1 if len(cand) > 48 else 5
+                new_out, n = re.subn(pat, span, out, count=max_rep)
+                if n:
+                    out = new_out
+                    break
+            except re.error:
+                continue
     return out
 
 
@@ -1472,21 +1525,20 @@ def render_distribution_tab_full() -> None:
         _body_chk = str(st.session_state.get("email_body", "") or "")
         _subj_chk = str(st.session_state.get("email_subj", "") or "")
         _syntax_err = _dist_mustache_syntax_error(_body_chk) or _dist_mustache_syntax_error(_subj_chk)
+        if "dist_send_cc_aaron" not in st.session_state:
+            st.session_state["dist_send_cc_aaron"] = True
 
         with st.container(border=True):
-            if _syntax_err:
-                st.markdown(
-                    f'<div class="dist-syntax-fatal">{html_module.escape(_syntax_err)}</div>',
-                    unsafe_allow_html=True,
-                )
             if row is not None:
                 demo_link = oid_preview
                 demo_alloc_disp = _allocated_placeholder_soft_circle()
                 fallback_amt = float(min_sub_amt) if min_sub_amt > 0 else 0.0
                 soft_alloc_txt = _allocated_placeholder_soft_circle()
                 send_hot = st.session_state.get("dist_recip_mode_ui") == _DIST_RECIP_FORMAL
+                demo_nm_preview = ""
                 if uniq:
                     _e0, _nm0, demo_cid0, fa0 = uniq[0]
+                    demo_nm_preview = str(_nm0 or "").strip()
                     if demo_cid0:
                         demo_link = _investment_portal_link(
                             portal_base,
@@ -1523,76 +1575,78 @@ def render_distribution_tab_full() -> None:
                 )
                 prev_plain = _dist_append_cloud_links_to_body(prev_plain, str(pid), cloud_items_all)
                 html_prev = _distribution_body_to_html_email(prev_plain)
-                hi_vals: List[str] = list(ctx_mail_static.values()) + [demo_alloc_disp, demo_link]
+                hi_vals: List[str] = [str(x).strip() for x in ctx_mail_static.values() if str(x).strip()]
+                for x in (demo_alloc_disp, demo_link, demo_nm_preview):
+                    s = str(x).strip()
+                    if s and s not in hi_vals:
+                        hi_vals.append(s)
                 html_prev = _dist_highlight_ctx_in_html(html_prev, hi_vals)
                 components.html(html_prev, height=520, scrolling=True)
             else:
-                st.text("—")
+                components.html("<div style='min-height:520px;background:#fafafa;'></div>", height=520)
 
         with st.container(border=True):
-            st.subheader("Pre-flight Checklist")
-            st.checkbox("变量占位符已全部检查", key="dist_safe_chk_vars")
-            st.checkbox("附件链接（Google Drive）已正确插入", key="dist_safe_chk_attach")
-            st.checkbox("已成功发送并查看测试邮件", key="dist_safe_chk_test")
-        _safe_all = (
-            bool(st.session_state.get("dist_safe_chk_vars", False))
-            and bool(st.session_state.get("dist_safe_chk_attach", False))
-            and bool(st.session_state.get("dist_safe_chk_test", False))
+            cc_l, cc_r = st.columns([1, 15])
+            with cc_l:
+                st.checkbox(
+                    "",
+                    key="dist_send_cc_aaron",
+                    label_visibility="collapsed",
+                )
+            with cc_r:
+                st.markdown(
+                    f"📧 自动抄送至您的邮箱 ({html_module.escape(DIST_BULK_CC_EMAIL)})",
+                    unsafe_allow_html=True,
+                )
+
+        _bulk_ready = bool(
+            (_syntax_err is None)
+            and row is not None
+            and len(uniq) > 0
+            and bool(cfg and cfg.get("host"))
         )
 
         with st.container(border=True):
-            _, _ctr, _ = st.columns([1, 2, 1])
-            with _ctr:
-                st.markdown(
-                    '<div class="dist-bulk-footer-title">执行正式群发</div>',
-                    unsafe_allow_html=True,
-                )
-                bulk_ok = st.checkbox("我确认执行正式群发", key="dist_bulk_send_confirm")
-                _checklist_ok = bool(_safe_all and (_syntax_err is None))
-                _bulk_ready = bool(
-                    _checklist_ok
-                    and bulk_ok
-                    and row is not None
-                    and len(uniq) > 0
-                    and bool(cfg and cfg.get("host"))
-                )
-                if st.button(
-                    "执行正式群发",
-                    type="primary" if _checklist_ok else "secondary",
-                    key="dist_send_bulk",
-                    disabled=not _bulk_ready,
-                    use_container_width=True,
-                ):
-                    if not cfg or not cfg.get("host"):
-                        st.error("未配置邮件")
-                    elif not uniq:
-                        st.error("未选择收件人")
+            if st.button(
+                "执行正式群发",
+                type="primary",
+                key="dist_send_bulk",
+                disabled=not _bulk_ready,
+                use_container_width=True,
+            ):
+                if not cfg or not cfg.get("host"):
+                    st.toast("未配置 SMTP", icon="⚠️")
+                elif not uniq:
+                    st.toast("无收件人", icon="⚠️")
+                else:
+                    body_live = str(st.session_state.get("email_body", ""))
+                    subj_live = str(st.session_state.get("email_subj", "")).strip()
+                    if not subj_live:
+                        st.toast("主题为空", icon="⚠️")
                     else:
-                        body_live = str(st.session_state.get("email_body", ""))
-                        subj_live = str(st.session_state.get("email_subj", "")).strip()
-                        if not subj_live:
-                            st.error("主题不能为空")
+                        bad = [
+                            x
+                            for x in _unresolved_vars(body_live)
+                            if x not in ("oid_link", "warrant_info", "allocated_amount")
+                        ]
+                        if bad:
+                            st.toast("正文含未替换变量", icon="⚠️")
                         else:
-                            bad = [
-                                x
-                                for x in _unresolved_vars(body_live)
-                                if x not in ("oid_link", "warrant_info", "allocated_amount")
-                            ]
-                            if bad:
-                                st.error("正文仍含未替换变量：" + ", ".join(bad))
-                            else:
-                                from_addr = cfg["from_email"]
-                                ok, errs = 0, []
-                                warrant_body = warrant_txt
-                                log_rows: List[Dict[str, Any]] = []
-                                send_hot = st.session_state.get("dist_recip_mode_ui") == _DIST_RECIP_FORMAL
-                                fallback_amt = float(min_sub_amt) if min_sub_amt > 0 else 0.0
-                                soft_alloc_txt = _allocated_placeholder_soft_circle()
+                            from_addr = cfg["from_email"]
+                            ok, errs = 0, []
+                            warrant_body = warrant_txt
+                            log_rows: List[Dict[str, Any]] = []
+                            send_hot = st.session_state.get("dist_recip_mode_ui") == _DIST_RECIP_FORMAL
+                            fallback_amt = float(min_sub_amt) if min_sub_amt > 0 else 0.0
+                            soft_alloc_txt = _allocated_placeholder_soft_circle()
+                            cc_list: Optional[List[str]] = None
+                            if bool(st.session_state.get("dist_send_cc_aaron", True)):
+                                cc_list = [DIST_BULK_CC_EMAIL]
+                            with st.status("正在群发邮件…", expanded=True) as _bulk_status:
                                 prog = st.progress(0)
                                 total = len(uniq)
-                                status_slot = st.empty()
                                 for i, (email, _n, cid, row_alloc) in enumerate(uniq):
-                                    status_slot.write(f"{i + 1} / {total}")
+                                    _bulk_status.write(f"{i + 1} / {total} · {email}")
                                     prog.progress(min(1.0, (i + 1) / max(total, 1)))
                                     try:
                                         exp_ts = _dist_portal_expires_ts()
@@ -1633,6 +1687,7 @@ def render_distribution_tab_full() -> None:
                                             html_one,
                                             text_plain=body_one,
                                             attachments=None,
+                                            cc=cc_list,
                                         )
                                         ok += 1
                                         if str(cid).strip():
@@ -1657,13 +1712,15 @@ def render_distribution_tab_full() -> None:
                                     except Exception as exc:
                                         errs.append(f"{email}: {exc}")
                                 prog.progress(1.0)
-                                status_slot.empty()
-                                if log_rows:
-                                    _append_manual_allocations(log_rows)
-                                if ok:
-                                    st.success(f"已发送 {ok}/{len(uniq)} 封")
-                                if errs:
-                                    st.error("部分失败：\n" + "\n".join(errs))
+                                _bulk_status.update(label="群发结束", state="complete")
+                            if log_rows:
+                                _append_manual_allocations(log_rows)
+                            if ok:
+                                st.toast(f"已发送 {ok}/{len(uniq)}", icon="✅")
+                            if errs:
+                                st.toast("部分失败", icon="❌")
+
+            components.html(_DIST_BULK_SEND_BTN_SCRIPT, height=0)
 
     with st.expander("⚙️ 高级配置 (非技术人员勿动)", expanded=False):
         st.caption(

@@ -28,6 +28,7 @@ from utils.final_allocations_io import (
     save_final_allocations_replace_project,
 )
 from utils.oid_feedback_io import RESPONSE_INTENT, read_oid_feedback_df
+from utils.oid_link_reissue import augment_alloc_clients_link_status, bulk_resend_expired_oid_emails
 
 
 def _p(*parts: str) -> str:
@@ -1246,9 +1247,6 @@ def _crm_type_display(r: pd.Series) -> str:
     return s or "—"
 
 
-AC_ALLOC_ACTIVITY_LOG = os.path.join(DATA_DIR, "allocation_activity_log.csv")
-
-
 def _ac_crm_unique_tier_type_labels(crm: pd.DataFrame) -> Tuple[List[str], List[str]]:
     tiers: set[str] = set()
     types: set[str] = set()
@@ -1649,7 +1647,20 @@ def _ac_enrich_alloc_meta(df: pd.DataFrame, crm: pd.DataFrame) -> pd.DataFrame:
 
 
 def _ac_strip_alloc_meta_cols(df: pd.DataFrame) -> pd.DataFrame:
-    drop = [c for c in ("_cohort", "_tier_disp", "_type_disp", "Diff_pct", "校验") if c in df.columns]
+    drop = [
+        c
+        for c in (
+            "_cohort",
+            "_tier_disp",
+            "_type_disp",
+            "Diff_pct",
+            "校验",
+            "链接状态",
+            "OID到期",
+            "_link_status_key",
+        )
+        if c in df.columns
+    ]
     if not drop:
         return df
     return df.drop(columns=drop, errors="ignore")
@@ -1791,20 +1802,17 @@ def _ac_infer_view_to_full_edits(
     return out
 
 
-def _append_allocation_activity_log(project_id: str, event: str, detail: str) -> None:
-    os.makedirs(DATA_DIR, exist_ok=True)
-    row = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "project_id": str(project_id),
-        "event": str(event)[:120],
-        "detail": str(detail).replace("\n", " ")[:800],
-    }
-    exists = os.path.isfile(AC_ALLOC_ACTIVITY_LOG)
-    with open(AC_ALLOC_ACTIVITY_LOG, "a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=list(row.keys()))
-        if not exists:
-            w.writeheader()
-        w.writerow(row)
+def _append_allocation_activity_log(project_id: str, event: str, detail: str, *, actor: str = "coo") -> None:
+    from utils.feedback_activity_log import log_action
+
+    log_action(
+        str(event)[:160],
+        str(detail).replace("\n", " ")[:1200],
+        project_id=str(project_id),
+        client_id="",
+        actor=str(actor),
+        highlight=False,
+    )
 
 
 def _ac_validation_column(df: pd.DataFrame) -> pd.Series:
@@ -1929,6 +1937,7 @@ def render_allocations_decision_center() -> None:
 
     display_baseline = merged_df.copy()
     display_df = _ac_enrich_alloc_meta(merged_df.copy(), crm)
+    display_df = augment_alloc_clients_link_status(display_df, str(pid), commits)
     st.session_state[f"_ac_cap_{str(pid)}"] = float(cap)
     uniq_tiers, uniq_types = _ac_alloc_unique_tier_type_for_filters(display_df, crm)
 
@@ -1938,7 +1947,9 @@ def render_allocations_decision_center() -> None:
     st.session_state[f"_ac_sync_price_{str(pid)}"] = float(_ed_price)
     st.session_state[f"_ac_sync_lot_{str(pid)}"] = float(_ed_lot)
 
-    tab_ov, tab_al = st.tabs(["📊 1. 项目概览", "⚖️ 2. 份额分配"])
+    tab_ov, tab_al, tab_mon = st.tabs(
+        ["📊 1. 项目概览", "⚖️ 2. 份额分配", "🔗 3. 认购链接监控"]
+    )
 
     working = display_df.copy()
     edited_slice = pd.DataFrame()
@@ -1948,63 +1959,36 @@ def render_allocations_decision_center() -> None:
 
     with tab_al:
         with st.container(border=True):
-            st.markdown("**动态群组（CRM Tier / Type）**")
-            tc, yc = st.columns(2)
-            _pills_fn = getattr(st, "pills", None)
-            with tc:
-                if not uniq_tiers:
-                    st.caption("暂无 Tier 选项")
-                elif callable(_pills_fn):
-                    try:
-                        st.pills(
-                            "Tier",
-                            uniq_tiers,
-                            selection_mode="multi",
-                            default=uniq_tiers,
-                            key=f"ac_ms_tiers_{pid}",
-                        )
-                    except TypeError:
+            st.caption(
+                "动态群组筛选与 Distribution「👥 3. 名单确认」一致：两列多选；"
+                "未选或清空该维度则不做限制（显示全部）。"
+            )
+            _k_tvis = f"ac_ms_tiers_{pid}"
+            _k_yvis = f"ac_ms_types_{pid}"
+            if uniq_tiers and _k_tvis not in st.session_state:
+                st.session_state[_k_tvis] = list(uniq_tiers)
+            if uniq_types and _k_yvis not in st.session_state:
+                st.session_state[_k_yvis] = list(uniq_types)
+            if uniq_tiers or uniq_types:
+                c_f1, c_f2 = st.columns(2)
+                with c_f1:
+                    if uniq_tiers:
                         st.multiselect(
-                            "Tier",
+                            "显示的 Tier（CRM 中出现的取值）",
                             options=uniq_tiers,
-                            default=uniq_tiers,
-                            key=f"ac_ms_tiers_{pid}",
+                            key=_k_tvis,
                         )
-                else:
-                    st.multiselect(
-                        "Tier",
-                        options=uniq_tiers,
-                        default=uniq_tiers,
-                        key=f"ac_ms_tiers_{pid}",
-                    )
-            with yc:
-                if not uniq_types:
-                    st.caption("暂无 Type 选项")
-                elif callable(_pills_fn):
-                    try:
-                        st.pills(
-                            "Type",
-                            uniq_types,
-                            selection_mode="multi",
-                            default=uniq_types,
-                            key=f"ac_ms_types_{pid}",
-                        )
-                    except TypeError:
+                with c_f2:
+                    if uniq_types:
                         st.multiselect(
-                            "Type",
+                            "显示的 Type（CRM 中出现的取值）",
                             options=uniq_types,
-                            default=uniq_types,
-                            key=f"ac_ms_types_{pid}",
+                            key=_k_yvis,
                         )
-                else:
-                    st.multiselect(
-                        "Type",
-                        options=uniq_types,
-                        default=uniq_types,
-                        key=f"ac_ms_types_{pid}",
-                    )
-            _raw_t = st.session_state.get(f"ac_ms_tiers_{pid}", uniq_tiers)
-            _raw_y = st.session_state.get(f"ac_ms_types_{pid}", uniq_types)
+            elif not uniq_tiers and not uniq_types:
+                st.caption("当前项目分配表与 CRM 中暂无可用 Tier/Type 选项。")
+            _raw_t = st.session_state.get(_k_tvis, uniq_tiers)
+            _raw_y = st.session_state.get(_k_yvis, uniq_types)
             sel_tier = list(_raw_t) if isinstance(_raw_t, (list, tuple)) else ([_raw_t] if _raw_t else [])
             sel_type = list(_raw_y) if isinstance(_raw_y, (list, tuple)) else ([_raw_y] if _raw_y else [])
             m_vis = _ac_filter_mask_by_tier_type(display_df, sel_tier, sel_type)
@@ -2012,8 +1996,64 @@ def render_allocations_decision_center() -> None:
         n_view = len(view_df)
         view_df = _ac_recompute_shares_from_amounts(view_df, float(_ed_price))
         view_df["Diff_pct"] = _ac_diff_pct_column(view_df["认购额度"], view_df["Suggested_Amount"])
+        expired_pick: List[str] = []
+        if (
+            not view_df.empty
+            and "client_id" in view_df.columns
+            and "_link_status_key" in view_df.columns
+        ):
+            expired_pick = (
+                view_df[view_df["_link_status_key"].astype(str) == "expired"]["client_id"]
+                .astype(str)
+                .str.strip()
+                .tolist()
+            )
+        if expired_pick:
+            _name_by_cid = {}
+            if "客户姓名" in view_df.columns:
+                for _, rr in view_df.iterrows():
+                    k = str(rr.get("client_id", "")).strip()
+                    if k:
+                        _name_by_cid[k] = str(rr.get("客户姓名", "") or "").strip() or "—"
+
+            def _fmt_expired_cid(x: str) -> str:
+                return f"{x} · {_name_by_cid.get(str(x).strip(), '—')}"
+
+            st.multiselect(
+                "已过期客户（勾选后点击下方按钮批量重发激活邮件）",
+                options=expired_pick,
+                format_func=_fmt_expired_cid,
+                key=f"ac_resend_expired_pick_{pid}",
+            )
+            _pick_resend = st.session_state.get(f"ac_resend_expired_pick_{pid}", [])
+            _sel_resend = (
+                [str(x).strip() for x in _pick_resend if str(x).strip()]
+                if isinstance(_pick_resend, list)
+                else []
+            )
+            if _sel_resend and st.button("📧 批量重发激活邮件", key=f"ac_bulk_resend_oid_{pid}"):
+                from coo_mailer import resolve_mail_transport_config
+
+                _cfg = resolve_mail_transport_config()
+                _actor = (st.session_state.get(f"ac_actor_{pid}", "") or "").strip() or "COO"
+                _errs = bulk_resend_expired_oid_emails(
+                    str(pid),
+                    _sel_resend,
+                    proj_row=proj_row,
+                    crm=crm,
+                    commits=_read_commitments_df(),
+                    actor=_actor,
+                    mail_cfg=_cfg,
+                )
+                if _errs:
+                    st.error("部分未发送成功：\n" + "\n".join(_errs))
+                else:
+                    st.success(f"已向 {len(_sel_resend)} 位客户重发认购链接邮件。")
+                st.rerun()
         editor_cols = [
             "客户姓名",
+            "链接状态",
+            "OID到期",
             "_tier_disp",
             "_type_disp",
             "认购额度",
@@ -2069,6 +2109,8 @@ def render_allocations_decision_center() -> None:
                     editor_body,
                     disabled=[
                         "客户姓名",
+                        "链接状态",
+                        "OID到期",
                         "_tier_disp",
                         "_type_disp",
                         "认购额度",
@@ -2077,19 +2119,25 @@ def render_allocations_decision_center() -> None:
                     ],
                     column_config={
                         "客户姓名": st.column_config.TextColumn("Name"),
+                        "链接状态": st.column_config.TextColumn("链接状态"),
+                        "OID到期": st.column_config.TextColumn("OID 到期"),
                         "_tier_disp": st.column_config.TextColumn("Tier"),
                         "_type_disp": st.column_config.TextColumn("Type"),
                         "认购额度": st.column_config.NumberColumn(
-                            "Desired (CAD)", format="%,.0f"
+                            "Desired (CAD)",
+                            format="localized",
+                            step=1.0,
                         ),
                         "Suggested_Amount": st.column_config.NumberColumn(
                             "Allocated (CAD)",
                             min_value=0.0,
                             step=1.0,
+                            format="localized",
                         ),
                         "Suggested_Shares": st.column_config.NumberColumn(
                             "Shares",
-                            format="%,.0f",
+                            format="localized",
+                            step=1.0,
                         ),
                         "Diff_pct": st.column_config.TextColumn("Diff %"),
                     },
@@ -2223,6 +2271,17 @@ def render_allocations_decision_center() -> None:
             if cap_display_i > 0:
                 pbar = min(max(float(total_allocated) / float(cap_display_i), 0.0), 1.0)
                 st.progress(pbar)
+
+    with tab_mon:
+        st.caption(
+            "链接状态依据 commitments（OID / OID_Expiry_At）与是否已打开门户（link_logs / allocations.link_clicked_at）综合判断；"
+            "重发仅更新准入凭证与邮件，不修改分配额度。"
+        )
+        _mon_cols = [c for c in ("客户姓名", "client_id", "链接状态", "OID到期") if c in working.columns]
+        if _mon_cols and not working.empty:
+            st.dataframe(working[_mon_cols].copy(), use_container_width=True, hide_index=True)
+        else:
+            st.info("当前项目暂无带链接状态的客户数据。")
 
     if _needs_editor_commit_rerun:
         st.rerun()

@@ -7,4 +7,8 @@ import app as app_mod
 
 st.set_page_config(page_title="签署统计 · Closing Deal", layout="wide", page_icon="📋")
 
+from utils.coo_session_chrome import render_coo_feedback_banner
+
+render_coo_feedback_banner()
+
 app_mod.render_closing_stats()

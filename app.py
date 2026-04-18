@@ -1004,7 +1004,7 @@ def render_dynamic_pool():
         use_container_width=True,
         num_rows="dynamic",
         column_config={
-            "Cap_Value": st.column_config.NumberColumn("Cap_Value", format="%,.2f"),
+            "Cap_Value": st.column_config.NumberColumn("Cap_Value", format="localized"),
             "Priority": st.column_config.NumberColumn("Priority", format="%,d", step=1),
         },
     )
@@ -1384,6 +1384,12 @@ def render_closing_stats() -> None:
     st.caption("手工维护签署/资金状态，批量预览 Closing 邮件，并导出报表。当前项目在左侧边栏选择。")
 
     projects = _load_or_init_projects()
+    _pending_closing = str(st.session_state.pop("coo_pending_closing_pid", "") or "").strip()
+    if _pending_closing and not projects.empty and "Project_ID" in projects.columns:
+        _pids = set(projects["Project_ID"].astype(str).str.strip())
+        if _pending_closing in _pids:
+            st.session_state[INVESTFLOW_PROJECT_SELECTOR_KEY] = _pending_closing
+            st.success(f"已从待办跳转至项目 **{_pending_closing}**。")
     render_sidebar_current_project(projects)
     if projects.empty:
         st.info("暂无项目。")
@@ -1449,6 +1455,56 @@ def render_closing_stats() -> None:
     m2.metric("待发送", int((work["签署状态"].astype(str) == "待发送").sum()))
     m3.metric("已发待签", int((work["签署状态"].astype(str) == "已发待签").sum()))
 
+    from utils.allocations_io import allocations_rows_for_project, mark_receipt_reviewed
+    from utils.feedback_activity_log import log_action
+
+    _ar = allocations_rows_for_project(str(pid))
+    _ev_cols = [
+        c
+        for c in (
+            "client_id",
+            "link_clicked_at",
+            "commitment_confirmed",
+            "document_signed",
+            "receipt_uploaded",
+            "receipt_reviewed_at",
+        )
+        if c in _ar.columns
+    ]
+    if _ev_cols and not _ar.empty:
+        _slim = _ar[_ev_cols].copy()
+        _mrow = pd.Series(False, index=_slim.index)
+        for c in _ev_cols:
+            if c != "client_id" and c in _slim.columns:
+                _mrow = _mrow | _slim[c].astype(str).str.strip().ne("")
+        _slim_show = _slim.loc[_mrow].copy()
+        if not _slim_show.empty:
+            st.subheader("Portal 行为证据（极简）")
+            st.dataframe(_slim_show, use_container_width=True, hide_index=True)
+            _pend = _ar[
+                _ar.get("receipt_uploaded", pd.Series(dtype=str)).astype(str).str.strip().ne("")
+                & _ar.get("receipt_reviewed_at", pd.Series(dtype=str)).astype(str).str.strip().eq("")
+            ]
+            if not _pend.empty and "client_id" in _pend.columns:
+                st.caption("收据待 COO 审核：选择客户后点击按钮。")
+                _cid_pick = st.selectbox(
+                    "待审核客户",
+                    options=_pend["client_id"].astype(str).str.strip().tolist(),
+                    key=f"closing_receipt_pick_{pid}",
+                )
+                if st.button("标记收据已审核", key=f"closing_receipt_ok_{pid}"):
+                    mark_receipt_reviewed(str(pid), str(_cid_pick))
+                    log_action(
+                        "oid_receipt_reviewed",
+                        f"COO marked receipt reviewed for client={_cid_pick}",
+                        project_id=str(pid),
+                        client_id=str(_cid_pick),
+                        actor="coo",
+                        highlight=True,
+                    )
+                    st.success("已记录审核时间。")
+                    st.rerun()
+
     st.subheader("投资人清单（Data Editor）")
     edited = st.data_editor(
         work,
@@ -1456,7 +1512,7 @@ def render_closing_stats() -> None:
             "client_id": st.column_config.TextColumn("client_id", disabled=True, help="内部主键"),
             "姓名": st.column_config.TextColumn("投资人姓名", disabled=True),
             "邮件": st.column_config.TextColumn("邮件", disabled=True),
-            "分配额度": st.column_config.NumberColumn("分配额度 (CAD)", disabled=True, format="%,.2f"),
+            "分配额度": st.column_config.NumberColumn("分配额度 (CAD)", disabled=True, format="localized"),
             "签署状态": st.column_config.SelectboxColumn(
                 "签署状态",
                 options=CLOSING_SIGN_OPTIONS,
@@ -1598,6 +1654,11 @@ def main():
     InvestFlow 主页。业务模块一律从左侧 Streamlit **Pages** 菜单进入（单一导航，无重复侧栏）。
     """
     st.set_page_config(page_title="InvestFlow", layout="wide", page_icon="📊")
+
+    from utils.coo_session_chrome import render_coo_feedback_banner
+
+    render_coo_feedback_banner()
+
     st.title("InvestFlow")
     st.markdown(
         """
@@ -1610,7 +1671,8 @@ def main():
 | 3 | **Distribution** | COO 邮件与模板分发 |
 | 4 | **Allocation Center** | 分配决策台、同步锁定、**余额对冲（GP 池）** |
 | 5 | **Investment Portal** | 投资人门户预览 |
-| 6 | **签署统计 · Closing** | Portal 签署进度、关账入口 |
+| 6 | **活动日志** | OID / Portal 行为与分配操作审计 |
+| 7 | **签署统计 · Closing** | Portal 签署进度、关账入口 |
 
 数据：`projects.csv`、`commitments.csv`（路径由 `investflow_data` 解析）。
 """

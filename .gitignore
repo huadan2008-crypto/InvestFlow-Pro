@@ -19,6 +19,13 @@ build/
 .env.*
 !.env.example
 Data/oid_tokens.json
+data/oid_tokens.json
+data/receipts/
+
+# Runtime logs (local / may contain PII; schema migration leaves *.bak)
+**/allocation_activity_log.csv
+**/allocation_activity_log.csv.schema_migration.bak
+Data/activity_log.csv
 
 # IDE / tooling
 .cursor/

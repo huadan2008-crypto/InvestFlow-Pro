@@ -898,10 +898,10 @@ def render_hot_deal_dispatch_v21() -> None:
         "client_id": st.column_config.TextColumn("Client_ID", disabled=True),
         "Name_Household": st.column_config.TextColumn("Name / Household", disabled=True),
         "Tier": st.column_config.TextColumn("Tier", disabled=True),
-        "Allocated_Amount": st.column_config.NumberColumn("Allocated_Amount", format="%,.2f"),
+        "Allocated_Amount": st.column_config.NumberColumn("Allocated_Amount", format="localized"),
         "Allocated_Shares": st.column_config.NumberColumn(
             "Allocated_Shares",
-            format="%,.0f",
+            format="localized",
             disabled=True,
             step=1,
         ),

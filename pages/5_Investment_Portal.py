@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -11,7 +12,10 @@ import pandas as pd
 import streamlit as st
 
 from hot_deal_dispatch_v21 import _get_query_param, _show_client_view, resolve_oid_for_project_client
+from utils.allocations_io import get_client_allocation_feedback_row, update_allocation_feedback_fields
+from utils.feedback_activity_log import log_action
 from utils.investment_portal_data import (
+    DATA_DIR,
     canonical_project_id,
     client_display_name,
     deadline_passed,
@@ -106,6 +110,18 @@ _link_key = f"portal_link_logged_{pid_canon}_{cid_url}"
 if _link_key not in st.session_state:
     append_link_open(project_id=pid_canon, client_id=cid_url)
     st.session_state[_link_key] = True
+_alloc_link_key = f"portal_alloc_link_sync_{pid_canon}_{cid_url}"
+if _alloc_link_key not in st.session_state:
+    update_allocation_feedback_fields(pid_canon, cid_url, set_link_clicked=True)
+    log_action(
+        "oid_link_open",
+        "Investment Portal link opened (allocations.link_clicked_at)",
+        project_id=pid_canon,
+        client_id=cid_url,
+        actor="investor",
+        highlight=True,
+    )
+    st.session_state[_alloc_link_key] = True
 
 past_deadline = deadline_passed(snap["deadline_date_raw"])
 if past_deadline:
@@ -171,6 +187,30 @@ st.markdown(
 )
 
 st.divider()
+
+_fb_row = get_client_allocation_feedback_row(pid_canon, cid_url)
+with st.status("认购进度（同步至 COO 看板）", expanded=False) as _portal_status:
+    st.caption("以下节点写入 `allocations.csv` 与活动日志，供管理人跟踪。")
+    st.write(
+        "· 链接访问：已记录"
+        if str(_fb_row.get("link_clicked_at", "") or "").strip() or (_alloc_link_key in st.session_state)
+        else "· 链接访问：待完成"
+    )
+    _conf_done = bool(str(_fb_row.get("commitment_confirmed", "") or "").strip()) or any(
+        client_has_confirmed_allocation(p, cid_url) for p in {pid_canon, pid_url} if p
+    )
+    st.write("· 电子确认：已完成" if _conf_done else "· 电子确认：待完成（如有配额请下方确认）")
+    st.write(
+        "· 文件查阅：已完成"
+        if str(_fb_row.get("document_signed", "") or "").strip()
+        else "· 文件查阅：待完成（见下方勾选）"
+    )
+    st.write(
+        "· 付款凭证：已上传"
+        if str(_fb_row.get("receipt_uploaded", "") or "").strip()
+        else "· 付款凭证：未上传"
+    )
+    _portal_status.update(label="进度已刷新", state="complete")
 
 # 任一 project_id 写法下已确认 / 已提交
 def _has_confirmed_any() -> bool:
@@ -250,6 +290,17 @@ if allocated is not None and float(allocated) > 0:
                     response_type=RESPONSE_CONFIRMATION,
                     oid=oid_for_log,
                 )
+                update_allocation_feedback_fields(
+                    pid_canon, cid_url, set_commitment_confirmed=True
+                )
+                log_action(
+                    "oid_commitment_confirm",
+                    f"amount={float(allocated)}",
+                    project_id=pid_canon,
+                    client_id=cid_url,
+                    actor="investor",
+                    highlight=True,
+                )
                 st.balloons()
                 st.success("已成功提交确认。感谢您的认购。")
                 st.markdown(
@@ -305,9 +356,75 @@ else:
                     response_type=RESPONSE_INTENT,
                     oid=oid_for_log,
                 )
+                log_action(
+                    "oid_intent_submit",
+                    f"amount={float(picked_amt)}",
+                    project_id=pid_canon,
+                    client_id=cid_url,
+                    actor="investor",
+                    highlight=True,
+                )
                 st.balloons()
                 st.success("已提交认购意向，感谢您的参与。")
                 st.markdown(
                     _confirmation_letter_html(amount=float(picked_amt), is_intent=True),
                     unsafe_allow_html=True,
                 )
+
+st.divider()
+st.subheader("Closing 材料（电子留痕）")
+_fb_live = get_client_allocation_feedback_row(pid_canon, cid_url)
+_doc_fb = str(_fb_live.get("document_signed", "") or "").strip()
+if not _doc_fb and can_submit:
+    _doc_ack = st.checkbox(
+        "本人确认已查阅认购协议及披露文件摘要（与正式文件核对以纸质/电子签为准）",
+        key="portal_doc_read_ack",
+    )
+    if st.button("确认已阅文件", disabled=not _doc_ack, key="portal_doc_sign_btn"):
+        update_allocation_feedback_fields(pid_canon, cid_url, set_document_signed=True)
+        log_action(
+            "oid_document_sign",
+            "Investor acknowledged subscription documents (summary)",
+            project_id=pid_canon,
+            client_id=cid_url,
+            actor="investor",
+            highlight=True,
+        )
+        st.success("已记录文件查阅确认。")
+        st.rerun()
+elif _doc_fb:
+    st.success("文件查阅确认已在系统中存档。")
+
+_rfb = str(_fb_live.get("receipt_uploaded", "") or "").strip()
+_up = st.file_uploader(
+    "上传付款 / 认购凭证（PDF 或图片）",
+    type=["pdf", "png", "jpg", "jpeg", "webp"],
+    key="portal_receipt_upload",
+)
+if _up is not None and can_submit and st.button("提交收据", key="portal_receipt_submit"):
+    _rd = os.path.join(DATA_DIR, "receipts")
+    os.makedirs(_rd, exist_ok=True)
+    _ext = os.path.splitext(_up.name)[1] or ".bin"
+    _fn = f"{pid_canon}_{cid_url}_{int(datetime.now(timezone.utc).timestamp())}{_ext}"
+    _full = os.path.join(_rd, _fn)
+    with open(_full, "wb") as _f:
+        _f.write(_up.getbuffer())
+    _rel = os.path.join("receipts", _fn).replace("\\", "/")
+    update_allocation_feedback_fields(
+        pid_canon, cid_url, set_receipt_uploaded=True, receipt_path=_rel
+    )
+    log_action(
+        "oid_receipt_upload",
+        f"path={_rel}",
+        project_id=pid_canon,
+        client_id=cid_url,
+        actor="investor",
+        highlight=True,
+    )
+    with st.status("正在上传收据…", expanded=True) as _ru:
+        st.caption(f"已保存：{_rel}")
+        _ru.update(label="上传完成", state="complete")
+    st.success("收据已提交，管理人将收到待办提醒。")
+    st.rerun()
+elif _rfb:
+    st.caption("付款凭证已存档；如需更新请邮件联系客户经理。")

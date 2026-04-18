@@ -5,6 +5,10 @@ import streamlit as st
 
 st.set_page_config(page_title="Allocation Center", layout="wide", page_icon="🎯")
 
+from utils.coo_session_chrome import render_coo_feedback_banner
+
+render_coo_feedback_banner()
+
 import app as app_mod
 
 app_mod.apply_pending_allocation_nav_from_hub()

@@ -1,0 +1,3 @@
+# 使用 Streamlit 原生 multipage 侧栏（pages/）；勿与 app 内第二套按钮菜单混用。
+[client]
+showSidebarNavigation = true

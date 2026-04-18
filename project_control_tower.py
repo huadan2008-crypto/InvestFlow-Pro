@@ -629,7 +629,7 @@ def render_project_control_tower() -> None:
             key=f"tower_open_editor_{selected}",
             column_config={
                 "client_id": st.column_config.TextColumn("client_id"),
-                "Desired_Amount": st.column_config.NumberColumn("Desired_Amount", format="%,.2f"),
+                "Desired_Amount": st.column_config.NumberColumn("Desired_Amount", format="localized"),
             },
         )
         if st.button("保存意向 (Open)", key=f"tower_save_open_{selected}"):
@@ -781,14 +781,14 @@ def render_project_control_tower() -> None:
         st.session_state[bk] = _apply_final_shares(st.session_state[bk], share_price, True)
 
     cfg = {
-        "Desired_Amount": st.column_config.NumberColumn("Desired_Amount", format="%,.2f", disabled=True),
-        "Suggested_Amount": st.column_config.NumberColumn("Suggested_Amount", format="%,.2f", disabled=True),
+        "Desired_Amount": st.column_config.NumberColumn("Desired_Amount", format="localized", disabled=True),
+        "Suggested_Amount": st.column_config.NumberColumn("Suggested_Amount", format="localized", disabled=True),
         "Final_Allocation": st.column_config.NumberColumn(
             "Final_Allocation",
-            format="%,.2f",
+            format="localized",
             disabled=(status == STATUS_CLOSED or dispatch_lock_edit),
         ),
-        "Final_Shares": st.column_config.NumberColumn("Final_Shares", format="%,.4f", disabled=True),
+        "Final_Shares": st.column_config.NumberColumn("Final_Shares", format="%.4f", disabled=True),
         "Tier": st.column_config.TextColumn("Tier", disabled=True),
         "Name_Household": st.column_config.TextColumn("Name/Household", disabled=True),
     }

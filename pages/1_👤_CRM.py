@@ -4,4 +4,8 @@ import streamlit as st
 from crm_mgmt import render_crm_mgmt
 
 st.set_page_config(page_title="CRM", layout="wide", page_icon="👤")
+
+from utils.coo_session_chrome import render_coo_feedback_banner
+
+render_coo_feedback_banner()
 render_crm_mgmt()
