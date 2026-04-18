@@ -4,6 +4,8 @@ Action Center — 分配决策台：项目额度、CRM/意向/OID 反馈汇总�
 """
 from __future__ import annotations
 
+import csv
+import html
 import json
 import math
 import os
@@ -25,7 +27,6 @@ from utils.final_allocations_io import (
     SYNTHETIC_BUFFER_CLIENT_ID,
     save_final_allocations_replace_project,
 )
-from utils.activity_log import log_action
 from utils.oid_feedback_io import RESPONSE_INTENT, read_oid_feedback_df
 
 
@@ -207,12 +208,8 @@ def _household_intent_agg_dataframe(pid: str, hard_cap: float) -> Optional[pd.Da
 def _render_household_concentration_analysis_from_df(show: Optional[pd.DataFrame]) -> None:
     """家族意向汇总（oid_feedback 意向 × crm household），水平柱图；超 Hard Cap 15% 橙红高亮。"""
     with st.expander("Household Concentration Analysis（家族意向集中度）", expanded=False):
-        st.caption(
-            "按 `oid_feedback.csv` 中意向金额（Selected_Amount / feedback_amount 等）汇总到 `crm.csv` 的 household_id；"
-            "缺 household_id 时暂用 client_id。超过 **项目 Hard Cap 的 15%** 的家族柱体为橙红色。"
-        )
+        st.caption("按意向金额汇总到 household；超过 Hard Cap 15% 的柱体为橙红色。")
         if show is None or show.empty:
-            st.info("当前项目暂无 Portal 意向记录、无 CRM 匹配，或 oid_feedback 中无可用金额列。")
             return
         _hh_show = show[["Household", "household_id", "Total Intent Amount", "over_cap15"]].rename(
             columns={"over_cap15": "超15% Hard Cap"}
@@ -440,7 +437,6 @@ def _build_allocation_base_table(
                 }
             )
     elif not crm.empty and "client_id" in crm.columns:
-        st.warning("该项目在 commitments.csv 中无记录，已列出全部 CRM 客户供手工分配（请核对）。")
         for _, r in crm.iterrows():
             cid = str(r.get("client_id", "")).strip()
             if not cid:
@@ -766,6 +762,45 @@ def _ac_merge_editor_columns(base_df: pd.DataFrame, ov: pd.DataFrame) -> pd.Data
     return out
 
 
+def _ac_workbench_merge(base_full: pd.DataFrame, ov: pd.DataFrame) -> pd.DataFrame:
+    """工作台以 override 行为准（可含 CRM 批量追加行）；与 base 交集行用 base 刷新非 Suggested 列。"""
+    if ov is None or ov.empty:
+        return base_full.copy()
+    out = ov.copy()
+    if base_full.empty or "client_id" not in base_full.columns or "client_id" not in out.columns:
+        return out
+    base_ix = base_full.copy()
+    base_ix["_cidk"] = base_ix["client_id"].astype(str).str.strip()
+    base_ix = base_ix.set_index("_cidk", drop=False)
+    skip = {"Suggested_Shares", "Suggested_Amount", "client_id"}
+    for i in out.index:
+        cid = str(out.at[i, "client_id"]).strip()
+        if not cid or cid not in base_ix.index:
+            continue
+        br = base_ix.loc[cid]
+        if isinstance(br, pd.DataFrame):
+            br = br.iloc[0]
+        for c in base_full.columns:
+            if c in skip or c not in out.columns:
+                continue
+            try:
+                out.at[i, c] = br[c]
+            except (KeyError, TypeError, ValueError):
+                continue
+    return out
+
+
+def _ac_df_suggested_amount_int_diff(a: pd.DataFrame, b: pd.DataFrame) -> bool:
+    """仅比较 Suggested_Amount（整数），用于分配台避免 Shares 联动导致反复 rerun。"""
+    if "Suggested_Amount" not in a.columns or "Suggested_Amount" not in b.columns:
+        return False
+    if len(a) != len(b):
+        return True
+    va = pd.to_numeric(a["Suggested_Amount"], errors="coerce").fillna(0).astype(int)
+    vb = pd.to_numeric(b["Suggested_Amount"], errors="coerce").fillna(0).astype(int)
+    return not va.reset_index(drop=True).equals(vb.reset_index(drop=True))
+
+
 def _df_suggested_int_diff(a: pd.DataFrame, b: pd.DataFrame) -> bool:
     """比较两表 Suggested 列（按 int）；任一行任一列不同则 True。用于检测编辑/同步是否与当前展示不一致。"""
     for col in ("Suggested_Shares", "Suggested_Amount"):
@@ -1075,6 +1110,11 @@ def _ac_get_data_editor_edit_state(raw: Any) -> Optional[dict]:
 AC_ALLOC_EDITOR_KEY = "alloc_editor"
 
 
+def _ac_alloc_editor_session_key(pid: str) -> str:
+    """按项目隔离 data_editor 的 session 键，避免与其它页面/组件的 alloc_editor 冲突导致只读。"""
+    return f"alloc_editor_{str(pid).strip()}"
+
+
 def _merge_locked_into_table(base: pd.DataFrame, pid: str) -> pd.DataFrame:
     m = latest_allocation_map_for_project(pid)
     if not m or "最终分配额度" not in base.columns:
@@ -1180,16 +1220,640 @@ def _save_final_allocations_including_buffer(
     save_final_allocations_replace_project(str(pid), new_rows)
 
 
-def render_allocations_decision_center() -> None:
-    st.subheader("分配决策台")
+def _crm_tier_display(r: pd.Series) -> str:
+    v = _row_get(r, "tier", "Tier", "Investor_Tier", "investor_tier")
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return "—"
+    s = str(v).strip()
+    return s or "—"
 
+
+def _crm_type_display(r: pd.Series) -> str:
+    v = _row_get(
+        r,
+        "type",
+        "Type",
+        "investor_type",
+        "client_type",
+        "Client_Type",
+        "tag",
+        "segment",
+        "Entity_Type",
+    )
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return "—"
+    s = str(v).strip()
+    return s or "—"
+
+
+AC_ALLOC_ACTIVITY_LOG = os.path.join(DATA_DIR, "allocation_activity_log.csv")
+
+
+def _ac_crm_unique_tier_type_labels(crm: pd.DataFrame) -> Tuple[List[str], List[str]]:
+    tiers: set[str] = set()
+    types: set[str] = set()
+    if crm.empty or "client_id" not in crm.columns:
+        return [], []
+    for _, r in crm.iterrows():
+        t = str(_crm_tier_display(r)).strip()
+        y = str(_crm_type_display(r)).strip()
+        if t and t != "—":
+            tiers.add(t)
+        if y and y != "—":
+            types.add(y)
+    return sorted(tiers), sorted(types)
+
+
+def _ac_alloc_unique_tier_type_for_filters(
+    display_df: pd.DataFrame, crm: pd.DataFrame
+) -> Tuple[List[str], List[str]]:
+    ut, uy = _ac_crm_unique_tier_type_labels(crm)
+    if not display_df.empty:
+        if "_tier_disp" in display_df.columns:
+            for t in display_df["_tier_disp"].dropna().astype(str).unique():
+                s = str(t).strip()
+                if s:
+                    ut = sorted(set(ut) | {s})
+        if "_type_disp" in display_df.columns:
+            for y in display_df["_type_disp"].dropna().astype(str).unique():
+                s = str(y).strip()
+                if s:
+                    uy = sorted(set(uy) | {s})
+    return ut, uy
+
+
+def _ac_filter_mask_by_tier_type(
+    df: pd.DataFrame, sel_tiers: List[str], sel_types: List[str]
+) -> pd.Series:
+    if df.empty:
+        return pd.Series([], dtype=bool)
+    m = pd.Series(True, index=df.index)
+    if sel_tiers:
+        m &= df["_tier_disp"].astype(str).isin(sel_tiers)
+    if sel_types:
+        m &= df["_type_disp"].astype(str).isin(sel_types)
+    return m
+
+
+def _ac_recompute_shares_from_amounts(df: pd.DataFrame, share_price: float) -> pd.DataFrame:
+    out = df.copy()
+    if out.empty or "Suggested_Amount" not in out.columns:
+        return out
+    if "Suggested_Shares" not in out.columns:
+        return out
+    price = float(share_price)
+    if price <= 0:
+        out["Suggested_Shares"] = 0
+        return out
+    am = pd.to_numeric(out["Suggested_Amount"], errors="coerce").fillna(0.0)
+    out["Suggested_Shares"] = (am / price).floordiv(1.0).astype(int).clip(lower=0)
+    return out
+
+
+def _ac_smart_allocate_hard_cap(
+    df: pd.DataFrame,
+    mask: pd.Series,
+    cap: float,
+    tier2_pct: float,
+) -> pd.DataFrame:
+    """在 mask 内：先尽量满足 Tier1/Insiders 的 Desired，再用剩余额度按 Tier2 目标比例分配。"""
+    out = df.copy()
+    if out.empty or not mask.any() or float(cap) <= 0:
+        return out
+    C = int(round(float(cap)))
+    cap_left = C
+    pct = max(0.0, min(100.0, float(tier2_pct)))
+    work_idx = out.index[mask.fillna(False)]
+    prio1 = [
+        i
+        for i in work_idx
+        if str(out.at[i, "_cohort"]) in ("Tier 1", "Insiders")
+        and not str(out.at[i, "client_id"]).strip().startswith("__")
+    ]
+    prio2 = [
+        i
+        for i in work_idx
+        if str(out.at[i, "_cohort"]) == "Tier 2"
+        and not str(out.at[i, "client_id"]).strip().startswith("__")
+    ]
+    rest = [
+        i
+        for i in work_idx
+        if i not in prio1 and i not in prio2 and not str(out.at[i, "client_id"]).strip().startswith("__")
+    ]
+    for i in prio1:
+        des = int(pd.to_numeric(out.at[i, "认购额度"], errors="coerce") or 0)
+        g = max(0, min(des, cap_left))
+        out.at[i, "Suggested_Amount"] = g
+        cap_left -= g
+    tier2_targets: Dict[Any, float] = {}
+    for i in prio2:
+        des = float(pd.to_numeric(out.at[i, "认购额度"], errors="coerce") or 0.0)
+        tier2_targets[i] = des * pct / 100.0
+    tot_t2 = sum(tier2_targets.values())
+    if cap_left > 0 and tot_t2 > 1e-9:
+        for i, tgt in tier2_targets.items():
+            raw = int(round(cap_left * (tgt / tot_t2)))
+            des = int(pd.to_numeric(out.at[i, "认购额度"], errors="coerce") or 0)
+            mx = int(round(des * pct / 100.0))
+            g = max(0, min(mx, raw, cap_left))
+            out.at[i, "Suggested_Amount"] = g
+            cap_left -= g
+    elif prio2:
+        for i in prio2:
+            des = int(pd.to_numeric(out.at[i, "认购额度"], errors="coerce") or 0)
+            g = max(0, min(int(round(des * pct / 100.0)), cap_left))
+            out.at[i, "Suggested_Amount"] = g
+            cap_left -= g
+    for i in rest:
+        out.at[i, "Suggested_Amount"] = 0
+    return out
+
+
+def _ac_cb_smart_allocate_hard_cap() -> None:
+    pid = str(st.session_state.get("ac_alloc_proj_pick", "") or "").strip()
+    if not pid:
+        return
+    cap = float(st.session_state.get(f"_ac_cap_{pid}", 0.0) or 0.0)
+    pct = float(st.session_state.get(f"ac_tier2_smart_pct_{pid}", 70.0) or 70.0)
+    k = f"ac_editor_override_{pid}"
+    df = st.session_state.get(k)
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        df = st.session_state.get("df_alloc")
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return
+    df = _ac_strip_alloc_meta_cols(df.copy())
+    crm = _read_crm_df()
+    df = _ac_enrich_alloc_meta(df, crm)
+    tiers = st.session_state.get(f"ac_ms_tiers_{pid}") or []
+    types = st.session_state.get(f"ac_ms_types_{pid}") or []
+    if isinstance(tiers, tuple):
+        tiers = list(tiers)
+    if isinstance(types, tuple):
+        types = list(types)
+    if not isinstance(tiers, list):
+        tiers = list(tiers) if tiers else []
+    if not isinstance(types, list):
+        types = list(types) if types else []
+    m = _ac_filter_mask_by_tier_type(df, tiers, types)
+    df = _ac_smart_allocate_hard_cap(df, m, cap, pct)
+    df = _ac_strip_alloc_meta_cols(df)
+    price = float(st.session_state.get(f"_ac_sync_price_{pid}", 0.0) or 0.0)
+    df = _ac_recompute_shares_from_amounts(df, price)
+    st.session_state[k] = df
+    st.session_state["df_alloc"] = df.copy()
+    st.session_state.pop(_ac_alloc_editor_session_key(pid), None)
+    st.session_state.pop(AC_ALLOC_EDITOR_KEY, None)
+
+
+def _ac_format_alloc_breakdown_line(df: pd.DataFrame) -> str:
+    """按 _cohort 汇总已分配金额，用于「已分配总计 (含 …)」文案。"""
+    if df.empty or "Suggested_Amount" not in df.columns:
+        return ""
+    amt = pd.to_numeric(df["Suggested_Amount"], errors="coerce").fillna(0.0)
+    if "_cohort" not in df.columns:
+        return ""
+    tmp = df.copy()
+    tmp["_a"] = amt
+    g = tmp.groupby("_cohort", dropna=False)["_a"].sum()
+    label_map = {
+        "Insiders": "Insider",
+        "Tier 1": "Anchor",
+        "Tier 2": "Tier 2",
+        "Waiting List": "Waiting List",
+    }
+    parts: List[str] = []
+    for c, v in g.items():
+        vi = int(round(float(v)))
+        if vi > 0:
+            parts.append(f"{label_map.get(str(c), str(c))} ${vi:,}")
+    return " + ".join(parts)
+
+
+def _ac_update_alloc_client_map(pid: str, df: pd.DataFrame) -> None:
+    """项目级全局分配：client_id -> Suggested_Amount（与 df_alloc / override 同源）。"""
+    key = f"ac_alloc_map_{pid}"
+    if df.empty or "client_id" not in df.columns:
+        st.session_state[key] = {}
+        return
+    am = pd.to_numeric(df["Suggested_Amount"], errors="coerce").fillna(0.0)
+    mp: Dict[str, float] = {}
+    for i in range(len(df)):
+        cid = str(df.iloc[i]["client_id"]).strip()
+        if cid and not cid.startswith("__"):
+            mp[cid] = float(am.iloc[i])
+    st.session_state[key] = mp
+
+
+def _ac_cb_recalculate_global() -> None:
+    """遍历项目全局分配表（非当前筛选子集）重算份额并刷新分解文案。"""
+    pid = str(st.session_state.get("ac_alloc_proj_pick", "") or "").strip()
+    if not pid:
+        return
+    k = f"ac_editor_override_{pid}"
+    df = st.session_state.get(k)
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        df = st.session_state.get("df_alloc")
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return
+    df = _ac_strip_alloc_meta_cols(df.copy())
+    price = float(st.session_state.get(f"_ac_sync_price_{pid}", 0.0) or 0.0)
+    df = _ac_recompute_shares_from_amounts(df, price)
+    crm = _read_crm_df()
+    enriched = _ac_enrich_alloc_meta(df.copy(), crm)
+    st.session_state[f"_ac_global_breakdown_{pid}"] = _ac_format_alloc_breakdown_line(enriched)
+    stripped = _ac_strip_alloc_meta_cols(df.copy())
+    st.session_state[k] = stripped
+    st.session_state["df_alloc"] = stripped.copy()
+    st.session_state.pop(_ac_alloc_editor_session_key(pid), None)
+    st.session_state.pop(AC_ALLOC_EDITOR_KEY, None)
+
+
+def _ac_build_global_alloc_summary_display(
+    working: pd.DataFrame, m_vis: pd.Series
+) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    """只读全局清单：Suggested_Amount > 0 的全部客户；末尾三行汇总。"""
+    empty_stats = {"sub_cur": 0, "other": 0, "total": 0}
+    if working.empty or "client_id" not in working.columns:
+        return pd.DataFrame(), empty_stats
+    amt = pd.to_numeric(working["Suggested_Amount"], errors="coerce").fillna(0.0)
+    m_ok = m_vis.reindex(working.index).fillna(False)
+    total = int(round(float(amt.sum())))
+    sub_cur = int(round(float(amt[m_ok].sum())))
+    other = total - sub_cur
+    view_cids = set(working.loc[m_ok, "client_id"].astype(str).str.strip())
+    sub = working.loc[amt > 0].copy()
+    if sub.empty:
+        footer = pd.DataFrame(
+            [
+                {
+                    "范围": "—",
+                    "客户姓名": "[当前群组小计]",
+                    "Tier": "",
+                    "Type": "",
+                    "意向 (CAD)": "",
+                    "已分配 (CAD)": sub_cur,
+                    "份额": "",
+                },
+                {
+                    "范围": "—",
+                    "客户姓名": "[其他群组已占份额]",
+                    "Tier": "",
+                    "Type": "",
+                    "意向 (CAD)": "",
+                    "已分配 (CAD)": other,
+                    "份额": "",
+                },
+                {
+                    "范围": "—",
+                    "客户姓名": "[全局总计]",
+                    "Tier": "",
+                    "Type": "",
+                    "意向 (CAD)": "",
+                    "已分配 (CAD)": total,
+                    "份额": "",
+                },
+            ]
+        )
+        return footer, {"sub_cur": sub_cur, "other": other, "total": total}
+    sub["范围"] = sub["client_id"].astype(str).str.strip().apply(
+        lambda x: "✏ 当前筛选" if x in view_cids else "🔒 其他群组"
+    )
+    des_col = "认购额度" if "认购额度" in sub.columns else None
+    row_des = sub[des_col] if des_col else pd.Series([""] * len(sub), index=sub.index)
+    tier_c = "_tier_disp" if "_tier_disp" in sub.columns else None
+    typ_c = "_type_disp" if "_type_disp" in sub.columns else None
+    sh_c = "Suggested_Shares" if "Suggested_Shares" in sub.columns else None
+    disp = pd.DataFrame(
+        {
+            "范围": sub["范围"].astype(str),
+            "客户姓名": sub["客户姓名"].astype(str) if "客户姓名" in sub.columns else "",
+            "Tier": sub[tier_c].astype(str) if tier_c else "—",
+            "Type": sub[typ_c].astype(str) if typ_c else "—",
+            "意向 (CAD)": pd.to_numeric(row_des, errors="coerce").fillna(0.0),
+            "已分配 (CAD)": pd.to_numeric(sub["Suggested_Amount"], errors="coerce").fillna(0.0),
+            "份额": pd.to_numeric(sub[sh_c], errors="coerce").fillna(0.0).astype(int)
+            if sh_c
+            else 0,
+        }
+    )
+    footer = pd.DataFrame(
+        [
+            {
+                "范围": "—",
+                "客户姓名": "[当前群组小计]",
+                "Tier": "",
+                "Type": "",
+                "意向 (CAD)": "",
+                "已分配 (CAD)": float(sub_cur),
+                "份额": "",
+            },
+            {
+                "范围": "—",
+                "客户姓名": "[其他群组已占份额]",
+                "Tier": "",
+                "Type": "",
+                "意向 (CAD)": "",
+                "已分配 (CAD)": float(other),
+                "份额": "",
+            },
+            {
+                "范围": "—",
+                "客户姓名": "[全局总计]",
+                "Tier": "",
+                "Type": "",
+                "意向 (CAD)": "",
+                "已分配 (CAD)": float(total),
+                "份额": "",
+            },
+        ]
+    )
+    out = pd.concat([disp, footer], ignore_index=True)
+    return out, {"sub_cur": sub_cur, "other": other, "total": total}
+
+
+def _ac_style_global_summary_df(df: pd.DataFrame) -> Any:
+    """非当前筛选行浅灰底；汇总行浅蓝加粗。"""
+
+    def _row_style(row: pd.Series) -> List[str]:
+        n = len(row)
+        name = str(row.get("客户姓名", "") or "")
+        if name.startswith("["):
+            return ["font-weight: 700; background-color: #e3f2fd"] * n
+        scope = str(row.get("范围", "") or "")
+        if scope.startswith("🔒"):
+            return ["background-color: #eceff1"] * n
+        return [""] * n
+
+    try:
+        return df.style.apply(_row_style, axis=1).format(
+            {"意向 (CAD)": "{:,.0f}", "已分配 (CAD)": "{:,.0f}", "份额": "{:,.0f}"},
+            na_rep="",
+        )
+    except (ValueError, TypeError):
+        try:
+            return df.style.apply(_row_style, axis=1).format(
+                {"已分配 (CAD)": "{:,.0f}"},
+                na_rep="",
+            )
+        except Exception:
+            return df.style.apply(_row_style, axis=1)
+    except Exception:
+        return df
+
+
+def _ac_crm_lookup_map(crm: pd.DataFrame) -> Dict[str, pd.Series]:
+    if crm.empty or "client_id" not in crm.columns:
+        return {}
+    out: Dict[str, pd.Series] = {}
+    for _, r in crm.iterrows():
+        cid = str(r.get("client_id", "")).strip()
+        if cid:
+            out[cid] = r
+    return out
+
+
+def _ac_row_cohort_bucket(inv_type: str, cr: Optional[pd.Series]) -> str:
+    typ = (_crm_type_display(cr) if cr is not None else "").strip().lower()
+    ts = (_crm_tier_display(cr) if cr is not None else "").strip().lower()
+    inv = (inv_type or "").strip().lower()
+    if "insider" in typ or "employee" in typ or "founder" in typ:
+        return "Insiders"
+    trc = ts.replace(" ", "")
+    if "wait" in ts or "wait" in inv or "tier3" in trc or "tier 3" in ts:
+        return "Waiting List"
+    if "anchor" in inv or "tier 1" in ts or "tier1" in trc or "anchor" in ts:
+        return "Tier 1"
+    return "Tier 2"
+
+
+def _ac_enrich_alloc_meta(df: pd.DataFrame, crm: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    lk = _ac_crm_lookup_map(crm)
+    cohorts: List[str] = []
+    tiers: List[str] = []
+    types: List[str] = []
+    for _, row in out.iterrows():
+        cid = str(row.get("client_id", "")).strip()
+        cr = lk.get(cid)
+        inv_type = str(row.get("投资人类型", "") or "")
+        cohorts.append(_ac_row_cohort_bucket(inv_type, cr))
+        tiers.append(_crm_tier_display(cr) if cr is not None else "—")
+        types.append(_crm_type_display(cr) if cr is not None else "—")
+    out["_cohort"] = cohorts
+    out["_tier_disp"] = tiers
+    out["_type_disp"] = types
+    return out
+
+
+def _ac_strip_alloc_meta_cols(df: pd.DataFrame) -> pd.DataFrame:
+    drop = [c for c in ("_cohort", "_tier_disp", "_type_disp", "Diff_pct", "校验") if c in df.columns]
+    if not drop:
+        return df
+    return df.drop(columns=drop, errors="ignore")
+
+
+def _ac_diff_pct_column(des: pd.Series, alloc: pd.Series) -> pd.Series:
+    d = pd.to_numeric(des, errors="coerce").fillna(0.0)
+    a = pd.to_numeric(alloc, errors="coerce").fillna(0.0)
+    out: List[str] = []
+    for i in range(len(des)):
+        di = float(d.iloc[i])
+        ai = float(a.iloc[i])
+        if di > 1e-6:
+            out.append(f"{(ai - di) / di * 100.0:.1f}%")
+        else:
+            out.append("—" if abs(ai) < 1e-6 else "—")
+    return pd.Series(out, index=des.index)
+
+
+def _ac_colored_alloc_table_html(view_df: pd.DataFrame) -> str:
+    if view_df.empty or "认购额度" not in view_df.columns or "Suggested_Amount" not in view_df.columns:
+        return ""
+    rows_html: List[str] = []
+    des = pd.to_numeric(view_df["认购额度"], errors="coerce").fillna(0.0)
+    alloc = pd.to_numeric(view_df["Suggested_Amount"], errors="coerce").fillna(0.0)
+    shv = (
+        pd.to_numeric(view_df["Suggested_Shares"], errors="coerce").fillna(0.0)
+        if "Suggested_Shares" in view_df.columns
+        else pd.Series([0.0] * len(view_df))
+    )
+    for i in range(len(view_df)):
+        r = view_df.iloc[i]
+        cid = str(r.get("client_id", "")).strip()
+        if cid.startswith("__"):
+            continue
+        nm = html.escape(str(r.get("客户姓名", "") or ""))
+        di = float(des.iloc[i])
+        ai = float(alloc.iloc[i])
+        sh = int(shv.iloc[i])
+        if ai > di + 1e-6:
+            style = "background:#ffebee;color:#b71c1c"
+        elif ai + 1e-6 < di:
+            style = "background:#fff8e1;color:#e65100"
+        else:
+            style = ""
+        tier = html.escape(str(r.get("_tier_disp", "—")))
+        typ = html.escape(str(r.get("_type_disp", "—")))
+        d_pct = html.escape(str(r.get("Diff_pct", "—")))
+        rows_html.append(
+            f"<tr style='{style}'><td>{nm}</td><td>{tier}</td><td>{typ}</td>"
+            f"<td style='text-align:right'>{di:,.0f}</td><td style='text-align:right'>{ai:,.0f}</td>"
+            f"<td style='text-align:right'>{sh:,}</td><td>{d_pct}</td></tr>"
+        )
+    if not rows_html:
+        return ""
+    head = (
+        "<table style='width:100%;border-collapse:collapse;font-size:0.9rem'>"
+        "<thead><tr><th>Name</th><th>Tier</th><th>Type</th>"
+        "<th style='text-align:right'>Desired</th><th style='text-align:right'>Allocated</th>"
+        "<th style='text-align:right'>Shares</th><th>Diff %</th></tr></thead><tbody>"
+    )
+    return head + "".join(rows_html) + "</tbody></table>"
+
+
+def _ac_overlay_view_editor_edits(
+    full_df: pd.DataFrame, view_df: pd.DataFrame, edit_state: Any
+) -> pd.DataFrame:
+    out = full_df.copy()
+    if not isinstance(edit_state, dict):
+        return out
+    vlen = len(view_df)
+    for ridx, changes in (edit_state.get("edited_rows") or {}).items():
+        ri = int(ridx)
+        if ri < 0 or ri >= vlen:
+            continue
+        cid = str(view_df["client_id"].iloc[ri]).strip()
+        if not cid or cid.startswith("__"):
+            continue
+        pos = out.index[out["client_id"].astype(str).str.strip() == cid]
+        if len(pos) == 0:
+            continue
+        loc = pos[0]
+        for cname, cval in (changes or {}).items():
+            if str(cname) == "Suggested_Amount" and not pd.isna(cval):
+                out.loc[loc, "Suggested_Amount"] = int(max(0, float(pd.to_numeric(cval, errors="coerce") or 0)))
+    return out
+
+
+def _ac_merge_view_slice_into_full(
+    full_df: pd.DataFrame,
+    view_df: pd.DataFrame,
+    edited_slice: pd.DataFrame,
+) -> None:
+    n = min(len(view_df), len(edited_slice))
+    for i in range(n):
+        cid = str(view_df["client_id"].iloc[i]).strip()
+        if not cid or cid.startswith("__"):
+            continue
+        pos = full_df.index[full_df["client_id"].astype(str).str.strip() == cid]
+        if len(pos) == 0:
+            continue
+        loc = pos[0]
+        if "Suggested_Amount" not in edited_slice.columns:
+            continue
+        v = edited_slice.iloc[i]["Suggested_Amount"]
+        if pd.isna(v):
+            continue
+        full_df.loc[loc, "Suggested_Amount"] = int(max(0, float(pd.to_numeric(v, errors="coerce") or 0)))
+
+
+def _ac_infer_view_to_full_edits(
+    full_df: pd.DataFrame,
+    view_df: pd.DataFrame,
+    editor_before: pd.DataFrame,
+    edited_slice: pd.DataFrame,
+) -> pd.DataFrame:
+    n_view = len(view_df)
+    if n_view <= 0:
+        return full_df
+    infer = _ac_infer_edited_rows(
+        editor_before,
+        edited_slice.iloc[:n_view],
+        min(n_view, len(edited_slice)),
+    )
+    out = full_df.copy()
+    for ri, ch in infer.items():
+        if ri < 0 or ri >= n_view:
+            continue
+        cid = str(view_df["client_id"].iloc[ri]).strip()
+        if not cid:
+            continue
+        pos = out.index[out["client_id"].astype(str).str.strip() == cid]
+        if len(pos) == 0:
+            continue
+        loc = pos[0]
+        if "Suggested_Amount" in ch:
+            v = ch["Suggested_Amount"]
+            out.loc[loc, "Suggested_Amount"] = int(max(0, float(pd.to_numeric(v, errors="coerce") or 0)))
+    return out
+
+
+def _append_allocation_activity_log(project_id: str, event: str, detail: str) -> None:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    row = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "project_id": str(project_id),
+        "event": str(event)[:120],
+        "detail": str(detail).replace("\n", " ")[:800],
+    }
+    exists = os.path.isfile(AC_ALLOC_ACTIVITY_LOG)
+    with open(AC_ALLOC_ACTIVITY_LOG, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if not exists:
+            w.writeheader()
+        w.writerow(row)
+
+
+def _ac_validation_column(df: pd.DataFrame) -> pd.Series:
+    if df.empty or "认购额度" not in df.columns or "Suggested_Amount" not in df.columns:
+        return pd.Series([""] * len(df), index=df.index)
+    sub = pd.to_numeric(df["认购额度"], errors="coerce").fillna(0.0)
+    amt = pd.to_numeric(df["Suggested_Amount"], errors="coerce").fillna(0.0)
+    return pd.Series(
+        ["超额" if float(amt.iloc[i]) > float(sub.iloc[i]) + 1e-6 else "" for i in range(len(df))],
+        index=df.index,
+    )
+
+
+
+def _ac_build_base_full_for_project_id(pid: str) -> Tuple[pd.DataFrame, float, float, float, bool]:
+    projects = _read_projects_df()
+    pid_col = _project_id_column(projects)
+    if projects.empty or pid_col not in projects.columns:
+        return pd.DataFrame(), 0.0, 0.0, 0.0, False
+    try:
+        proj_row = _select_project_row(projects, str(pid))
+    except KeyError:
+        return pd.DataFrame(), 0.0, 0.0, 0.0, False
+    soft = _is_soft_circle_project(proj_row)
+    cap, ed_price, ed_lot = _ac_project_caps_for_action_center(proj_row)
+    crm = _read_crm_df()
+    commits = _read_commitments_df()
+    base = _build_allocation_base_table(str(pid), proj_row, crm, commits, soft)
+    lock_map = latest_allocation_map_for_project(str(pid))
+    if not (soft and cap <= 0):
+        base = _merge_locked_into_table(base, str(pid))
+    if soft and cap > 0 and not lock_map:
+        cap_i0 = int(round(float(cap)))
+        al = _soft_circle_waterfall_final_alloc(base, cap_i0)
+        base = base.copy()
+        base["最终分配额度"] = al
+    base = _compute_smart_quota_columns(base, proj_row, cap, soft, share_price=ed_price, lot_size=ed_lot)
+    bf = base.copy()
+    bf["认购额度"] = pd.to_numeric(bf["原始意向_参考额度"], errors="coerce").fillna(0.0)
+    return bf, float(cap), float(ed_price), float(ed_lot), soft
+
+
+def render_allocations_decision_center() -> None:
     projects = _read_projects_df()
     import app as _app_alloc
 
     _app_alloc.render_sidebar_current_project(projects)
     pid_col = _project_id_column(projects)
     if projects.empty or pid_col not in projects.columns:
-        st.warning("未找到 projects.csv。")
         return
 
     pids = projects[pid_col].astype(str).tolist()
@@ -1203,21 +1867,24 @@ def render_allocations_decision_center() -> None:
         )
     with row_top[1]:
         st.write("")
-        if st.button("刷新实时数据", key="ac_refresh_oid_fb", help="重新读取 oid_feedback.csv / 邮件发送记录等"):
+        if st.button("刷新实时数据", key="ac_refresh_oid_fb"):
             st.session_state.pop(f"ac_editor_override_{str(pid)}", None)
+            st.session_state.pop(_ac_alloc_editor_session_key(str(pid)), None)
             st.session_state.pop(AC_ALLOC_EDITOR_KEY, None)
             st.session_state.pop("df_alloc", None)
             st.session_state.pop("_ac_bound_alloc_editor_pid", None)
+            st.session_state.pop(f"ac_ms_tiers_{str(pid)}", None)
+            st.session_state.pop(f"ac_ms_types_{str(pid)}", None)
             st.rerun()
 
     try:
         proj_row = _select_project_row(projects, str(pid))
     except KeyError:
-        st.error("项目不存在。")
         return
 
     soft = _is_soft_circle_project(proj_row)
     cap, _ed_price, _ed_lot = _ac_project_caps_for_action_center(proj_row)
+    cap_display_i = int(round(float(cap))) if float(cap) > 0 else 0
 
     crm = _read_crm_df()
     commits = _read_commitments_df()
@@ -1226,8 +1893,8 @@ def render_allocations_decision_center() -> None:
     if not (soft and cap <= 0):
         base = _merge_locked_into_table(base, str(pid))
     if soft and cap > 0 and not lock_map:
-        cap_i = int(round(float(cap)))
-        alloc_list = _soft_circle_waterfall_final_alloc(base, cap_i)
+        cap_i0 = int(round(float(cap)))
+        alloc_list = _soft_circle_waterfall_final_alloc(base, cap_i0)
         base = base.copy()
         base["最终分配额度"] = alloc_list
     base = _compute_smart_quota_columns(
@@ -1236,175 +1903,326 @@ def render_allocations_decision_center() -> None:
     base_full = base.copy()
     base_full["认购额度"] = pd.to_numeric(base_full["原始意向_参考额度"], errors="coerce").fillna(0.0)
 
-    _editor_cols = ["client_id", "客户姓名", "认购额度", "Suggested_Shares", "Suggested_Amount"]
-
     override_key = f"ac_editor_override_{str(pid)}"
     _needs_editor_commit_rerun = False
 
-    if base_full.empty:
-        st.warning("没有可展示的客户行（请检查 commitments 或 CRM）。")
-        return
-
     if str(st.session_state.get("_ac_bound_alloc_editor_pid", "")) != str(pid):
+        old_pid = str(st.session_state.get("_ac_bound_alloc_editor_pid", "") or "").strip()
+        if old_pid:
+            st.session_state.pop(_ac_alloc_editor_session_key(old_pid), None)
+            st.session_state.pop(f"_ac_global_breakdown_{old_pid}", None)
+        st.session_state.pop(_ac_alloc_editor_session_key(str(pid)), None)
         st.session_state.pop(AC_ALLOC_EDITOR_KEY, None)
     st.session_state["_ac_bound_alloc_editor_pid"] = str(pid)
 
     _ov = st.session_state.get(override_key)
-    if _ov is not None and not _ac_same_client_rows(base_full, _ov):
-        st.session_state.pop(override_key, None)
-        _ov = None
-    display_df = _ac_merge_editor_columns(base_full, _ov) if _ov is not None else base_full.copy()
+    if _ov is not None and not base_full.empty and "client_id" in base_full.columns and "client_id" in _ov.columns:
+        b_ids = set(base_full["client_id"].astype(str).str.strip())
+        o_ids = set(_ov["client_id"].astype(str).str.strip())
+        if not b_ids <= o_ids:
+            st.session_state.pop(override_key, None)
+            _ov = None
+    if _ov is None:
+        merged_df = base_full.copy()
+    else:
+        merged_df = _ac_workbench_merge(base_full, _ov)
+
+    display_baseline = merged_df.copy()
+    display_df = _ac_enrich_alloc_meta(merged_df.copy(), crm)
+    st.session_state[f"_ac_cap_{str(pid)}"] = float(cap)
+    uniq_tiers, uniq_types = _ac_alloc_unique_tier_type_for_filters(display_df, crm)
+
     n_data_rows = len(display_df)
-    cap_display_i = int(round(float(cap))) if float(cap) > 0 else 0
-    st.subheader(f"Project Hard Cap: ${cap_display_i:,}")
-
-    editor_body = display_df[_editor_cols].copy()
-
-    st.session_state.df_alloc = display_df.copy()
     st.session_state[f"_ac_n_data_rows_{str(pid)}"] = int(n_data_rows)
-    # 仅客户数据行；汇总用下方 metric，不塞进 data_editor
     st.session_state[f"_ac_merge_base_full_{str(pid)}"] = display_df.copy()
     st.session_state[f"_ac_sync_price_{str(pid)}"] = float(_ed_price)
     st.session_state[f"_ac_sync_lot_{str(pid)}"] = float(_ed_lot)
 
-    # --- 1. 渲染编辑器 ---
-    edited_slice = st.data_editor(
-        editor_body,
-        disabled=False,
-        column_config={
-            "client_id": st.column_config.TextColumn("client_id", disabled=True),
-            "客户姓名": st.column_config.TextColumn("客户姓名", disabled=True),
-            "认购额度": st.column_config.NumberColumn(
-                "认购额度 (CAD)", format="%,.0f", disabled=True, help="意向（只读）。"
-            ),
-            "Suggested_Shares": st.column_config.NumberColumn(
-                "Suggested_Shares",
-                format="%,.0f",
-                disabled=True,
-                help="由下方加元金额按股价/Lot反推。",
-            ),
-            "Suggested_Amount": st.column_config.NumberColumn(
-                "Suggested_Amount (CAD)",
-                format="%,.0f",
-                min_value=0.0,
-                step=1.0,
-                disabled=False,
-                help="手动修改金额，系统将自动对齐股数。",
-            ),
-        },
-        hide_index=True,
-        use_container_width=True,
-        key=AC_ALLOC_EDITOR_KEY,
-    )
+    tab_ov, tab_al = st.tabs(["📊 1. 项目概览", "⚖️ 2. 份额分配"])
 
-    # --- 2. 抓取 session 中的 edited_rows，按股价/Lot/单行加元上限同步股数与金额 ---
-    # （与「金额 → floor(lot) 股数 → 反推加元」一致；写回 override 后 pop 编辑器缓存，避免重复触发）
-    edit_state = _ac_get_data_editor_edit_state(st.session_state.get(AC_ALLOC_EDITOR_KEY))
-    rows_sess = (edit_state or {}).get("edited_rows") or {}
+    working = display_df.copy()
+    edited_slice = pd.DataFrame()
+    view_df = pd.DataFrame()
+    editor_body = pd.DataFrame()
+    n_view = 0
 
-    edited_full = display_df.copy()
-    if rows_sess:
-        edited_full = _ac_overlay_allocation_editor_edits(
-            display_df.copy(), edit_state, max_data_rows=n_data_rows
-        )
-    elif len(edited_slice) >= n_data_rows:
-        _ac_merge_edited_slice_into_df(edited_full, edited_slice, n_data_rows)
-
-    infer = _ac_infer_edited_rows(
-        editor_body,
-        edited_slice.iloc[:n_data_rows],
-        n_data_rows,
-    )
-    rows_for_sync = rows_sess if rows_sess else infer
-    synced = _ac_sync_after_editor_edit(edited_full, rows_for_sync, _ed_price, _ed_lot)
-    if rows_for_sync and not _ac_edits_touch_suggested_amount(rows_for_sync):
-        synced = _ac_refresh_all_suggested_amounts_from_shares(synced, _ed_price, _ed_lot)
-    if _df_suggested_int_diff(synced, display_df):
-        st.session_state[override_key] = synced.copy()
-        st.session_state.pop(AC_ALLOC_EDITOR_KEY, None)
-        _needs_editor_commit_rerun = True
-
-    working = synced
-    st.session_state.df_alloc = working.copy()
-
-    total_allocated = int(pd.to_numeric(working["Suggested_Amount"], errors="coerce").fillna(0).sum())
-    cap_i = cap_display_i
-    if cap_i > 0 and total_allocated > cap_i:
-        st.warning(
-            f"Σ Suggested **C${total_allocated:,}** 已超过 Hard Cap **C${cap_i:,}**，请下调后再点同步。"
-        )
-
-    # --- 3. 汇总指标（紧跟表格）---
-    gap_m = int(round(float(cap) - float(total_allocated))) if float(cap) > 0 else 0
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Project Cap", f"${cap_i:,.0f}" if cap_i > 0 else "—")
-    c2.metric("Total Allocated", f"${total_allocated:,.0f}")
-    c3.metric(
-        "Remaining Gap",
-        f"${gap_m:,.0f}" if cap_i > 0 else "—",
-        delta=-gap_m if cap_i > 0 else None,
-        delta_color="inverse" if cap_i > 0 and gap_m < 0 else "normal",
-    )
-    if cap_i > 0:
-        st.caption(
-            "GAP = Hard Cap − ΣSuggested_Amount（加元整数）。尾差 buffer 在点「同步并锁定」时写入 CSV。"
-        )
-
-    if st.button("🔄 同步并锁定数据", type="primary", key="ac_sync_lock_btn"):
-        _es_btn = _ac_get_data_editor_edit_state(st.session_state.get(AC_ALLOC_EDITOR_KEY))
-        edited_data = (_es_btn or {}).get("edited_rows", {})
-        df_alloc = st.session_state.df_alloc.copy()
-        for row_idx, updated_cols in (edited_data or {}).items():
-            ri = int(row_idx)
-            if ri < 0 or ri >= len(df_alloc):
-                continue
-            for col_name, new_val in (updated_cols or {}).items():
-                cstr = str(col_name)
-                if cstr in df_alloc.columns:
-                    if cstr == "Suggested_Amount" and pd.isna(new_val):
-                        continue
-                    df_alloc.iloc[ri, df_alloc.columns.get_loc(cstr)] = new_val
-        if not edited_data and len(edited_slice) >= n_data_rows:
-            n = min(len(df_alloc), n_data_rows)
-            df_alloc = df_alloc.copy()
-            _ac_merge_edited_slice_into_df(df_alloc, edited_slice, n)
-            infer_btn = _ac_infer_edited_rows(
-                editor_body,
-                edited_slice.iloc[:n_data_rows],
-                n_data_rows,
+    with tab_al:
+        with st.container(border=True):
+            st.markdown("**动态群组（CRM Tier / Type）**")
+            tc, yc = st.columns(2)
+            _pills_fn = getattr(st, "pills", None)
+            with tc:
+                if not uniq_tiers:
+                    st.caption("暂无 Tier 选项")
+                elif callable(_pills_fn):
+                    try:
+                        st.pills(
+                            "Tier",
+                            uniq_tiers,
+                            selection_mode="multi",
+                            default=uniq_tiers,
+                            key=f"ac_ms_tiers_{pid}",
+                        )
+                    except TypeError:
+                        st.multiselect(
+                            "Tier",
+                            options=uniq_tiers,
+                            default=uniq_tiers,
+                            key=f"ac_ms_tiers_{pid}",
+                        )
+                else:
+                    st.multiselect(
+                        "Tier",
+                        options=uniq_tiers,
+                        default=uniq_tiers,
+                        key=f"ac_ms_tiers_{pid}",
+                    )
+            with yc:
+                if not uniq_types:
+                    st.caption("暂无 Type 选项")
+                elif callable(_pills_fn):
+                    try:
+                        st.pills(
+                            "Type",
+                            uniq_types,
+                            selection_mode="multi",
+                            default=uniq_types,
+                            key=f"ac_ms_types_{pid}",
+                        )
+                    except TypeError:
+                        st.multiselect(
+                            "Type",
+                            options=uniq_types,
+                            default=uniq_types,
+                            key=f"ac_ms_types_{pid}",
+                        )
+                else:
+                    st.multiselect(
+                        "Type",
+                        options=uniq_types,
+                        default=uniq_types,
+                        key=f"ac_ms_types_{pid}",
+                    )
+            _raw_t = st.session_state.get(f"ac_ms_tiers_{pid}", uniq_tiers)
+            _raw_y = st.session_state.get(f"ac_ms_types_{pid}", uniq_types)
+            sel_tier = list(_raw_t) if isinstance(_raw_t, (list, tuple)) else ([_raw_t] if _raw_t else [])
+            sel_type = list(_raw_y) if isinstance(_raw_y, (list, tuple)) else ([_raw_y] if _raw_y else [])
+            m_vis = _ac_filter_mask_by_tier_type(display_df, sel_tier, sel_type)
+        view_df = display_df.loc[m_vis].copy().reset_index(drop=True)
+        n_view = len(view_df)
+        view_df = _ac_recompute_shares_from_amounts(view_df, float(_ed_price))
+        view_df["Diff_pct"] = _ac_diff_pct_column(view_df["认购额度"], view_df["Suggested_Amount"])
+        editor_cols = [
+            "客户姓名",
+            "_tier_disp",
+            "_type_disp",
+            "认购额度",
+            "Suggested_Amount",
+            "Suggested_Shares",
+            "Diff_pct",
+        ]
+        editor_body = view_df[[c for c in editor_cols if c in view_df.columns]].copy()
+        if "Suggested_Amount" in editor_body.columns:
+            editor_body["Suggested_Amount"] = (
+                pd.to_numeric(editor_body["Suggested_Amount"], errors="coerce").fillna(0.0).astype(float)
             )
-        else:
-            infer_btn = edited_data
-        df_alloc = _ac_sync_after_editor_edit(df_alloc, infer_btn, _ed_price, _ed_lot)
-        st.session_state.df_alloc = df_alloc
-        st.session_state[override_key] = df_alloc.copy()
-        _save_final_allocations_including_buffer(str(pid), df_alloc, cap, _ed_price, _ed_lot)
-        if "Suggested_Amount" in df_alloc.columns:
-            try:
-                _sum_s = int(
+        if "认购额度" in editor_body.columns:
+            editor_body["认购额度"] = (
+                pd.to_numeric(editor_body["认购额度"], errors="coerce").fillna(0.0).astype(float)
+            )
+        if "Suggested_Shares" in editor_body.columns:
+            editor_body["Suggested_Shares"] = (
+                pd.to_numeric(editor_body["Suggested_Shares"], errors="coerce").fillna(0.0).astype(float)
+            )
+        edited_slice = editor_body.copy()
+        _ed_key = _ac_alloc_editor_session_key(str(pid))
+
+        with st.container(border=True):
+            st.markdown("**智能分配**")
+            st.number_input(
+                "Tier 2 预填比例 (%)",
+                min_value=0.0,
+                max_value=100.0,
+                value=float(st.session_state.get(f"ac_tier2_smart_pct_{pid}", 70.0)),
+                step=1.0,
+                key=f"ac_tier2_smart_pct_{pid}",
+            )
+            b1, b2 = st.columns(2)
+            with b1:
+                st.button(
+                    "智能分配",
+                    type="primary",
+                    key="ac_smart_alloc_btn",
+                    on_click=_ac_cb_smart_allocate_hard_cap,
+                )
+            with b2:
+                st.button(
+                    "重核计算",
+                    key="ac_recalc_btn",
+                    on_click=_ac_cb_recalculate_global,
+                )
+
+        st.subheader("🎯 当前群组编辑")
+        with st.container(border=True):
+            if not view_df.empty:
+                edited_slice = st.data_editor(
+                    editor_body,
+                    disabled=[
+                        "客户姓名",
+                        "_tier_disp",
+                        "_type_disp",
+                        "认购额度",
+                        "Suggested_Shares",
+                        "Diff_pct",
+                    ],
+                    column_config={
+                        "客户姓名": st.column_config.TextColumn("Name"),
+                        "_tier_disp": st.column_config.TextColumn("Tier"),
+                        "_type_disp": st.column_config.TextColumn("Type"),
+                        "认购额度": st.column_config.NumberColumn(
+                            "Desired (CAD)", format="%,.0f"
+                        ),
+                        "Suggested_Amount": st.column_config.NumberColumn(
+                            "Allocated (CAD)",
+                            min_value=0.0,
+                            step=1.0,
+                        ),
+                        "Suggested_Shares": st.column_config.NumberColumn(
+                            "Shares",
+                            format="%,.0f",
+                        ),
+                        "Diff_pct": st.column_config.TextColumn("Diff %"),
+                    },
+                    hide_index=True,
+                    use_container_width=True,
+                    key=_ed_key,
+                )
+
+        edit_state = _ac_get_data_editor_edit_state(st.session_state.get(_ed_key))
+        rows_sess = (edit_state or {}).get("edited_rows") or {}
+
+        edited_full = display_df.copy()
+        if rows_sess:
+            edited_full = _ac_overlay_view_editor_edits(display_df.copy(), view_df, edit_state)
+        elif n_view > 0 and len(edited_slice) >= n_view:
+            _ac_merge_view_slice_into_full(edited_full, view_df, edited_slice)
+        elif n_view > 0:
+            edited_full = _ac_infer_view_to_full_edits(
+                display_df.copy(), view_df, editor_body, edited_slice
+            )
+
+        synced = _ac_recompute_shares_from_amounts(edited_full, float(_ed_price))
+        if _ac_df_suggested_amount_int_diff(
+            _ac_strip_alloc_meta_cols(synced), _ac_strip_alloc_meta_cols(display_baseline)
+        ):
+            st.session_state[override_key] = _ac_strip_alloc_meta_cols(synced.copy())
+            st.session_state.pop(_ed_key, None)
+            st.session_state.pop(AC_ALLOC_EDITOR_KEY, None)
+            _needs_editor_commit_rerun = True
+
+        working = synced.copy()
+        working["校验"] = _ac_validation_column(working)
+        st.session_state.df_alloc = working.copy()
+        _ac_update_alloc_client_map(str(pid), working)
+        tot_post = int(
+            pd.to_numeric(working["Suggested_Amount"], errors="coerce").fillna(0).sum()
+        )
+        gap_post = int(round(float(cap) - float(tot_post))) if float(cap) > 0 else 0
+        gap_label = f"${gap_post:,}" if cap_display_i > 0 else "—"
+        _bd = str(st.session_state.get(f"_ac_global_breakdown_{pid}") or "").strip()
+        if not _bd:
+            _bd = _ac_format_alloc_breakdown_line(working)
+        _bd_html = html.escape(_bd) if _bd else "—"
+        st.markdown(
+            f"<div style='font-size:1.15rem;font-weight:600;margin:0.5rem 0'>"
+            f"已分配总计 <span style='color:#1e88e5'>${tot_post:,}</span>"
+            f" <span style='font-weight:500;color:#546e7a'>(含 {_bd_html})</span>"
+            f"&nbsp;&nbsp;|&nbsp;&nbsp;"
+            f"距离 Hard Cap 剩余 <span style='color:{'#2e7d32' if gap_post >= 0 else '#c62828'}'>{gap_label}</span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+        st.subheader("📊 项目全局分配清单")
+        with st.container(border=True):
+            _sum_df, _ = _ac_build_global_alloc_summary_display(working, m_vis)
+            if not _sum_df.empty:
+                st.caption(
+                    "✏ 当前筛选：与上方工作台一致；🔒 其他群组：不在当前 Tier/Type 筛选内，但已占用额度（COO 可识别固定份额）。"
+                )
+                try:
+                    st.dataframe(
+                        _ac_style_global_summary_df(_sum_df),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                except Exception:
+                    st.dataframe(_sum_df, use_container_width=True, hide_index=True)
+            else:
+                st.info("暂无已分配金额大于 0 的客户。")
+
+        with st.container(border=True):
+            actor = st.text_input(
+                "操作人（用于活动日志）",
+                key=f"ac_actor_{pid}",
+                placeholder="姓名或工号",
+            )
+            if st.button("确认并保存分配", type="primary", key="ac_save_alloc_confirm_btn"):
+                _es_btn = _ac_get_data_editor_edit_state(st.session_state.get(_ed_key))
+                edited_data = (_es_btn or {}).get("edited_rows", {})
+                df_alloc = st.session_state.df_alloc.copy()
+                if edited_data:
+                    df_alloc = _ac_overlay_view_editor_edits(df_alloc, view_df, _es_btn or {})
+                elif n_view > 0 and len(edited_slice) >= n_view:
+                    _ac_merge_view_slice_into_full(df_alloc, view_df, edited_slice)
+                elif n_view > 0:
+                    df_alloc = _ac_infer_view_to_full_edits(
+                        df_alloc, view_df, editor_body, edited_slice
+                    )
+                df_alloc = _ac_recompute_shares_from_amounts(
+                    _ac_strip_alloc_meta_cols(df_alloc), float(_ed_price)
+                )
+                st.session_state.df_alloc = df_alloc
+                st.session_state[override_key] = df_alloc.copy()
+                _ac_update_alloc_client_map(str(pid), df_alloc)
+                _save_final_allocations_including_buffer(str(pid), df_alloc, cap, _ed_price, _ed_lot)
+                from project_control_tower import STATUS_ALLOCATING
+
+                actor_s = (actor or "").strip() or "unknown"
+                ts = datetime.now(timezone.utc).isoformat()
+                tot_save = int(
                     pd.to_numeric(df_alloc["Suggested_Amount"], errors="coerce").fillna(0).sum()
                 )
-            except Exception:
-                _sum_s = -1
-        else:
-            _sum_s = -1
-        log_action(
-            "allocation_sync_lock",
-            f"rows={len(df_alloc)}; sum_suggested_cad={_sum_s}",
-            project_id=str(pid),
-        )
-        from project_control_tower import STATUS_ALLOCATING
+                _app_alloc.update_project_status(
+                    str(pid),
+                    STATUS_ALLOCATING,
+                    actor=f"{actor_s} (Allocation Center)",
+                )
+                _append_allocation_activity_log(
+                    str(pid),
+                    "allocation_locked",
+                    f"actor={actor_s}; ts={ts}; total_allocated_cad={tot_save}",
+                )
+                st.session_state.pop(_ed_key, None)
+                st.session_state.pop(AC_ALLOC_EDITOR_KEY, None)
+                st.rerun()
 
-        _app_alloc.update_project_status(
-            str(pid),
-            STATUS_ALLOCATING,
-            actor="system (Allocation Center: sync-lock final allocations)",
-        )
-        st.success(
-            f"已同步并写入 `{FINAL_ALLOCATIONS_CSV}`（投资人各行 + 尾差 `{SYNTHETIC_BUFFER_CLIENT_ID}`）。"
-        )
-        st.session_state.pop(AC_ALLOC_EDITOR_KEY, None)
-        st.rerun()
+    total_allocated = int(
+        pd.to_numeric(working["Suggested_Amount"], errors="coerce").fillna(0).sum()
+    )
+    gap_m = int(round(float(cap) - float(total_allocated))) if float(cap) > 0 else 0
+    pct = (total_allocated / cap_display_i * 100.0) if cap_display_i > 0 else 0.0
+
+    with tab_ov:
+        with st.container(border=True):
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Hard Cap", f"${cap_display_i:,}" if cap_display_i > 0 else "—")
+            c2.metric("已分配总额", f"${total_allocated:,}")
+            c3.metric("Remaining Gap", f"${gap_m:,}" if cap_display_i > 0 else "—")
+            c4.metric("当前募集进度", f"{pct:.1f} %" if cap_display_i > 0 else "—")
+            if cap_display_i > 0:
+                pbar = min(max(float(total_allocated) / float(cap_display_i), 0.0), 1.0)
+                st.progress(pbar)
 
     if _needs_editor_commit_rerun:
         st.rerun()

@@ -18,7 +18,6 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from coo_mailer import resolve_mail_transport_config, send_email
-from utils.activity_log import log_action
 from utils.cloud_drive_links import (
     appendix_plaintext_lines,
     multiselect_label,
@@ -49,7 +48,6 @@ _DIST_SOFT_LABEL = "意向收集模式 (Soft Circle)"
 _DIST_HOT_LABEL = "确认分配模式 (Hot Deal)"
 _DIST_RECIP_INTENT = "意向收集模式"
 _DIST_RECIP_FORMAL = "正式分配模式"
-_DIST_BULK_CC_EMAIL = "aaron.zhong@ede.com"
 
 
 def _p(*parts: str) -> str:
@@ -129,34 +127,6 @@ def _crm_type_display(r: pd.Series) -> str:
     return s or "—"
 
 
-def _audience_tier_bucket_from_label(label: str) -> int:
-    x = (label or "").lower().replace(" ", "")
-    if "anchor" in x or "tier1" in x or x == "1" or x.startswith("t1"):
-        return 1
-    if "public" in x or "tier2" in x or x == "2" or x.startswith("t2"):
-        return 2
-    if "waitlist" in x or "tier3" in x or x == "3" or x.startswith("t3"):
-        return 3
-    low = (label or "").lower()
-    if "tier1" in low or "tier 1" in low:
-        return 1
-    if "tier2" in low or "tier 2" in low:
-        return 2
-    if "tier3" in low or "tier 3" in low:
-        return 3
-    return 0
-
-
-def _tier_display_from_bucket(bucket: int) -> str:
-    if bucket == 1:
-        return "🔵 Tier 1"
-    if bucket == 2:
-        return "🟡 Tier 2"
-    if bucket == 3:
-        return "🟢 Tier 3"
-    return "—"
-
-
 def _audience_master_key_fn() -> str:
     return str(st.session_state.get("_dist_audience_master_key", "") or "")
 
@@ -171,100 +141,90 @@ def _audience_mutate_master(mutate) -> None:
     st.session_state[mk] = out
 
 
-def _audience_cb_clear_all_sends() -> None:
-    st.session_state.pop("dist_audience_list_confirmed", None)
+def _audience_visible_mask(df: pd.DataFrame, pid: str) -> pd.Series:
+    """按 CRM 的 Tier / Type 多选筛选可见行；未选或全清空则该维度不做限制。"""
+    p = str(pid).strip()
+    tk = f"dist_visible_tiers_{p}"
+    yk = f"dist_visible_types_{p}"
 
+    def _allow_set(key: str) -> Optional[set]:
+        sel = st.session_state.get(key)
+        if not isinstance(sel, list) or len(sel) == 0:
+            return None
+        out = {str(x).strip() for x in sel if str(x).strip()}
+        return out or None
+
+    ta = _allow_set(tk)
+    ty = _allow_set(yk)
+
+    def _row_ok(r: pd.Series) -> bool:
+        tiv = str(r.get("Tier", "")).strip()
+        typ = str(r.get("Type", "")).strip()
+        if ta is not None and tiv not in ("", "—") and tiv not in ta:
+            return False
+        if ty is not None and typ not in ("", "—") and typ not in ty:
+            return False
+        return True
+
+    return df.apply(_row_ok, axis=1)
+
+
+def _audience_cb_select_all_visible() -> None:
+    pid = str(st.session_state.get("_dist_audience_mask_pid", "") or "")
+
+    def _m(out: pd.DataFrame) -> None:
+        m = _audience_visible_mask(out, pid)
+        out.loc[m, "_send"] = True
+
+    _audience_mutate_master(_m)
+
+
+def _audience_cb_clear_all() -> None:
     def _m(out: pd.DataFrame) -> None:
         out["_send"] = False
 
     _audience_mutate_master(_m)
 
 
-def _audience_cb_select_all_sends() -> None:
-    st.session_state.pop("dist_audience_list_confirmed", None)
+def _audience_cb_invert_visible() -> None:
+    pid = str(st.session_state.get("_dist_audience_mask_pid", "") or "")
 
     def _m(out: pd.DataFrame) -> None:
-        out["_send"] = True
+        m = _audience_visible_mask(out, pid)
+        cur = out.loc[m, "_send"].fillna(False).astype(bool)
+        out.loc[m, "_send"] = (~cur).astype(bool)
 
     _audience_mutate_master(_m)
 
 
-def _audience_cb_invert_sends() -> None:
-    st.session_state.pop("dist_audience_list_confirmed", None)
+def _audience_cb_type_by_pick() -> None:
+    tk = str(st.session_state.get("_dist_audience_type_pick_key", "") or "")
+    pick = str(st.session_state.get(tk, "") or "").strip()
+    pid = str(st.session_state.get("_dist_audience_mask_pid", "") or "")
+    if not pick or pick == "无操作":
+        return
 
     def _m(out: pd.DataFrame) -> None:
-        if "_send" not in out.columns:
-            return
-        out["_send"] = ~out["_send"].fillna(False).astype(bool)
+        m = _audience_visible_mask(out, pid)
+        pl = pick.lower()
+        for i in out.loc[m].index:
+            typ = str(out.at[i, "Type"]).strip().lower()
+            if typ == pl or pl in typ or typ in pl:
+                out.at[i, "_send"] = True
 
     _audience_mutate_master(_m)
+    if tk:
+        st.session_state[tk] = "无操作"
 
 
-def _audience_apply_pill_option(opt: str) -> None:
-    """按 pills 选项（TYPE|| / TIER|| 前缀）将匹配行设为选中。"""
-    st.session_state.pop("dist_audience_list_confirmed", None)
-    raw = str(opt or "")
-    if raw.startswith("TYPE||"):
-        val = raw.split("||", 1)[1].strip()
-
-        def _m(out: pd.DataFrame) -> None:
-            for i in out.index:
-                if str(out.at[i, "Type"] or "").strip() == val:
-                    out.at[i, "_send"] = True
-
-        _audience_mutate_master(_m)
-    elif raw.startswith("TIER||"):
-        val = raw.split("||", 1)[1].strip()
-
-        def _m(out: pd.DataFrame) -> None:
-            for i in out.index:
-                if str(out.at[i, "_tier_src"] or "").strip() == val:
-                    out.at[i, "_send"] = True
-
-        _audience_mutate_master(_m)
-
-
-def _audience_pill_format(opt: Any) -> str:
-    s = str(opt or "")
-    if s.startswith("TYPE||"):
-        return f"类型 · {s.split('||', 1)[1]}"
-    if s.startswith("TIER||"):
-        return f"档位 · {s.split('||', 1)[1]}"
-    return s
-
-
-def _audience_cb_confirm_final_recipients() -> None:
+def _audience_cb_save_distribution_list() -> None:
     mk = _audience_master_key_fn()
     df = st.session_state.get(mk)
-    pid = str(st.session_state.get("_dist_audience_mask_pid", "") or "").strip()
-    formal = bool(st.session_state.get("_dist_confirm_formal_mode", False))
-    try:
-        default_amt = float(st.session_state.get("_dist_confirm_default_amt", 0) or 0)
-    except (TypeError, ValueError):
-        default_amt = 0.0
-    locked = st.session_state.get("_dist_confirm_locked_map")
-    locked_alloc_map: Dict[str, float] = locked if isinstance(locked, dict) else {}
-    rows: List[Dict[str, Any]] = []
-    if isinstance(df, pd.DataFrame) and not df.empty:
-        for _, r in df.iterrows():
-            if not bool(r.get("_send")):
-                continue
-            cid = str(r.get("client_id", "")).strip()
-            em = str(r.get("email", "") or "").strip()
-            if "@" not in em:
-                continue
-            nm = str(r.get("name", ""))
-            alloc_v: Optional[float] = None
-            if formal:
-                if cid in locked_alloc_map:
-                    alloc_v = float(locked_alloc_map[cid])
-                else:
-                    alloc_v = float(default_amt)
-            rows.append({"client_id": cid, "email": em, "name": nm, "allocated": alloc_v})
-    st.session_state["final_recipient_list"] = rows
-    st.session_state["_dist_final_recip_pid"] = pid
-    st.session_state["dist_audience_list_confirmed"] = True
-    st.session_state["current_distribution_list"] = [x["client_id"] for x in rows if x.get("client_id")]
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        st.session_state["current_distribution_list"] = []
+        return
+    ids = [str(r.get("client_id", "")).strip() for _, r in df.iterrows() if bool(r.get("_send"))]
+    st.session_state["current_distribution_list"] = [x for x in ids if x]
 
 
 def _read_commitments_df() -> pd.DataFrame:
@@ -526,48 +486,18 @@ def _investment_portal_link(
     client_id: str,
     *,
     expires_at: Optional[int] = None,
-    reuse_preview_token: bool = False,
 ) -> str:
-    """{{oid_link}}：不透明 token 门户链接（?t=...）；expires_at 为 UTC Unix 秒。"""
-    from utils.oid_token_store import generate_secure_oid
-
+    """正式/测试邮件中的 {{oid_link}}：Investment Portal 深链；可选 expires_at（UTC Unix 秒）。"""
     b = (base or "").strip().rstrip("/") or "http://localhost:8501"
     cid = str(client_id or "").strip()
     pid = str(project_id or "").strip()
     if not cid:
         return "（未绑定 client_id，无法生成专属门户链接。）"
-    exp_f = float(int(expires_at)) if expires_at is not None else None
-    if reuse_preview_token:
-        ck = f"_dist_oidtok_preview_{pid}_{cid}_{int(exp_f) if exp_f is not None else 0}"
-        if ck in st.session_state:
-            return str(st.session_state[ck])
-    url = generate_secure_oid(pid, cid, exp_f, base_url=b)
-    if reuse_preview_token:
-        st.session_state[ck] = url
-    return url
-
-
-def _dist_first_client_id_for_oid_preview(
-    uniq: List[Tuple[str, str, str, Optional[float]]],
-    oid_m: Dict[str, str],
-    crm: pd.DataFrame,
-) -> str:
-    """预览/测试用 client_id：已选名单首位 → commitments 的 OID 映射 → CRM 中带邮箱的任一条。"""
-    if uniq:
-        c0 = str(uniq[0][2] or "").strip()
-        if c0:
-            return c0
-    if oid_m:
-        k0 = next(iter(oid_m.keys()), "")
-        if str(k0).strip():
-            return str(k0).strip()
-    if isinstance(crm, pd.DataFrame) and not crm.empty and "client_id" in crm.columns:
-        for _, rr in crm.iterrows():
-            em = str(rr.get("email", "") or "").strip()
-            cix = str(rr.get("client_id", "") or "").strip()
-            if "@" in em and cix:
-                return cix
-    return ""
+    qd: Dict[str, str] = {"project_id": pid, "client_id": cid}
+    if expires_at is not None:
+        qd["expires_at"] = str(int(expires_at))
+    q = urllib.parse.urlencode(qd)
+    return f"{b}/Investment_Portal?{q}"
 
 
 def _portal_subscribe_button_html(url: str, label: str) -> str:
@@ -670,7 +600,32 @@ def _crm_editor_df_from_session(key: str) -> Optional[pd.DataFrame]:
     return raw if isinstance(raw, pd.DataFrame) else None
 
 
-_SUBJ_PREVIEW_COL = "邮件主题预览"
+_DIST_PREVIEW_COL = "预估内容预览"
+
+
+def _merge_dist_crm_pick_session(view: pd.DataFrame, editor_key: str, *, hot: bool) -> pd.DataFrame:
+    """把上一轮 data_editor 中的勾选 / Hot 额度写回 view，便于重算「预估内容预览」。"""
+    prev = st.session_state.get(editor_key)
+    if not isinstance(prev, pd.DataFrame) or prev.empty or "client_id" not in prev.columns:
+        return view
+    out = view.copy()
+    pidx = prev.set_index(prev["client_id"].astype(str).str.strip())
+    if hot and "Allocated_Amount" in prev.columns:
+        for i, r in out.iterrows():
+            ck = str(r.get("client_id", "")).strip()
+            if ck and ck in pidx.index:
+                v = pd.to_numeric(pidx.loc[ck, "Allocated_Amount"], errors="coerce")
+                if pd.notna(v):
+                    out.at[i, "Allocated_Amount"] = float(v)
+    if "_send" in prev.columns:
+        for i, r in out.iterrows():
+            ck = str(r.get("client_id", "")).strip()
+            if ck and ck in pidx.index:
+                try:
+                    out.at[i, "_send"] = bool(pidx.loc[ck, "_send"])
+                except Exception:
+                    pass
+    return out
 
 
 def _merge_audience_send_from_master(view: pd.DataFrame, master_key: str) -> pd.DataFrame:
@@ -694,55 +649,24 @@ def _merge_audience_send_from_master(view: pd.DataFrame, master_key: str) -> pd.
     return out
 
 
-def _audience_subject_preview_snippet(
+def _dist_preview_amount_cell(
+    r: pd.Series,
     *,
-    cid: str,
-    name: str,
-    subj_tpl: str,
-    ctx_static: Dict[str, str],
-    formal_mode: bool,
+    hot_mode: bool,
     locked_alloc_map: Dict[str, float],
-    default_amt: float,
+    min_sub_amt: float,
 ) -> str:
-    cid = str(cid or "").strip()
-    fill_ctx = dict(ctx_static or {})
-    fill_ctx["name"] = str(name or "")
-    if formal_mode:
-        if cid and cid in locked_alloc_map:
-            alloc_disp = _format_allocated_currency(float(locked_alloc_map[cid]))
-        else:
-            alloc_disp = _format_allocated_currency(float(default_amt))
-    else:
-        if cid and cid in locked_alloc_map:
-            alloc_disp = _format_allocated_currency(float(locked_alloc_map[cid]))
-        else:
-            alloc_disp = _allocated_placeholder_soft_circle()
-    fill_ctx["allocated_amount"] = alloc_disp
-    subj = _apply_placeholders_keep_unknown(str(subj_tpl or ""), fill_ctx).strip()
-    if len(subj) > 100:
-        return subj[:100] + "…"
-    return subj
-
-
-def _audience_coverage_summary(sel: pd.DataFrame) -> str:
-    if not isinstance(sel, pd.DataFrame) or sel.empty:
-        return "—"
-    parts: List[str] = []
-    if "Type" in sel.columns:
-        vc = sel["Type"].astype(str).str.strip()
-        vc = vc[(vc.ne("")) & (vc.ne("—"))]
-        if not vc.empty:
-            for k, v in vc.value_counts().items():
-                parts.append(f"{k} ({int(v)})")
-    if "_tier_src" in sel.columns:
-        vt = sel["_tier_src"].astype(str).str.strip()
-        vt = vt[(vt.ne("")) & (vt.ne("—"))]
-        if not vt.empty:
-            for k, v in vt.value_counts().items():
-                parts.append(f"{k} ({int(v)})")
-    if not parts:
-        return "—"
-    return "，".join(parts[:14])
+    """收件人表「预估内容预览」：与群发时 {{allocated_amount}} 替换逻辑一致的简要金额/文案。"""
+    cid = str(r.get("client_id", "") or "").strip()
+    if hot_mode:
+        v = pd.to_numeric(r.get("Allocated_Amount"), errors="coerce")
+        if pd.notna(v) and float(v) >= 0:
+            return _format_allocated_currency(float(v))
+        fb = float(min_sub_amt) if min_sub_amt and min_sub_amt > 0 else 0.0
+        return _format_allocated_currency(fb)
+    if cid and cid in locked_alloc_map:
+        return _format_allocated_currency(float(locked_alloc_map[cid]))
+    return "（意向/软文案，无单独数字）"
 
 
 def _dist_placeholder_preview_html(text: str) -> str:
@@ -763,32 +687,17 @@ def _dist_placeholder_preview_html(text: str) -> str:
 def _dist_coo_layout_css() -> str:
     return """
 <style>
-.dist-var-hint {
-    font-size: 0.8rem;
-    color: #64748b;
-    margin: 0 0 0.55rem 0;
-    line-height: 1.4;
+.dist-toolbox-pane {
+    background: #f1f5f9;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    padding: 0.5rem 0.55rem 0.65rem;
+    margin-bottom: 0.35rem;
 }
-.dist-aud-statbar {
-    background: linear-gradient(90deg, #f0fdf4 0%, #ecfeff 100%);
-    border: 1px solid #bbf7d0;
-    border-radius: 14px;
-    padding: 0.7rem 1.1rem;
-    margin: 0.4rem 0 0.85rem;
-    font-size: 1.05rem;
-    color: #14532d;
-    line-height: 1.45;
-}
-.dist-aud-statbar strong {
-    color: #166534;
-    font-weight: 800;
-}
-.stButton > button {
-    border-radius: 20px;
-    transition: box-shadow 0.3s ease, transform 0.2s ease;
-}
-.stButton > button:hover {
-    box-shadow: 0 3px 12px rgba(15, 23, 42, 0.1);
+.dist-toolbox-pane button {
+    background-color: #e2e8f0 !important;
+    border-color: #cbd5e1 !important;
+    color: #0f172a !important;
 }
 .dist-ph-tok {
     color: #a21caf;
@@ -840,45 +749,20 @@ def _dist_coo_layout_css() -> str:
     color: #1e3a8a;
     border: 1px solid #93c5fd;
 }
-.st-key-dist_send_bulk button {
-    width: 100% !important;
-    background: linear-gradient(180deg, #2563eb 0%, #1e3a8a 100%) !important;
-    background-color: #1e3a8a !important;
-    color: #f8fafc !important;
-    border: 1px solid rgba(15, 23, 42, 0.35) !important;
-    border-radius: 14px !important;
-    font-size: 1.2rem !important;
+.dist-bulk-footer-title {
+    text-align: center;
+    font-weight: 800;
+    font-size: 1.2rem;
+    margin: 0.25rem 0 0.65rem;
+    color: #0f172a;
+}
+.dist-bulk-footer button[kind="primary"] {
     font-weight: 800 !important;
-    letter-spacing: 0.08em !important;
-    padding: 1rem 1.35rem !important;
-    box-shadow:
-        inset 0 3px 6px rgba(255, 255, 255, 0.12),
-        inset 0 -4px 10px rgba(0, 0, 0, 0.28),
-        0 6px 18px rgba(30, 58, 138, 0.45) !important;
-    transition: filter 0.2s ease, box-shadow 0.2s ease, transform 0.15s ease !important;
+    font-size: 1.05rem !important;
 }
-.st-key-dist_send_bulk button:hover:not(:disabled) {
-    filter: brightness(1.14) saturate(1.05) !important;
-    box-shadow:
-        inset 0 2px 5px rgba(255, 255, 255, 0.18),
-        inset 0 -3px 8px rgba(0, 0, 0, 0.22),
-        0 8px 22px rgba(37, 99, 235, 0.5) !important;
-}
-.st-key-dist_send_bulk button:active:not(:disabled) {
-    transform: translateY(1px) !important;
-    box-shadow:
-        inset 0 4px 12px rgba(0, 0, 0, 0.35),
-        inset 0 1px 2px rgba(255, 255, 255, 0.08),
-        0 3px 10px rgba(30, 58, 138, 0.35) !important;
-}
-.st-key-dist_send_bulk button:disabled {
-    opacity: 0.5 !important;
-    filter: grayscale(0.15) !important;
-    box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.2) !important;
-}
-/* 名单确认：已勾选行浅底（依赖 data_editor 内 checkbox 状态） */
-div[data-testid="stDataEditor"] tbody tr:has(input[type="checkbox"]:checked) {
-    background-color: #ecfdf5 !important;
+.st-key-dist_send_bulk button {
+    font-weight: 800 !important;
+    font-size: 1.08rem !important;
 }
 </style>
 """
@@ -959,112 +843,6 @@ def _append_manual_allocations(rows: List[Dict[str, Any]]) -> None:
 def _dist_mark_template_changed() -> None:
     """仅在用户操作「选择邮件模板」时触发，避免切换项目等无关重跑误从磁盘覆盖原件。"""
     st.session_state["_dist_reload_tpl_from_disk"] = True
-
-
-def _dist_tpl_project_context_ready(pids: List[str]) -> bool:
-    """Tab 2 中已选择有效项目时，Tab 1 中依赖项目行的变量视为就绪。"""
-    pid = str(st.session_state.get("dist_proj_pick", "") or "").strip()
-    if not pid:
-        return False
-    return pid in {str(p).strip() for p in pids}
-
-
-def _dist_tab1_vars_clipboard_html(ctx_ok: bool) -> str:
-    """在 iframe 内渲染变量按钮：点击直接调用浏览器剪贴板 API（可写入用户本机剪贴板）。"""
-    style = """
-<style>
-*{box-sizing:border-box;}
-body{margin:0;padding:8px;font-family:system-ui,-apple-system,sans-serif;background:#fff;}
-#distcp-msg{min-height:22px;font-size:13px;color:#15803d;margin-bottom:8px;}
-.grp{border:1px solid #e2e8f0;border-radius:10px;padding:8px 10px;margin-bottom:10px;background:#f8fafc;}
-.grp-title{font-weight:700;font-size:14px;margin:0 0 8px 0;color:#0f172a;}
-button.btnv{width:100%;text-align:center;padding:8px 10px;margin-bottom:6px;border-radius:20px;
-  border:1px solid #cbd5e1;background:#f1f5f9;color:#0f172a;cursor:pointer;font-size:13px;transition:box-shadow .2s;}
-button.btnv:hover:not(:disabled){box-shadow:0 2px 8px rgba(15,23,42,.1);}
-button.btnv:disabled{opacity:.45;cursor:not-allowed;}
-</style>
-"""
-    chunks: List[str] = [
-        "<!DOCTYPE html><html><head><meta charset=\"utf-8\">",
-        style,
-        "</head><body><div id=\"distcp-msg\"></div>",
-    ]
-    for title, rows in (
-        ("项目", _DIST_TAB1_VARS_PROJECT),
-        ("客户", _DIST_TAB1_VARS_CLIENT),
-        ("链接", _DIST_TAB1_VARS_LINK),
-    ):
-        chunks.append('<div class="grp">')
-        chunks.append(f"<div class=\"grp-title\">{html_module.escape(title)}</div>")
-        for tok, _kid, need_proj in rows:
-            dis = bool(need_proj and not ctx_ok)
-            if dis:
-                lab = html_module.escape(f"{tok}（未就绪）")
-                chunks.append(f'<button type="button" class="btnv" disabled>{lab}</button>')
-            else:
-                tok_attr = html_module.escape(tok, quote=True)
-                chunks.append(
-                    "<button type=\"button\" class=\"btnv\" "
-                    f"data-ph=\"{tok_attr}\" "
-                    "onclick=\"distCpPh(this)\">"
-                    f"{html_module.escape(tok)}</button>"
-                )
-        chunks.append("</div>")
-    script = """
-<script>
-function distCpFlash(t) {
-  var m = document.getElementById("distcp-msg");
-  if (m) m.textContent = "已复制 " + t + "，请在左侧编辑器中粘贴";
-}
-function distCpPh(btn) {
-  var t = btn.getAttribute("data-ph");
-  if (!t) return;
-  try {
-    var ta = document.createElement("textarea");
-    ta.value = t;
-    ta.setAttribute("readonly", "");
-    ta.style.position = "fixed";
-    ta.style.left = "-9999px";
-    ta.style.opacity = "0";
-    document.body.appendChild(ta);
-    ta.focus();
-    ta.select();
-    var ok = false;
-    try { ok = document.execCommand("copy"); } catch (e1) { ok = false; }
-    document.body.removeChild(ta);
-    if (ok) {
-      distCpFlash(t);
-      return;
-    }
-  } catch (e2) {}
-  if (navigator.clipboard && window.isSecureContext) {
-    navigator.clipboard.writeText(t).then(function () { distCpFlash(t); }).catch(function () { distCpFlash(t); });
-  } else {
-    distCpFlash(t);
-  }
-}
-</script>
-"""
-    chunks.append(script)
-    chunks.append("</body></html>")
-    return "".join(chunks)
-
-
-# Tab 1 变量： (占位符, widget_key, 是否需要已选项目)
-_DIST_TAB1_VARS_PROJECT: Tuple[Tuple[str, str, bool], ...] = (
-    ("{{ticker}}", "dist_cp_ticker", True),
-    ("{{company_name}}", "dist_cp_co", True),
-    ("{{price}}", "dist_cp_price", True),
-    ("{{warrant_info}}", "dist_cp_warr", True),
-    ("{{options_text}}", "dist_cp_opt", True),
-    ("{{deadline_text}}", "dist_cp_dead", True),
-)
-_DIST_TAB1_VARS_CLIENT: Tuple[Tuple[str, str, bool], ...] = (
-    ("{{allocated_amount}}", "dist_cp_alloc", False),
-)
-_DIST_TAB1_VARS_LINK: Tuple[Tuple[str, str, bool], ...] = (
-    ("{{oid_link}}", "dist_cp_oid", False),
-)
 
 
 def _new_template_id_from_display_name(name: str, existing: set) -> str:
@@ -1189,29 +967,20 @@ def render_distribution_tab_full() -> None:
         return
 
     pids = projects[pid_col].astype(str).tolist()
-    _pid_set_boot = {str(x).strip() for x in pids}
-    if pids:
-        _dp_boot = str(st.session_state.get("dist_proj_pick", "") or "").strip()
-        if not _dp_boot or _dp_boot not in _pid_set_boot:
-            st.session_state["dist_proj_pick"] = str(pids[0]).strip()
-    _tpl_boot_payload = _load_mail_templates()
-    _tpl_boot_map = dict(_tpl_boot_payload.get("templates") or {})
-    _tpl_boot_ids = sorted(_tpl_boot_map.keys())
-    if _tpl_boot_ids:
-        _tpl_boot_active = str(
-            _tpl_boot_payload.get("active_template_id") or _tpl_boot_ids[0]
-        ).strip()
-        if _tpl_boot_active not in _tpl_boot_map:
-            _tpl_boot_active = _tpl_boot_ids[0]
-        _mts_boot = str(st.session_state.get("dist_mail_tpl_select", "") or "").strip()
-        if not _mts_boot or _mts_boot not in _tpl_boot_map:
-            st.session_state["dist_mail_tpl_select"] = _tpl_boot_active
 
     st.markdown(_dist_coo_layout_css(), unsafe_allow_html=True)
 
     tab_tpl, tab_asm, tab_recip, tab_send = st.tabs(
         ["💾 1. 模板管理", "📧 2. 邮件组装", "👥 3. 名单确认", "🚀 4. 发送中心"]
     )
+
+    def _insert_workspace_token_click(tok: str) -> None:
+        """供「插入变量」按钮 on_click 使用：在下一轮脚本开头写入，避免晚于 text_area 改 session。"""
+        cur = str(st.session_state.get("dist_tpl_workspace_body", ""))
+        if st.session_state.get("dist_var_ins_pos") == "文首":
+            st.session_state["dist_tpl_workspace_body"] = tok + cur
+        else:
+            st.session_state["dist_tpl_workspace_body"] = cur + tok
 
     def _on_assembly_template_change() -> None:
         tid = str(st.session_state.get("dist_assembly_tpl_select") or "").strip()
@@ -1271,138 +1040,48 @@ def render_distribution_tab_full() -> None:
                         )
                     st.session_state["_dist_workspace_bootstrapped"] = True
                 st.text_area("正文", height=420, key="dist_tpl_workspace_body")
-                _tpl_save_col, _tpl_save_as_col, _tpl_del_col = st.columns(3)
-                with _tpl_save_col:
-                    if st.button("保存模板", key="dist_tab1_save_tpl", use_container_width=True):
-                        payload_w = _load_mail_templates()
-                        tw = dict(payload_w.get("templates") or {})
-                        tid_w = str(st.session_state.get("dist_mail_tpl_select", "") or "").strip()
-                        if tid_w in tw:
-                            subj_save = str(
-                                st.session_state.get("dist_tpl_subj_edit", "")
-                                or COO_DISTRIBUTION_DEFAULT_SUBJECT
-                            ).strip()
-                            tw[tid_w] = _template_record_for_save(
-                                str(st.session_state.get("dist_tpl_name_edit", "")),
-                                subj_save,
-                                str(st.session_state.get("dist_tpl_workspace_body", "")),
-                            )
-                            payload_w["templates"] = tw
-                            payload_w["active_template_id"] = tid_w
-                            _save_mail_templates(payload_w)
-                            _tpl_pid = str(st.session_state.get("dist_proj_pick", "") or "").strip()
-                            log_action(
-                                "distribution_template_save",
-                                f"template_id={tid_w}; mode=overwrite",
-                                project_id=_tpl_pid or None,
-                            )
-                            st.success("已保存")
-                            st.rerun()
-                with _tpl_save_as_col:
-                    if st.session_state.pop("_dist_clear_save_as_name", False):
-                        st.session_state.pop("dist_tpl_save_as_name", None)
-                    st.text_input(
-                        "新模板名称",
-                        key="dist_tpl_save_as_name",
-                        placeholder="另存为时填写显示名称",
-                        label_visibility="collapsed",
-                    )
-                    if st.button(
-                        "另存为",
-                        key="dist_tab1_save_as_tpl",
-                        type="secondary",
-                        use_container_width=True,
-                    ):
-                        display_name = str(
-                            st.session_state.get("dist_tpl_save_as_name", "") or ""
+                if st.button("保存模板", key="dist_tab1_save_tpl"):
+                    payload_w = _load_mail_templates()
+                    tw = dict(payload_w.get("templates") or {})
+                    tid_w = str(st.session_state.get("dist_mail_tpl_select", "") or "").strip()
+                    if tid_w in tw:
+                        subj_save = str(
+                            st.session_state.get("dist_tpl_subj_edit", "")
+                            or COO_DISTRIBUTION_DEFAULT_SUBJECT
                         ).strip()
-                        if not display_name:
-                            st.warning("请填写新模板名称")
-                        else:
-                            payload_w = _load_mail_templates()
-                            tw = dict(payload_w.get("templates") or {})
-                            new_id = _new_template_id_from_display_name(
-                                display_name, set(tw.keys())
-                            )
-                            if not new_id:
-                                st.error("无法生成新模板 ID，请更换名称后重试。")
-                            else:
-                                subj_save = str(
-                                    st.session_state.get("dist_tpl_subj_edit", "")
-                                    or st.session_state.get("email_subj", "")
-                                    or COO_DISTRIBUTION_DEFAULT_SUBJECT
-                                ).strip()
-                                body_save = str(
-                                    st.session_state.get("dist_tpl_workspace_body", "")
-                                )
-                                tw[new_id] = _template_record_for_save(
-                                    display_name, subj_save, body_save
-                                )
-                                payload_w["templates"] = tw
-                                payload_w["active_template_id"] = new_id
-                                _save_mail_templates(payload_w)
-                                _tpl_pid2 = str(st.session_state.get("dist_proj_pick", "") or "").strip()
-                                log_action(
-                                    "distribution_template_save_as",
-                                    f"new_template_id={new_id}; display_name={display_name}",
-                                    project_id=_tpl_pid2 or None,
-                                )
-                                st.session_state["_dist_pending_tpl_select"] = new_id
-                                st.session_state.pop("_dist_workspace_bootstrapped", None)
-                                st.session_state["dist_assembly_tpl_select"] = new_id
-                                st.session_state["_dist_clear_save_as_name"] = True
-                                st.success(f"已另存为「{display_name}」")
-                                st.rerun()
-                with _tpl_del_col:
-                    if st.button(
-                        "删除模板",
-                        key="dist_tab1_delete_tpl",
-                        type="secondary",
-                        use_container_width=True,
-                    ):
-                        payload_w = _load_mail_templates()
-                        tw = dict(payload_w.get("templates") or {})
-                        tid_w = str(st.session_state.get("dist_mail_tpl_select", "") or "").strip()
-                        if tid_w not in tw:
-                            st.error("当前模板不存在，请刷新后重试。")
-                        elif len(tw) <= 1:
-                            st.warning("至少需要保留一个邮件模板。")
-                        else:
-                            del tw[tid_w]
-                            new_ids = sorted(tw.keys())
-                            new_pick = new_ids[0]
-                            if str(payload_w.get("active_template_id", "") or "").strip() == tid_w:
-                                payload_w["active_template_id"] = new_pick
-                            payload_w["templates"] = tw
-                            _save_mail_templates(payload_w)
-                            _tpl_pid3 = str(st.session_state.get("dist_proj_pick", "") or "").strip()
-                            log_action(
-                                "template_delete",
-                                f"removed_template_id={tid_w}; fallback_active={new_pick}",
-                                project_id=_tpl_pid3 or None,
-                            )
-                            st.session_state["_dist_pending_tpl_select"] = new_pick
-                            st.session_state.pop("_dist_workspace_bootstrapped", None)
-                            st.session_state.pop("_dist_assembly_tpl_prev", None)
-                            if str(st.session_state.get("dist_assembly_tpl_select", "") or "").strip() == tid_w:
-                                st.session_state["dist_assembly_tpl_select"] = new_pick
-                            st.success("已删除该模板")
-                            st.rerun()
+                        tw[tid_w] = _template_record_for_save(
+                            str(st.session_state.get("dist_tpl_name_edit", "")),
+                            subj_save,
+                            str(st.session_state.get("dist_tpl_workspace_body", "")),
+                        )
+                        payload_w["templates"] = tw
+                        payload_w["active_template_id"] = tid_w
+                        _save_mail_templates(payload_w)
+                        st.success("已保存")
+                        st.rerun()
             with col_r:
-                st.markdown(
-                    '<p class="dist-var-hint">点击变量即可复制，在左侧编辑器内粘贴即可。</p>',
-                    unsafe_allow_html=True,
-                )
-                _tpl_tid_r = str(st.session_state.get("dist_mail_tpl_select", "") or "").strip()
-                _tpl_ok_r = _tpl_tid_r in templates
-                _proj_ok_r = _dist_tpl_project_context_ready(pids)
-                _ctx_ok_r = bool(_tpl_ok_r and _proj_ok_r)
-                with st.container(border=True):
-                    components.html(
-                        _dist_tab1_vars_clipboard_html(_ctx_ok_r),
-                        height=420,
-                        scrolling=True,
+                st.markdown("##### 点击插入变量")
+                st.markdown('<div class="dist-toolbox-pane">', unsafe_allow_html=True)
+                st.radio("插入位置", ["文末", "文首"], horizontal=True, key="dist_var_ins_pos")
+                for _tok, _bid in (
+                    ("{{ticker}}", "dist_v_ticker"),
+                    ("{{deadline_text}}", "dist_v_dead"),
+                    ("{{price}}", "dist_v_price"),
+                    ("{{warrant_info}}", "dist_v_warr"),
+                    ("{{company_name}}", "dist_v_co"),
+                    ("{{oid_link}}", "dist_v_oid"),
+                    ("{{options_text}}", "dist_v_opt"),
+                    ("{{allocated_amount}}", "dist_v_alloc"),
+                ):
+                    st.button(
+                        _tok,
+                        key=_bid,
+                        use_container_width=True,
+                        type="secondary",
+                        on_click=_insert_workspace_token_click,
+                        args=(_tok,),
                     )
+                st.markdown("</div>", unsafe_allow_html=True)
 
     row: Optional[pd.Series] = None
     pid = ""
@@ -1487,15 +1166,12 @@ def render_distribution_tab_full() -> None:
                 deadline_text = _format_deadline_text(deadline_d, today)
                 oid_m = _oid_map(str(pid), commits)
                 oid_preview = ""
-                _pv_cid = _dist_first_client_id_for_oid_preview([], oid_m, crm)
-                if _pv_cid:
-                    oid_preview = _investment_portal_link(
-                        portal_base,
-                        str(pid),
-                        _pv_cid,
-                        expires_at=_dist_portal_expires_ts(),
-                        reuse_preview_token=True,
-                    )
+                if oid_m:
+                    first_cid = next(iter(oid_m.keys()), "")
+                    if first_cid:
+                        oid_preview = _investment_portal_link(
+                            portal_base, str(pid), first_cid, expires_at=_dist_portal_expires_ts()
+                        )
                 min_sub_amt = _min_subscription_amount(row)
                 locked_alloc_map = merged_allocation_map_for_project(str(pid))
                 ctx_base = {
@@ -1538,15 +1214,19 @@ def render_distribution_tab_full() -> None:
                 _DIST_HOT_LABEL if formal_mode else _DIST_SOFT_LABEL
             )
         master_key = f"dist_crm_audience_{pid}" if pid else "dist_crm_audience_none"
-        slice_key = f"dist_aud_recip_ed_{pid}" if pid else "dist_aud_recip_ed_none"
+        slice_key = f"dist_crm_audience_slice_{pid}" if pid else "dist_crm_audience_slice_none"
         st.session_state["_dist_audience_master_key"] = master_key
 
-        if str(st.session_state.get("_dist_aud_recip_pid_prev", "")) != str(pid).strip():
-            st.session_state.pop("dist_audience_list_confirmed", None)
-            st.session_state.pop("final_recipient_list", None)
-            st.session_state.pop("_dist_final_recip_pid", None)
-            st.session_state.pop("_dist_aud_pills_prev", None)
-        st.session_state["_dist_aud_recip_pid_prev"] = str(pid).strip()
+        if formal_mode:
+            _badge_cls = "dist-mode-badge dist-mode-hot"
+            _badge_txt = "🔵 Hot Deal 分配模式"
+        else:
+            _badge_cls = "dist-mode-badge dist-mode-soft"
+            _badge_txt = "🟢 Soft Circle 模式"
+        st.markdown(
+            f'<div class="{_badge_cls}">{html_module.escape(_badge_txt)}</div>',
+            unsafe_allow_html=True,
+        )
 
         if pid and _DIST_ALLOC_CENTER_REL:
             if st.button("前往分配中心修改额度", key="dist_goto_alloc"):
@@ -1557,13 +1237,10 @@ def render_distribution_tab_full() -> None:
                     st.session_state.pop(app_mod.PENDING_ALLOC_NAV_FROM_HUB_KEY, None)
 
         recips: List[Tuple[str, str, str, Optional[float]]] = []
-        _n_sel_disp = 0
-
-        if row is None or crm.empty or "email" not in crm.columns:
-            st.markdown(
-                '<div class="dist-aud-statbar">✅ 已选中 <strong>0</strong> 位客户 | 覆盖维度：—</div>',
-                unsafe_allow_html=True,
-            )
+        if row is None:
+            st.info("请先在「邮件组装」中选择项目。")
+        elif crm.empty or "email" not in crm.columns:
+            st.warning("CRM 无可用数据。")
         else:
             crm_src = crm.copy()
             for c in ("client_id", "name", "email"):
@@ -1588,24 +1265,53 @@ def render_distribution_tab_full() -> None:
                     return ""
                 return str(sub.iloc[0].get("email", "")).strip()
 
+            type_opts: List[str] = []
+            for _, cr in crm_src.iterrows():
+                t = str(_crm_type_display(cr)).strip()
+                if t and t != "—" and t not in type_opts:
+                    type_opts.append(t)
+            type_opts = sorted(type_opts, key=lambda x: x.lower())
+
+            tier_opts: List[str] = []
+            for _, cr in crm_src.iterrows():
+                tv = str(_crm_tier_display(cr)).strip()
+                if tv and tv != "—" and tv not in tier_opts:
+                    tier_opts.append(tv)
+            tier_opts = sorted(tier_opts, key=lambda x: x.lower())
+
             st.session_state["_dist_audience_mask_pid"] = str(pid).strip()
-            default_amt = float(min_sub_amt) if min_sub_amt and min_sub_amt > 0 else 0.0
-            st.session_state["_dist_confirm_formal_mode"] = bool(formal_mode)
-            st.session_state["_dist_confirm_default_amt"] = float(default_amt)
-            st.session_state["_dist_confirm_locked_map"] = dict(locked_alloc_map)
+            _k_tvis = f"dist_visible_tiers_{pid}"
+            _k_yvis = f"dist_visible_types_{pid}"
+            if tier_opts and _k_tvis not in st.session_state:
+                st.session_state[_k_tvis] = list(tier_opts)
+            if type_opts and _k_yvis not in st.session_state:
+                st.session_state[_k_yvis] = list(type_opts)
+
+            if tier_opts or type_opts:
+                c_f1, c_f2 = st.columns(2)
+                with c_f1:
+                    if tier_opts:
+                        st.multiselect(
+                            "显示的 Tier（CRM 中出现的取值）",
+                            options=tier_opts,
+                            key=_k_tvis,
+                        )
+                with c_f2:
+                    if type_opts:
+                        st.multiselect(
+                            "显示的 Type（CRM 中出现的取值）",
+                            options=type_opts,
+                            key=_k_yvis,
+                        )
 
             view = crm_src[["client_id", "name", "email"]].copy()
             view["client_id"] = view["client_id"].astype(str).str.strip()
             view["email"] = view["email"].astype(str).str.strip()
             view = view[view["email"].str.contains("@", na=False)]
             view = view.assign(_send=False)
-            _tier_raw = view["client_id"].map(_aud_crm_tier)
-            view["_tier_src"] = _tier_raw.map(lambda x: str(x).strip() if x is not None else "")
-            view["_tier_bucket"] = _tier_raw.map(
-                lambda x: _audience_tier_bucket_from_label(str(x))
-            )
-            view["Tier"] = view["_tier_bucket"].map(_tier_display_from_bucket)
+            view["Tier"] = view["client_id"].map(_aud_crm_tier)
             view["Type"] = view["client_id"].map(_aud_crm_type)
+            default_amt = float(min_sub_amt) if min_sub_amt and min_sub_amt > 0 else 0.0
             if formal_mode:
                 view["Allocated_Amount"] = view["client_id"].map(
                     lambda c: _format_allocated_currency(float(locked_alloc_map[c]))
@@ -1618,179 +1324,116 @@ def render_distribution_tab_full() -> None:
                     if c in locked_alloc_map
                     else "—"
                 )
+            view[_DIST_PREVIEW_COL] = view.apply(
+                lambda r: _dist_preview_amount_cell(
+                    r,
+                    hot_mode=False,
+                    locked_alloc_map=locked_alloc_map,
+                    min_sub_amt=min_sub_amt,
+                ),
+                axis=1,
+            )
             view = _merge_audience_send_from_master(view, master_key)
             st.session_state[master_key] = view.copy()
-
-            q1, q2, q3 = st.columns(3)
-            with q1:
-                st.button(
-                    "全选所有",
-                    key=f"dist_q_all_{pid}",
-                    use_container_width=True,
-                    on_click=_audience_cb_select_all_sends,
-                )
-            with q2:
-                st.button(
-                    "清空选择",
-                    key=f"dist_q_clr_{pid}",
-                    use_container_width=True,
-                    on_click=_audience_cb_clear_all_sends,
-                )
-            with q3:
-                st.button(
-                    "反选",
-                    key=f"dist_q_inv_{pid}",
-                    use_container_width=True,
-                    on_click=_audience_cb_invert_sends,
-                )
-
-            type_opts = sorted(
-                {
-                    str(x).strip()
-                    for x in view["Type"]
-                    if str(x).strip() and str(x).strip() != "—"
-                }
-            )
-            tier_opts = sorted(
-                {
-                    str(x).strip()
-                    for x in view["_tier_src"]
-                    if str(x).strip() and str(x).strip() != "—"
-                }
-            )
-            dim_opts: List[str] = [f"TYPE||{t}" for t in type_opts] + [f"TIER||{t}" for t in tier_opts]
-            if dim_opts and hasattr(st, "pills"):
-                picked = st.pills(
-                    " ",
-                    options=dim_opts,
-                    selection_mode="multi",
-                    default=None,
-                    format_func=_audience_pill_format,
-                    key=f"dist_aud_pills_dim_{pid}",
-                    label_visibility="collapsed",
-                )
-                if picked is None:
-                    cur_list: List[str] = []
-                elif isinstance(picked, list):
-                    cur_list = list(picked)
-                else:
-                    cur_list = [str(picked)]
-                prev_list = list(st.session_state.get("_dist_aud_pills_prev") or [])
-                prev_set = set(prev_list)
-                for tag in cur_list:
-                    if tag not in prev_set:
-                        _audience_apply_pill_option(str(tag))
-                st.session_state["_dist_aud_pills_prev"] = list(cur_list)
-
             master_df = st.session_state[master_key]
-            _subj_tpl = str(st.session_state.get("email_subj", "") or "")
-            master_df = master_df.copy()
-
-            def _row_subj_preview(r: pd.Series) -> str:
-                return _audience_subject_preview_snippet(
-                    cid=str(r.get("client_id", "") or "").strip(),
-                    name=str(r.get("name", "") or ""),
-                    subj_tpl=_subj_tpl,
-                    ctx_static=dict(ctx_mail_static or {}),
-                    formal_mode=formal_mode,
-                    locked_alloc_map=locked_alloc_map,
-                    default_amt=default_amt,
-                )
-
-            master_df[_SUBJ_PREVIEW_COL] = master_df.apply(_row_subj_preview, axis=1)
-
-            _n_sel_disp = (
-                int(master_df["_send"].fillna(False).astype(bool).sum())
-                if "_send" in master_df.columns
-                else 0
-            )
-            _sel_sub = master_df[master_df["_send"].fillna(False).astype(bool)] if "_send" in master_df.columns else master_df.iloc[0:0]
-            _cov = _audience_coverage_summary(_sel_sub)
-            st.markdown(
-                f'<div class="dist-aud-statbar">✅ 已选中 <strong>{_n_sel_disp}</strong> 位客户 | 覆盖维度：{html_module.escape(_cov)}</div>',
-                unsafe_allow_html=True,
-            )
-
-            _disp_cols = [
-                "client_id",
+            _vis = _audience_visible_mask(master_df, str(pid).strip())
+            disp_full = master_df.loc[_vis].copy()
+            disp_cols = [
                 "_send",
                 "name",
+                "email",
                 "Tier",
                 "Type",
+                "client_id",
                 "Allocated_Amount",
-                _SUBJ_PREVIEW_COL,
-                "email",
+                _DIST_PREVIEW_COL,
             ]
-            _disp_df = master_df[[c for c in _disp_cols if c in master_df.columns]].drop_duplicates(
-                subset=["client_id"], keep="first"
-            )
-            disp = _disp_df.set_index("client_id", drop=True)
-            ed = st.data_editor(
-                disp,
-                column_config={
-                    "_send": st.column_config.CheckboxColumn("选择", default=False),
-                    "name": st.column_config.TextColumn("Name", disabled=True),
-                    "Tier": st.column_config.TextColumn("Tier", disabled=True),
-                    "Type": st.column_config.TextColumn("Type", disabled=True),
-                    "Allocated_Amount": st.column_config.TextColumn("分配额度", disabled=True),
-                    _SUBJ_PREVIEW_COL: st.column_config.TextColumn(
-                        _SUBJ_PREVIEW_COL,
-                        disabled=True,
-                        width="medium",
-                    ),
-                    "email": st.column_config.TextColumn("邮件地址", disabled=True, width="medium"),
-                },
-                disabled=[
-                    "name",
-                    "Tier",
-                    "Type",
-                    "Allocated_Amount",
-                    _SUBJ_PREVIEW_COL,
-                    "email",
-                ],
-                hide_index=True,
-                use_container_width=True,
-                key=slice_key,
-            )
-            mupd = st.session_state[master_key].copy()
-            for cid, r in ed.iterrows():
-                ck = str(cid).strip()
-                if ck:
-                    mupd.loc[mupd["client_id"].astype(str).str.strip() == ck, "_send"] = bool(
-                        r.get("_send")
-                    )
-            st.session_state[master_key] = mupd
+            disp = disp_full[[c for c in disp_cols if c in disp_full.columns]]
+            if disp.empty:
+                st.caption("当前 Tier/Type 筛选下没有可见收件人，可放宽上方多选。")
+                ed = None
+            else:
+                ed = st.data_editor(
+                    disp,
+                    column_config={
+                        "_send": st.column_config.CheckboxColumn("", default=False),
+                        "name": st.column_config.TextColumn("姓名", disabled=True),
+                        "email": st.column_config.TextColumn("邮箱", disabled=True),
+                        "Tier": st.column_config.TextColumn("Tier", disabled=True),
+                        "Type": st.column_config.TextColumn("类型", disabled=True),
+                        "client_id": st.column_config.TextColumn("Client ID", disabled=True),
+                        "Allocated_Amount": st.column_config.TextColumn("Allocated Amount", disabled=True),
+                        _DIST_PREVIEW_COL: st.column_config.TextColumn(
+                            _DIST_PREVIEW_COL,
+                            disabled=True,
+                        ),
+                    },
+                    disabled=[
+                        "name",
+                        "email",
+                        "Tier",
+                        "Type",
+                        "client_id",
+                        "Allocated_Amount",
+                        _DIST_PREVIEW_COL,
+                    ],
+                    hide_index=True,
+                    use_container_width=True,
+                    key=slice_key,
+                )
+                mupd = st.session_state[master_key].copy()
+                for _, r in ed.iterrows():
+                    cid = str(r.get("client_id", "")).strip()
+                    if cid:
+                        mupd.loc[mupd["client_id"].astype(str).str.strip() == cid, "_send"] = bool(
+                            r.get("_send")
+                        )
+                st.session_state[master_key] = mupd
 
-            st.button(
-                "确认并保存名单",
-                key=f"dist_aud_confirm_{pid}",
-                type="primary",
-                use_container_width=True,
-                on_click=_audience_cb_confirm_final_recipients,
-            )
+            _fin = st.session_state.get(master_key)
+            if isinstance(_fin, pd.DataFrame) and not _fin.empty and "_send" in _fin.columns:
+                _n_sel = int(_fin["_send"].fillna(False).astype(bool).sum())
+                _n_tot = len(_fin)
+                st.caption(f"已选中 {_n_sel} 位客户 / 总计 {_n_tot} 位")
+
+            with st.container(border=True):
+                st.caption("批量勾选（与上方名单联动；类型选项来自 CRM）")
+                _type_pick_key = f"dist_batch_type_action_{pid}"
+                st.session_state["_dist_audience_type_pick_key"] = _type_pick_key
+                st.selectbox(
+                    "按 Type 勾选（CRM）",
+                    options=["无操作"] + type_opts,
+                    key=_type_pick_key,
+                    on_change=_audience_cb_type_by_pick,
+                )
+                st.button(
+                    "全选可见",
+                    key="dist_aud_all_vis",
+                    use_container_width=True,
+                    on_click=_audience_cb_select_all_visible,
+                )
+                st.button(
+                    "取消全选",
+                    key="dist_aud_clear_all",
+                    use_container_width=True,
+                    on_click=_audience_cb_clear_all,
+                )
+                st.button(
+                    "反选可见",
+                    key="dist_aud_inv_vis",
+                    use_container_width=True,
+                    on_click=_audience_cb_invert_visible,
+                )
+                st.button(
+                    "保存当前名单",
+                    key="dist_aud_save_list",
+                    type="primary",
+                    use_container_width=True,
+                    on_click=_audience_cb_save_distribution_list,
+                )
 
             _fin2 = st.session_state.get(master_key)
-            if (
-                st.session_state.get("dist_audience_list_confirmed")
-                and str(st.session_state.get("_dist_final_recip_pid", "")).strip() == str(pid).strip()
-            ):
-                _fr = st.session_state.get("final_recipient_list")
-                if isinstance(_fr, list):
-                    for it in _fr:
-                        if not isinstance(it, dict):
-                            continue
-                        em = str(it.get("email", "") or "").strip()
-                        if "@" not in em:
-                            continue
-                        recips.append(
-                            (
-                                em,
-                                str(it.get("name", "") or ""),
-                                str(it.get("client_id", "") or "").strip(),
-                                it.get("allocated"),
-                            )
-                        )
-            elif isinstance(_fin2, pd.DataFrame):
+            if isinstance(_fin2, pd.DataFrame):
                 for _, r in _fin2.iterrows():
                     if not r.get("_send"):
                         continue
@@ -1850,7 +1493,6 @@ def render_distribution_tab_full() -> None:
                             str(pid),
                             str(demo_cid0).strip(),
                             expires_at=_dist_portal_expires_ts(),
-                            reuse_preview_token=True,
                         )
                     if send_hot:
                         demo_alloc_disp = _format_allocated_currency(
@@ -1866,30 +1508,11 @@ def render_distribution_tab_full() -> None:
                     demo_cid0 = next(iter(oid_m.keys()), "")
                     if demo_cid0:
                         demo_link = _investment_portal_link(
-                            portal_base,
-                            str(pid),
-                            demo_cid0,
-                            expires_at=_dist_portal_expires_ts(),
-                            reuse_preview_token=True,
+                            portal_base, str(pid), demo_cid0, expires_at=_dist_portal_expires_ts()
                         )
                     demo_alloc_disp = (
                         _format_allocated_currency(fallback_amt) if send_hot else soft_alloc_txt
                     )
-                _dl = str(demo_link or "").strip()
-                if pid and (
-                    not _dl
-                    or "未绑定" in _dl
-                    or "无法生成" in _dl
-                ):
-                    _fdc = _dist_first_client_id_for_oid_preview(uniq, oid_m, crm)
-                    if _fdc:
-                        demo_link = _investment_portal_link(
-                            portal_base,
-                            str(pid),
-                            _fdc,
-                            expires_at=_dist_portal_expires_ts(),
-                            reuse_preview_token=True,
-                        )
                 prev_plain = str(st.session_state.get("email_body", ""))
                 prev_plain = _apply_placeholders_keep_unknown(prev_plain, ctx_mail_static)
                 prev_plain = _personalize_distribution_body(
@@ -1907,250 +1530,233 @@ def render_distribution_tab_full() -> None:
                 st.text("—")
 
         with st.container(border=True):
-            if "dist_bulk_cc_email" not in st.session_state:
-                st.session_state["dist_bulk_cc_email"] = _DIST_BULK_CC_EMAIL
-            _cc_l, _cc_r = st.columns([1, 15])
-            with _cc_l:
-                st.checkbox(
-                    "cc_self",
-                    value=True,
-                    key="dist_bulk_cc_self",
-                    label_visibility="collapsed",
-                )
-            with _cc_r:
-                st.markdown("📧 自动抄送至您的邮箱", unsafe_allow_html=False)
-                st.text_input(
-                    "copy_to",
-                    key="dist_bulk_cc_email",
-                    label_visibility="collapsed",
-                )
+            st.subheader("Pre-flight Checklist")
+            st.checkbox("变量占位符已全部检查", key="dist_safe_chk_vars")
+            st.checkbox("附件链接（Google Drive）已正确插入", key="dist_safe_chk_attach")
+            st.checkbox("已成功发送并查看测试邮件", key="dist_safe_chk_test")
+        _safe_all = (
+            bool(st.session_state.get("dist_safe_chk_vars", False))
+            and bool(st.session_state.get("dist_safe_chk_attach", False))
+            and bool(st.session_state.get("dist_safe_chk_test", False))
+        )
 
         with st.container(border=True):
-            st.markdown("**单封测试**")
-            test_inbox = st.text_input("测试收件邮箱", value="", key="dist_test_inbox")
-            _do_test = st.button("发送单封测试", type="secondary", key="dist_send_test")
-            if _do_test:
-                if not cfg or not cfg.get("host"):
-                    st.error("未配置发信")
-                elif not str(test_inbox).strip() or "@" not in str(test_inbox):
-                    st.error("测试邮箱无效")
-                elif row is None:
-                    st.error("未选择有效项目")
-                else:
-                    body_live = str(st.session_state.get("email_body", ""))
-                    subj_live = str(st.session_state.get("email_subj", "")).strip()
-                    if not subj_live:
-                        st.error("主题不能为空")
+            _, _ctr, _ = st.columns([1, 2, 1])
+            with _ctr:
+                st.markdown(
+                    '<div class="dist-bulk-footer-title">执行正式群发</div>',
+                    unsafe_allow_html=True,
+                )
+                bulk_ok = st.checkbox("我确认执行正式群发", key="dist_bulk_send_confirm")
+                _checklist_ok = bool(_safe_all and (_syntax_err is None))
+                _bulk_ready = bool(
+                    _checklist_ok
+                    and bulk_ok
+                    and row is not None
+                    and len(uniq) > 0
+                    and bool(cfg and cfg.get("host"))
+                )
+                if st.button(
+                    "执行正式群发",
+                    type="primary" if _checklist_ok else "secondary",
+                    key="dist_send_bulk",
+                    disabled=not _bulk_ready,
+                    use_container_width=True,
+                ):
+                    if not cfg or not cfg.get("host"):
+                        st.error("未配置邮件")
+                    elif not uniq:
+                        st.error("未选择收件人")
                     else:
-                        send_hot = st.session_state.get("dist_recip_mode_ui") == _DIST_RECIP_FORMAL
-                        fallback_amt = float(min_sub_amt) if min_sub_amt > 0 else 0.0
-                        soft_alloc_txt = _allocated_placeholder_soft_circle()
-                        demo_cid = ""
-                        demo_link = oid_preview
-                        demo_alloc_disp = _format_allocated_currency(10000.0)
-                        if uniq:
-                            _e, _nm, demo_cid, fa_demo = uniq[0]
-                            if demo_cid:
-                                demo_link = _investment_portal_link(
-                                    portal_base,
-                                    str(pid),
-                                    str(demo_cid).strip(),
-                                    expires_at=_dist_portal_expires_ts(),
-                                )
-                            if send_hot:
-                                demo_alloc_disp = _format_allocated_currency(
-                                    float(fa_demo) if fa_demo is not None else fallback_amt
-                                )
+                        body_live = str(st.session_state.get("email_body", ""))
+                        subj_live = str(st.session_state.get("email_subj", "")).strip()
+                        if not subj_live:
+                            st.error("主题不能为空")
+                        else:
+                            bad = [
+                                x
+                                for x in _unresolved_vars(body_live)
+                                if x not in ("oid_link", "warrant_info", "allocated_amount")
+                            ]
+                            if bad:
+                                st.error("正文仍含未替换变量：" + ", ".join(bad))
                             else:
-                                ck = str(demo_cid).strip()
-                                if ck and ck in locked_alloc_map:
-                                    demo_alloc_disp = _format_allocated_currency(float(locked_alloc_map[ck]))
-                                else:
-                                    demo_alloc_disp = soft_alloc_txt
-                        elif oid_m:
-                            demo_cid = next(iter(oid_m.keys()), "")
-                            if demo_cid:
-                                demo_link = _investment_portal_link(
-                                    portal_base, str(pid), demo_cid, expires_at=_dist_portal_expires_ts()
-                                )
-                            demo_alloc_disp = (
-                                _format_allocated_currency(fallback_amt) if send_hot else soft_alloc_txt
-                            )
-                        _tdl = str(demo_link or "").strip()
-                        if pid and (
-                            not _tdl
-                            or "未绑定" in _tdl
-                            or "无法生成" in _tdl
-                        ):
-                            _tfc = _dist_first_client_id_for_oid_preview(uniq, oid_m, crm)
-                            if _tfc:
-                                demo_link = _investment_portal_link(
-                                    portal_base,
-                                    str(pid),
-                                    _tfc,
-                                    expires_at=_dist_portal_expires_ts(),
-                                )
-                        subj_demo = _apply_placeholders_keep_unknown(subj_live, ctx_mail_static)
-                        body_demo = _apply_placeholders_keep_unknown(body_live, ctx_mail_static)
-                        subj_demo, body_demo = _seal_recipient_tokens(
-                            subj_demo,
-                            body_demo,
-                            oid_link=demo_link,
-                            allocated_display=demo_alloc_disp,
-                            warrant_body=warrant_txt,
-                        )
-                        body_demo = _dist_append_cloud_links_to_body(body_demo, str(pid), cloud_items_all)
-                        html_body = _distribution_body_to_html_email(body_demo)
-                        try:
-                            send_email(
-                                cfg,
-                                cfg["from_email"],
-                                str(test_inbox).strip(),
-                                subj_demo,
-                                html_body,
-                                text_plain=body_demo,
-                                attachments=None,
-                            )
-                            st.success("测试邮件已发送")
-                        except Exception as exc:
-                            st.error(f"发信失败：{exc}")
+                                from_addr = cfg["from_email"]
+                                ok, errs = 0, []
+                                warrant_body = warrant_txt
+                                log_rows: List[Dict[str, Any]] = []
+                                send_hot = st.session_state.get("dist_recip_mode_ui") == _DIST_RECIP_FORMAL
+                                fallback_amt = float(min_sub_amt) if min_sub_amt > 0 else 0.0
+                                soft_alloc_txt = _allocated_placeholder_soft_circle()
+                                prog = st.progress(0)
+                                total = len(uniq)
+                                status_slot = st.empty()
+                                for i, (email, _n, cid, row_alloc) in enumerate(uniq):
+                                    status_slot.write(f"{i + 1} / {total}")
+                                    prog.progress(min(1.0, (i + 1) / max(total, 1)))
+                                    try:
+                                        exp_ts = _dist_portal_expires_ts()
+                                        portal_link = (
+                                            _investment_portal_link(
+                                                portal_base, str(pid), str(cid).strip(), expires_at=exp_ts
+                                            )
+                                            if cid
+                                            else ""
+                                        )
+                                        if send_hot:
+                                            amt_f = float(row_alloc) if row_alloc is not None else fallback_amt
+                                            alloc_disp = _format_allocated_currency(amt_f)
+                                        else:
+                                            ck = str(cid).strip()
+                                            if ck and ck in locked_alloc_map:
+                                                alloc_disp = _format_allocated_currency(float(locked_alloc_map[ck]))
+                                            else:
+                                                alloc_disp = soft_alloc_txt
+                                        subj_ctx = _apply_placeholders_keep_unknown(subj_live, ctx_mail_static)
+                                        body_ctx = _apply_placeholders_keep_unknown(body_live, ctx_mail_static)
+                                        subj_one, body_one = _seal_recipient_tokens(
+                                            subj_ctx,
+                                            body_ctx,
+                                            oid_link=portal_link,
+                                            allocated_display=alloc_disp,
+                                            warrant_body=warrant_body,
+                                        )
+                                        body_one = _dist_append_cloud_links_to_body(
+                                            body_one, str(pid), cloud_items_all
+                                        )
+                                        html_one = _distribution_body_to_html_email(body_one)
+                                        send_email(
+                                            cfg,
+                                            from_addr,
+                                            email,
+                                            subj_one,
+                                            html_one,
+                                            text_plain=body_one,
+                                            attachments=None,
+                                        )
+                                        ok += 1
+                                        if str(cid).strip():
+                                            append_mail_dispatch_record(
+                                                str(pid),
+                                                str(cid).strip(),
+                                                str(email).strip(),
+                                            )
+                                        if send_hot:
+                                            log_rows.append(
+                                                {
+                                                    "recorded_at": datetime.now(timezone.utc).isoformat(),
+                                                    "project_id": str(pid),
+                                                    "client_id": str(cid).strip(),
+                                                    "allocated_amount": float(row_alloc)
+                                                    if row_alloc is not None
+                                                    else fallback_amt,
+                                                    "allocation_source": "COO_hot_deal_mail",
+                                                    "email": str(email).strip(),
+                                                }
+                                            )
+                                    except Exception as exc:
+                                        errs.append(f"{email}: {exc}")
+                                prog.progress(1.0)
+                                status_slot.empty()
+                                if log_rows:
+                                    _append_manual_allocations(log_rows)
+                                if ok:
+                                    st.success(f"已发送 {ok}/{len(uniq)} 封")
+                                if errs:
+                                    st.error("部分失败：\n" + "\n".join(errs))
 
-        _syntax_ok = _syntax_err is None
-        _bulk_ready = bool(
-            _syntax_ok
-            and row is not None
-            and len(uniq) > 0
-            and bool(cfg and cfg.get("host"))
+    with st.expander("⚙️ 高级配置 (非技术人员勿动)", expanded=False):
+        st.caption(
+            "门户链接与测试邮件。SMTP 凭据请在 `.streamlit/secrets.toml`（或 Streamlit Cloud Secrets）中配置，勿提交仓库。"
         )
-        if st.button(
-            "执行正式群发",
-            type="primary",
-            key="dist_send_bulk",
-            disabled=not _bulk_ready,
-            use_container_width=True,
-        ):
+        st.markdown("**门户根地址（当前解析）**")
+        st.code(portal_base or "—", language=None)
+        st.markdown(
+            "解析顺序：`[investflow]` 的 `portal_base_url` / `base_url` / `public_url` → "
+            "环境变量 `PORTAL_BASE_URL` / `INVESTFLOW_BASE_URL` → 当前请求 Host → 本地默认。"
+        )
+        st.number_input(
+            "门户链接有效期（小时）",
+            min_value=1,
+            max_value=30 * 24,
+            step=1,
+            key="dist_portal_link_ttl_hours",
+        )
+        st.divider()
+        st.markdown("**单封测试**")
+        test_inbox = st.text_input("测试收件邮箱", value="", key="dist_test_inbox")
+        _do_test = st.button("发送单封测试", type="secondary", key="dist_send_test")
+        if _do_test:
             if not cfg or not cfg.get("host"):
-                st.error("未配置发信")
-            elif not uniq:
-                st.error("未选择收件人")
+                st.error("未配置邮件")
+            elif not str(test_inbox).strip() or "@" not in str(test_inbox):
+                st.error("测试邮箱无效")
+            elif row is None:
+                st.error("未选择有效项目")
             else:
                 body_live = str(st.session_state.get("email_body", ""))
                 subj_live = str(st.session_state.get("email_subj", "")).strip()
                 if not subj_live:
                     st.error("主题不能为空")
                 else:
-                    bad = [
-                        x
-                        for x in _unresolved_vars(body_live)
-                        if x not in ("oid_link", "warrant_info", "allocated_amount")
-                    ]
-                    if bad:
-                        st.error("正文仍含未替换变量：" + ", ".join(bad))
-                    else:
-                        from_addr = cfg["from_email"]
-                        ok, errs = 0, []
-                        warrant_body = warrant_txt
-                        log_rows: List[Dict[str, Any]] = []
-                        send_hot = st.session_state.get("dist_recip_mode_ui") == _DIST_RECIP_FORMAL
-                        fallback_amt = float(min_sub_amt) if min_sub_amt > 0 else 0.0
-                        soft_alloc_txt = _allocated_placeholder_soft_circle()
-                        total = len(uniq)
-                        _cc_raw = str(st.session_state.get("dist_bulk_cc_email", "") or "").strip()
-                        _cc_list: Optional[List[str]] = (
-                            [_cc_raw]
-                            if bool(st.session_state.get("dist_bulk_cc_self", True))
-                            and _cc_raw
-                            and "@" in _cc_raw
-                            else None
-                        )
-                        with st.status("正在群发…", expanded=True) as bulk_stat:
-                            bulk_stat.write("准备中…")
-                            for i, (email, _n, cid, row_alloc) in enumerate(uniq):
-                                bulk_stat.write(f"{i + 1} / {total} · {email}")
-                                try:
-                                    exp_ts = _dist_portal_expires_ts()
-                                    portal_link = (
-                                        _investment_portal_link(
-                                            portal_base, str(pid), str(cid).strip(), expires_at=exp_ts
-                                        )
-                                        if cid
-                                        else ""
-                                    )
-                                    if send_hot:
-                                        amt_f = float(row_alloc) if row_alloc is not None else fallback_amt
-                                        alloc_disp = _format_allocated_currency(amt_f)
-                                    else:
-                                        ck = str(cid).strip()
-                                        if ck and ck in locked_alloc_map:
-                                            alloc_disp = _format_allocated_currency(float(locked_alloc_map[ck]))
-                                        else:
-                                            alloc_disp = soft_alloc_txt
-                                    subj_ctx = _apply_placeholders_keep_unknown(subj_live, ctx_mail_static)
-                                    body_ctx = _apply_placeholders_keep_unknown(body_live, ctx_mail_static)
-                                    subj_one, body_one = _seal_recipient_tokens(
-                                        subj_ctx,
-                                        body_ctx,
-                                        oid_link=portal_link,
-                                        allocated_display=alloc_disp,
-                                        warrant_body=warrant_body,
-                                    )
-                                    body_one = _dist_append_cloud_links_to_body(
-                                        body_one, str(pid), cloud_items_all
-                                    )
-                                    html_one = _distribution_body_to_html_email(body_one)
-                                    send_email(
-                                        cfg,
-                                        from_addr,
-                                        email,
-                                        subj_one,
-                                        html_one,
-                                        text_plain=body_one,
-                                        attachments=None,
-                                        cc=_cc_list,
-                                    )
-                                    ok += 1
-                                    if str(cid).strip():
-                                        append_mail_dispatch_record(
-                                            str(pid),
-                                            str(cid).strip(),
-                                            str(email).strip(),
-                                        )
-                                    if send_hot:
-                                        log_rows.append(
-                                            {
-                                                "recorded_at": datetime.now(timezone.utc).isoformat(),
-                                                "project_id": str(pid),
-                                                "client_id": str(cid).strip(),
-                                                "allocated_amount": float(row_alloc)
-                                                if row_alloc is not None
-                                                else fallback_amt,
-                                                "allocation_source": "COO_hot_deal_mail",
-                                                "email": str(email).strip(),
-                                            }
-                                        )
-                                except Exception as exc:
-                                    errs.append(f"{email}: {exc}")
-                            if log_rows:
-                                _append_manual_allocations(log_rows)
-                            log_action(
-                                "distribution_bulk_send",
-                                f"sent_ok={ok}; planned_recipients={total}; failure_count={len(errs)}",
-                                project_id=str(pid).strip() if pid else None,
+                    send_hot = st.session_state.get("dist_recip_mode_ui") == _DIST_RECIP_FORMAL
+                    fallback_amt = float(min_sub_amt) if min_sub_amt > 0 else 0.0
+                    soft_alloc_txt = _allocated_placeholder_soft_circle()
+                    demo_cid = ""
+                    demo_link = oid_preview
+                    demo_alloc_disp = _format_allocated_currency(10000.0)
+                    if uniq:
+                        _e, _nm, demo_cid, fa_demo = uniq[0]
+                        if demo_cid:
+                            demo_link = _investment_portal_link(
+                                portal_base,
+                                str(pid),
+                                str(demo_cid).strip(),
+                                expires_at=_dist_portal_expires_ts(),
                             )
-                            if errs and ok == 0:
-                                bulk_stat.update(label="发送失败", state="error")
-                                st.error("\n".join(errs))
-                            elif errs:
-                                bulk_stat.update(
-                                    label=f"已完成 {ok}/{total}（部分失败）",
-                                    state="complete",
-                                )
-                                st.error("部分失败：\n" + "\n".join(errs))
+                        if send_hot:
+                            demo_alloc_disp = _format_allocated_currency(
+                                float(fa_demo) if fa_demo is not None else fallback_amt
+                            )
+                        else:
+                            ck = str(demo_cid).strip()
+                            if ck and ck in locked_alloc_map:
+                                demo_alloc_disp = _format_allocated_currency(float(locked_alloc_map[ck]))
                             else:
-                                bulk_stat.update(
-                                    label=f"已完成 {ok}/{total}",
-                                    state="complete",
-                                )
+                                demo_alloc_disp = soft_alloc_txt
+                    elif oid_m:
+                        demo_cid = next(iter(oid_m.keys()), "")
+                        if demo_cid:
+                            demo_link = _investment_portal_link(
+                                portal_base, str(pid), demo_cid, expires_at=_dist_portal_expires_ts()
+                            )
+                        demo_alloc_disp = (
+                            _format_allocated_currency(fallback_amt) if send_hot else soft_alloc_txt
+                        )
+                    subj_demo = _apply_placeholders_keep_unknown(subj_live, ctx_mail_static)
+                    body_demo = _apply_placeholders_keep_unknown(body_live, ctx_mail_static)
+                    subj_demo, body_demo = _seal_recipient_tokens(
+                        subj_demo,
+                        body_demo,
+                        oid_link=demo_link,
+                        allocated_display=demo_alloc_disp,
+                        warrant_body=warrant_txt,
+                    )
+                    body_demo = _dist_append_cloud_links_to_body(body_demo, str(pid), cloud_items_all)
+                    html_body = _distribution_body_to_html_email(body_demo)
+                    try:
+                        send_email(
+                            cfg,
+                            cfg["from_email"],
+                            str(test_inbox).strip(),
+                            subj_demo,
+                            html_body,
+                            text_plain=body_demo,
+                            attachments=None,
+                        )
+                        st.success("测试邮件已发送")
+                    except Exception as exc:
+                        st.error(f"SMTP 失败：{exc}")
 
 
 render_distribution_tab_full()

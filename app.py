@@ -1609,9 +1609,8 @@ def main():
 | 2 | **Project Hub** | 项目创建与 Control Tower |
 | 3 | **Distribution** | COO 邮件与模板分发 |
 | 4 | **Allocation Center** | 分配决策台、同步锁定、**余额对冲（GP 池）** |
-| 5 | **活动日志** | COO 关键操作审计与 CSV 导出 |
-| 6 | **Investment Portal** | 投资人门户预览 |
-| 7 | **签署统计 · Closing** | Portal 签署进度、关账入口 |
+| 5 | **Investment Portal** | 投资人门户预览 |
+| 6 | **签署统计 · Closing** | Portal 签署进度、关账入口 |
 
 数据：`projects.csv`、`commitments.csv`（路径由 `investflow_data` 解析）。
 """

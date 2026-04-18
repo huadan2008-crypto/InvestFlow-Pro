@@ -35,7 +35,6 @@ from project_control_tower import (
     _project_effective_cap,
     _save_commitments,
 )
-from utils.activity_log import log_action
 from utils.cloud_drive_links import (
     coerce_drive_editor_value_to_df,
     dataframe_to_drive_items,
@@ -1325,12 +1324,6 @@ def render_project_hub() -> None:
                                 if not prev_cd:
                                     projects_sv.at[row_idx, "Created_Date"] = soft_d.strftime("%Y-%m-%d")
                                 save_projects(projects_sv)
-                                _prev_st = _normalize_status(prev.get("Status", STATUS_OPEN))
-                                log_action(
-                                    "project_update",
-                                    f"Status: {_prev_st} -> {stat_keep}; Ticker={t_clean}; Deal_Type={deal}",
-                                    project_id=str(pick),
-                                )
                                 _hub_sync_projects_session(load_projects())
                                 st.success("已更新项目信息。")
                                 _invalidate_action_bench(pick)

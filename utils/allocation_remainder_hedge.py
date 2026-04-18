@@ -8,8 +8,6 @@ from typing import Any, Optional, Tuple
 import pandas as pd
 import streamlit as st
 
-from utils.activity_log import log_action
-
 GP_MANAGEMENT_POOL_CLIENT_ID = "GP_MANAGEMENT_POOL"
 GP_DISPLAY_NAME = "REMAINDER_A/C (GP Pool)"
 
@@ -47,9 +45,11 @@ def get_allocation_working_df(pid: str) -> Tuple[Optional[pd.DataFrame], Any, fl
         return st.session_state["df_alloc"].copy(), proj_row, cap, price, lot
     try:
         base_full, _, _, _, _ = adc._ac_build_base_full_for_project_id(str(pid))
-        return base_full.copy(), proj_row, cap, price, lot
-    except (KeyError, ValueError):
-        return None, proj_row, cap, price, lot
+        if base_full is not None and not base_full.empty:
+            return base_full.copy(), proj_row, cap, price, lot
+    except (KeyError, ValueError, AttributeError):
+        pass
+    return None, proj_row, cap, price, lot
 
 
 def apply_gp_remainder_hedge(pid: str) -> Tuple[bool, str]:
@@ -112,15 +112,11 @@ def apply_gp_remainder_hedge(pid: str) -> Tuple[bool, str]:
         )
 
     adc._save_final_allocations_including_buffer(str(pid), synced, cap, price, lot)
-    log_action(
-        "hedge_gp_remainder",
-        f"gap_cad={gap}; gp_pool_client={GP_MANAGEMENT_POOL_CLIENT_ID}",
-        project_id=str(pid),
-    )
     ov_key = f"ac_editor_override_{str(pid)}"
     st.session_state[ov_key] = synced.copy()
     st.session_state["df_alloc"] = synced.copy()
     st.session_state.pop(adc.AC_ALLOC_EDITOR_KEY, None)
+    st.session_state.pop(f"alloc_editor_{str(pid)}", None)
     return (
         True,
         f"已将余额 **${gap:,}** CAD 记入 **{GP_MANAGEMENT_POOL_CLIENT_ID}**（{GP_DISPLAY_NAME}），"

@@ -1,7 +1,2 @@
-# 统一换行，减少 Windows/macOS 协作差异
+# Normalize line endings for cross-platform (Windows / macOS / Linux)
 * text=auto
-*.py text diff=python
-*.csv text
-*.json text
-*.toml text
-*.md text

@@ -1,5 +1,6 @@
-# Streamlit — 切勿提交密钥
+# Streamlit — never commit secrets
 .streamlit/secrets.toml
+**/secrets.toml
 
 # Python
 __pycache__/
@@ -8,40 +9,28 @@ __pycache__/
 .Python
 .venv/
 venv/
-env/
-.env
-.env.*
-!.env.example
 *.egg-info/
 .eggs/
 dist/
 build/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-htmlcov/
 
-# IDE / OS
+# Local env / keys
+.env
+.env.*
+!.env.example
+Data/oid_tokens.json
+
+# IDE / tooling
+.cursor/
 .idea/
-.vscode/
 *.swp
-.DS_Store
-Thumbs.db
+*.swo
 
-# Jupyter
-.ipynb_checkpoints/
-
-# 本地运行产生的快照目录（若曾启用过应用内节点保存）
-data/distribution_nodes/
-
-# OID 不透明 token 映射（含客户与项目关联，勿提交到公开仓库）
-data/oid_tokens.json
-data/oid_tokens.json.tmp
-
-# COO 活动日志（本地追加；合规导出用应用内下载）
-data/activity_log.csv
-
-# 本地草稿 / 重复脚本副本
+# Accidental duplicates / local experiments
 *.copy.py
-*Copy*.py
+*_newversion.py
+**/*Copy*.py
+
+# OS
+Thumbs.db
+.DS_Store
