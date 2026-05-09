@@ -8,6 +8,7 @@ import html as html_module
 import json
 import os
 import re
+from functools import partial
 import urllib.parse
 from pathlib import Path
 from datetime import date, datetime, timedelta, timezone
@@ -52,7 +53,7 @@ _DIST_SOFT_LABEL = "意向收集模式 (Soft Circle)"
 _DIST_HOT_LABEL = "确认分配模式 (Hot Deal)"
 _DIST_RECIP_INTENT = "意向收集模式"
 _DIST_RECIP_FORMAL = "正式分配模式"
-DIST_BULK_CC_EMAIL = "aaron.zhong@ede.com"
+DIST_BULK_CC_EMAIL = "aaron.zhong@edeasset.com"
 
 _DIST_BULK_SEND_BTN_SCRIPT = """
 <script>
@@ -89,6 +90,28 @@ _DIST_BULK_SEND_BTN_SCRIPT = """
 
 def _p(*parts: str) -> str:
     return os.path.join(*parts)
+
+
+def _dist_emit_clipboard_html(snippet: str) -> None:
+    """在浏览器中写入剪贴板（优先 parent 窗口，兼容 iframe 限制）。"""
+    safe = json.dumps(str(snippet or ""))
+    html = (
+        "<script>"
+        f"const _distCopyTok={safe};"
+        "(function(){var w=window.parent||window;var d=w.document;try{"
+        "if(w.navigator&&w.navigator.clipboard&&w.navigator.clipboard.writeText){"
+        "w.navigator.clipboard.writeText(_distCopyTok);return;}"
+        "}catch(e){}"
+        "try{var ta=d.createElement('textarea');ta.value=_distCopyTok;"
+        "d.body.appendChild(ta);ta.select();d.execCommand('copy');d.body.removeChild(ta);}"
+        "catch(e2){}})();</script>"
+    )
+    components.html(html, height=0, width=0)
+
+
+def _dist_schedule_clipboard_copy(token: str) -> None:
+    """供变量按钮 on_click 调用：下一轮在 Tab 1 开头执行 toast + 剪贴板写入。"""
+    st.session_state["_dist_pending_clipboard"] = {"token": str(token or "").strip()}
 
 
 def _read_projects_df() -> pd.DataFrame:
@@ -1027,14 +1050,6 @@ def render_distribution_tab_full() -> None:
         ["💾 1. 模板管理", "📧 2. 邮件组装", "👥 3. 名单确认", "🚀 4. 发送中心"]
     )
 
-    def _insert_workspace_token_click(tok: str) -> None:
-        """供「插入变量」按钮 on_click 使用：在下一轮脚本开头写入，避免晚于 text_area 改 session。"""
-        cur = str(st.session_state.get("dist_tpl_workspace_body", ""))
-        if st.session_state.get("dist_var_ins_pos") == "文首":
-            st.session_state["dist_tpl_workspace_body"] = tok + cur
-        else:
-            st.session_state["dist_tpl_workspace_body"] = cur + tok
-
     def _on_assembly_template_change() -> None:
         tid = str(st.session_state.get("dist_assembly_tpl_select") or "").strip()
         if not tid:
@@ -1046,6 +1061,13 @@ def render_distribution_tab_full() -> None:
         st.session_state["email_subj"] = sj if sj else COO_DISTRIBUTION_DEFAULT_SUBJECT
 
     with tab_tpl:
+        _clip_pending = st.session_state.pop("_dist_pending_clipboard", None)
+        if isinstance(_clip_pending, dict):
+            _ctok = str(_clip_pending.get("token", "")).strip()
+            if _ctok:
+                st.toast(f"已复制 {_ctok} 到剪贴板", icon="📋")
+                _dist_emit_clipboard_html(_ctok)
+
         payload = _load_mail_templates()
         templates = dict(payload.get("templates") or {})
         tpl_ids = sorted(templates.keys())
@@ -1062,12 +1084,50 @@ def render_distribution_tab_full() -> None:
             st.session_state["dist_mail_tpl_select"] = pend_tpl
             st.session_state["_dist_reload_tpl_from_disk"] = True
 
+        # 在 columns 之前完成模板引导：避免右侧栏早于 selectbox 读到空的 dist_mail_tpl_select，
+        # 导致首次进入时 _tpl_ready 误判为 False（换模板后 session 已写入才「恢复正常」）。
+        need_tpl_disk = bool(
+            st.session_state.pop("_dist_reload_tpl_from_disk", False)
+        ) or not st.session_state.get("_dist_workspace_bootstrapped", False)
+        if need_tpl_disk:
+            payload = _load_mail_templates()
+            templates = dict(payload.get("templates") or {})
+            tpl_ids = sorted(templates.keys())
+            if not tpl_ids:
+                payload = _default_mail_templates_payload()
+                _save_mail_templates(payload)
+                templates = dict(payload["templates"])
+                tpl_ids = sorted(templates.keys())
+            default_pick = str(payload.get("active_template_id") or tpl_ids[0])
+            if default_pick not in tpl_ids:
+                default_pick = tpl_ids[0]
+            _ts = str(st.session_state.get("dist_mail_tpl_select", "") or default_pick or "").strip()
+            if not _ts or _ts not in tpl_ids:
+                _ts = default_pick
+            st.session_state["dist_mail_tpl_select"] = _ts
+            if _ts in templates:
+                t0 = templates[_ts]
+                st.session_state["dist_tpl_workspace_body"] = _template_body(t0)
+                st.session_state["dist_tpl_name_edit"] = str(t0.get("name", _ts))
+                subj0 = str(t0.get("subject", "") or "").strip()
+                st.session_state["dist_tpl_subj_edit"] = (
+                    subj0 if subj0 else COO_DISTRIBUTION_DEFAULT_SUBJECT
+                )
+            st.session_state["_dist_workspace_bootstrapped"] = True
+
+        _tid_gate = str(st.session_state.get("dist_mail_tpl_select", "") or default_pick or "").strip()
+        if not _tid_gate or _tid_gate not in tpl_ids:
+            _tid_gate = default_pick if default_pick in tpl_ids else tpl_ids[0]
+            st.session_state["dist_mail_tpl_select"] = _tid_gate
+
         with st.container(border=True):
-            col_l, col_r = st.columns([3, 1])
-            with col_l:
+            # 分两行：第一行只渲染模板下拉，第二行再渲染正文 + 变量区，保证同轮脚本里
+            # 「邮件模板」selectbox 已执行后，变量按钮再读 session（避免列内顺序/首帧 session 异常）。
+            row1_l, row1_r = st.columns([3, 1])
+            with row1_l:
                 _cur_tid = str(st.session_state.get("dist_mail_tpl_select", default_pick) or default_pick)
                 _ix = tpl_ids.index(_cur_tid) if _cur_tid in tpl_ids else tpl_ids.index(default_pick)
-                tpl_sel = st.selectbox(
+                st.selectbox(
                     "邮件模板",
                     tpl_ids,
                     index=_ix,
@@ -1075,23 +1135,11 @@ def render_distribution_tab_full() -> None:
                     key="dist_mail_tpl_select",
                     on_change=_dist_mark_template_changed,
                 )
-                need_tpl_disk = bool(
-                    st.session_state.pop("_dist_reload_tpl_from_disk", False)
-                ) or not st.session_state.get("_dist_workspace_bootstrapped", False)
-                if need_tpl_disk:
-                    payload = _load_mail_templates()
-                    templates = dict(payload.get("templates") or {})
-                    tpl_ids = sorted(templates.keys())
-                    _ts = str(st.session_state.get("dist_mail_tpl_select", "") or "").strip()
-                    if _ts in templates:
-                        t0 = templates[_ts]
-                        st.session_state["dist_tpl_workspace_body"] = _template_body(t0)
-                        st.session_state["dist_tpl_name_edit"] = str(t0.get("name", _ts))
-                        subj0 = str(t0.get("subject", "") or "").strip()
-                        st.session_state["dist_tpl_subj_edit"] = (
-                            subj0 if subj0 else COO_DISTRIBUTION_DEFAULT_SUBJECT
-                        )
-                    st.session_state["_dist_workspace_bootstrapped"] = True
+            with row1_r:
+                st.caption("点击变量即可复制，在左侧编辑器内粘贴即可。")
+
+            row2_l, row2_r = st.columns([3, 1])
+            with row2_l:
                 st.text_area("正文", height=420, key="dist_tpl_workspace_body")
                 if st.button("保存模板", key="dist_tab1_save_tpl"):
                     payload_w = _load_mail_templates()
@@ -1112,29 +1160,37 @@ def render_distribution_tab_full() -> None:
                         _save_mail_templates(payload_w)
                         st.success("已保存")
                         st.rerun()
-            with col_r:
-                st.markdown("##### 点击插入变量")
-                st.markdown('<div class="dist-toolbox-pane">', unsafe_allow_html=True)
-                st.radio("插入位置", ["文末", "文首"], horizontal=True, key="dist_var_ins_pos")
-                for _tok, _bid in (
-                    ("{{ticker}}", "dist_v_ticker"),
-                    ("{{deadline_text}}", "dist_v_dead"),
-                    ("{{price}}", "dist_v_price"),
-                    ("{{warrant_info}}", "dist_v_warr"),
-                    ("{{company_name}}", "dist_v_co"),
-                    ("{{oid_link}}", "dist_v_oid"),
-                    ("{{options_text}}", "dist_v_opt"),
-                    ("{{allocated_amount}}", "dist_v_alloc"),
-                ):
-                    st.button(
-                        _tok,
-                        key=_bid,
-                        use_container_width=True,
-                        type="secondary",
-                        on_click=_insert_workspace_token_click,
-                        args=(_tok,),
-                    )
-                st.markdown("</div>", unsafe_allow_html=True)
+            with row2_r:
+                # 占位符复制不依赖「是否已在邮件组装选项目」：未选项目时仍可粘贴 {{price}} 等，
+                # 由后续「填充变量」或发送链路解析；仅当无任何模板数据时禁用。
+                _tpl_ready = bool(tpl_ids)
+                _var_groups: List[Tuple[str, List[Tuple[str, str]]]] = [
+                    (
+                        "项目",
+                        [
+                            ("{{ticker}}", "dist_cv_ticker"),
+                            ("{{company_name}}", "dist_cv_co"),
+                            ("{{deadline_text}}", "dist_cv_dead"),
+                            ("{{price}}", "dist_cv_price"),
+                            ("{{warrant_info}}", "dist_cv_warr"),
+                            ("{{options_text}}", "dist_cv_opt"),
+                        ],
+                    ),
+                    ("客户", [("{{allocated_amount}}", "dist_cv_alloc")]),
+                    ("链接", [("{{oid_link}}", "dist_cv_oid")]),
+                ]
+                for _gtitle, _items in _var_groups:
+                    with st.container(border=True):
+                        st.markdown(f"**{_gtitle}**")
+                        for _tok, _kid in _items:
+                            st.button(
+                                _tok,
+                                key=_kid,
+                                use_container_width=True,
+                                type="secondary",
+                                disabled=not _tpl_ready,
+                                on_click=partial(_dist_schedule_clipboard_copy, _tok),
+                            )
 
     row: Optional[pd.Series] = None
     pid = ""
