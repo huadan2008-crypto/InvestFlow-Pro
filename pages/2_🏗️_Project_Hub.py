@@ -36,6 +36,7 @@ from project_control_tower import (
     _save_commitments,
 )
 from utils.oid_funnel_metrics import confirmed_amount_total_cad, subscription_funnel_counts
+from utils.oid_feedback_io import RESPONSE_INTENT, read_oid_feedback_df
 from utils.cloud_drive_links import (
     coerce_drive_editor_value_to_df,
     dataframe_to_drive_items,
@@ -280,6 +281,80 @@ def _hub_total_allocation_cap(row: pd.Series) -> float:
     if ttc > 0:
         return ttc
     return float(pd.to_numeric(row.get("Final_Cap"), errors="coerce") or 0.0)
+
+
+def _latest_intent_amounts_for_project(project_id: str) -> dict[str, float]:
+    """从 oid_feedback.csv 取每位客户最新一条意向金额（response_type 为空或 Intent）。"""
+    pid = str(project_id).strip()
+    if not pid:
+        return {}
+    df = read_oid_feedback_df()
+    if df.empty or "project_id" not in df.columns or "client_id" not in df.columns:
+        return {}
+    sub = df[df["project_id"].astype(str).str.strip() == pid].copy()
+    if sub.empty:
+        return {}
+    if "response_type" in sub.columns:
+        rt = sub["response_type"].fillna("").astype(str).str.strip().str.lower()
+        sub = sub[rt.isin(("", RESPONSE_INTENT.lower()))]
+    if sub.empty:
+        return {}
+    ts_col = "submitted_at" if "submitted_at" in sub.columns else None
+    latest: dict[str, tuple[float, str]] = {}
+    for _, r in sub.iterrows():
+        cid = str(r.get("client_id", "")).strip()
+        if not cid:
+            continue
+        amt = float(pd.to_numeric(r.get("feedback_amount"), errors="coerce") or 0.0)
+        ts = str(r.get(ts_col, "") or "") if ts_col else ""
+        prev = latest.get(cid)
+        if prev is None or ts >= prev[1]:
+            latest[cid] = (max(0.0, amt), ts)
+    return {k: v[0] for k, v in latest.items()}
+
+
+def _hub_commitments_with_live_intent(commit_sub: pd.DataFrame, project_id: str) -> pd.DataFrame:
+    """
+    将 Portal 最新意向回填到 Project Hub 视图：
+    - 对已有客户覆盖 Desired_Amount；
+    - 对仅在 Portal 出现的客户补一行，避免漏看。
+    """
+    out = commit_sub.copy()
+    intent_map = _latest_intent_amounts_for_project(project_id)
+    if not intent_map:
+        return out
+
+    if "Desired_Amount" not in out.columns:
+        out["Desired_Amount"] = 0.0
+    out["Desired_Amount"] = pd.to_numeric(out["Desired_Amount"], errors="coerce").fillna(0.0)
+
+    known_ids: set[str] = set()
+    if not out.empty and "client_id" in out.columns:
+        for i, r in out.iterrows():
+            cid = str(r.get("client_id", "")).strip()
+            if not cid:
+                continue
+            known_ids.add(cid)
+            if cid in intent_map:
+                out.at[i, "Desired_Amount"] = float(intent_map[cid])
+
+    missing_ids = [cid for cid in intent_map.keys() if cid not in known_ids]
+    if missing_ids:
+        add_rows: list[dict[str, Any]] = []
+        for cid in missing_ids:
+            add_rows.append(
+                {
+                    "Project_ID": str(project_id).strip(),
+                    "client_id": cid,
+                    "Name_Household": cid,
+                    "Tier": "",
+                    "Desired_Amount": float(intent_map[cid]),
+                    "Suggested_Amount": 0.0,
+                    "Final_Allocation": 0.0,
+                }
+            )
+        out = pd.concat([out, pd.DataFrame(add_rows)], ignore_index=True)
+    return out
 
 
 def _hub_portfolio_summary_df(projects: pd.DataFrame) -> pd.DataFrame:
@@ -562,7 +637,12 @@ def render_project_hub() -> None:
 
                         commits_all = _load_commitments()
                         sub = commits_all[commits_all["Project_ID"].astype(str) == str(selected)].copy()
-                        _wa = sub["Desired_Amount"] if not sub.empty and "Desired_Amount" in sub.columns else pd.Series(dtype=float)
+                        sub_live = _hub_commitments_with_live_intent(sub, str(selected))
+                        _wa = (
+                            sub_live["Desired_Amount"]
+                            if not sub_live.empty and "Desired_Amount" in sub_live.columns
+                            else pd.Series(dtype=float)
+                        )
                         total_desired = float(pd.to_numeric(_wa, errors="coerce").fillna(0.0).sum())
                         cap_hard = _hub_total_allocation_cap(prj)
                         _raise_pct = (100.0 * total_desired / cap_hard) if cap_hard > 0 else 0.0
@@ -619,6 +699,7 @@ def render_project_hub() -> None:
                         with dcol_l:
                             with st.container(border=True):
                                 st.markdown("##### 募集进度")
+                                st.caption(f"当前意向总额（含 Portal 实时提交）：**{_fmt_money2(total_desired)}**")
                                 st.markdown(_hub_progress_bar_html(_fr_ratio), unsafe_allow_html=True)
                                 if cap_hard > 0:
                                     st.caption(
@@ -650,7 +731,7 @@ def render_project_hub() -> None:
                                     st.session_state.pop(f"tower_open_editor_{selected}", None)
                                     st.markdown("##### 当前意向明细")
                                     st.caption(
-                                        "此处仅显示最新同步/搜集的意向数据。如需进行额度切分或余额对冲，请前往 **Allocation Center**。"
+                                        "此处展示最新意向（含 Portal 已提交 Intent 的实时回填）。如需进行额度切分或余额对冲，请前往 **Allocation Center**。"
                                     )
                                     intent_cols = [
                                         "client_id",
@@ -660,11 +741,11 @@ def render_project_hub() -> None:
                                         "Suggested_Amount",
                                         "Final_Allocation",
                                     ]
-                                    if sub.empty:
+                                    if sub_live.empty:
                                         intent_show = pd.DataFrame(columns=intent_cols)
                                     else:
-                                        take = [c for c in intent_cols if c in sub.columns]
-                                        intent_show = sub[take].copy()
+                                        take = [c for c in intent_cols if c in sub_live.columns]
+                                        intent_show = sub_live[take].copy()
                                         for c in intent_cols:
                                             if c not in intent_show.columns:
                                                 intent_show[c] = (

@@ -8,6 +8,8 @@ import json
 import os
 import threading
 import time
+import urllib.parse
+import uuid
 from typing import Any, Dict, Optional
 
 _lock = threading.Lock()
@@ -161,3 +163,33 @@ def revoke_tokens_for_project_client(project_id: str, client_id: str) -> None:
                     changed = True
         if changed:
             _save_store(store)
+
+
+def issue_opaque_portal_url(
+    base_url: str,
+    project_id: str,
+    client_id: str,
+    expires_at_unix: float,
+    *,
+    revoke_previous_for_pair: bool = True,
+) -> str:
+    """
+    为单次邮件生成唯一不透明 Token，持久化至 oid_tokens.json，返回：
+    `{base}/Investment_Portal?t=<uuid>`，URL 中不暴露 project_id / client_id。
+    """
+    pid = str(project_id or "").strip()
+    cid = str(client_id or "").strip()
+    if not pid or not cid:
+        return ""
+    token = str(uuid.uuid4())
+    commit_oid_token(
+        token,
+        pid,
+        cid,
+        float(expires_at_unix),
+        revoke_previous_for_pair=revoke_previous_for_pair,
+    )
+    b = (base_url or "").strip().rstrip("/") or "http://localhost:8501"
+    t = urllib.parse.quote(token.strip(), safe="")
+    sep = "&" if "?" in b else "?"
+    return f"{b}/Investment_Portal{sep}t={t}"

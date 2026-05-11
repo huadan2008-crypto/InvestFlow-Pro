@@ -65,7 +65,8 @@ if tok_param is not None and str(tok_param).strip() != "":
     _res = peek_oid_token(_token_raw)
     if not _res:
         st.title("Investment Portal")
-        st.error("链接已失效")
+        st.error("链接已失效或已过期")
+        st.caption("若您是从邮件进入，请返回邮箱查看是否有更新的认购邀请，或联系客户经理重新发送专属链接。")
         st.stop()
     project_id = _res.get("project_id") or ""
     client_id = _res.get("client_id") or ""
@@ -153,7 +154,7 @@ st.markdown(
 )
 
 st.title(snap["ticker"])
-st.caption(f"项目编号 `{pid_canon}` · {snap['company_name']} · 客户 `{cid_url}`")
+st.caption(f"{snap['company_name']} · 项目编号 `{pid_canon}`")
 
 hp_raw = snap["hold_period"]
 hp_num = pd.to_numeric(str(hp_raw).strip(), errors="coerce")
@@ -252,6 +253,8 @@ def _confirmation_letter_html(*, amount: float, is_intent: bool) -> str:
 
 
 can_submit = (not past_deadline) and (not link_expired)
+# Closing 留痕：认购截止后仍应允许（只要专属链接未过期），与认购确认/意向的 can_submit 解耦
+can_closing_materials = not link_expired
 oid_for_log = resolve_oid_for_project_client(pid_canon, cid_url) or resolve_oid_for_project_client(
     pid_url, cid_url
 )
@@ -373,58 +376,70 @@ else:
 
 st.divider()
 st.subheader("Closing 材料（电子留痕）")
+if past_deadline and can_closing_materials:
+    st.info(
+        "认购截止日已过，您仍可在此完成「文件查阅确认」并「提交付款凭证」，供管理人 Closing 留痕与核对。"
+    )
 _fb_live = get_client_allocation_feedback_row(pid_canon, cid_url)
 _doc_fb = str(_fb_live.get("document_signed", "") or "").strip()
-if not _doc_fb and can_submit:
-    _doc_ack = st.checkbox(
-        "本人确认已查阅认购协议及披露文件摘要（与正式文件核对以纸质/电子签为准）",
-        key="portal_doc_read_ack",
-    )
-    if st.button("确认已阅文件", disabled=not _doc_ack, key="portal_doc_sign_btn"):
-        update_allocation_feedback_fields(pid_canon, cid_url, set_document_signed=True)
-        log_action(
-            "oid_document_sign",
-            "Investor acknowledged subscription documents (summary)",
-            project_id=pid_canon,
-            client_id=cid_url,
-            actor="investor",
-            highlight=True,
+if not _doc_fb:
+    if not can_closing_materials:
+        st.caption("此认购链接已过期，无法在线确认文件；请联系客户经理重发链接。")
+    else:
+        _doc_ack = st.checkbox(
+            "本人确认已查阅认购协议及披露文件摘要（与正式文件核对以纸质/电子签为准）",
+            key="portal_doc_read_ack",
         )
-        st.success("已记录文件查阅确认。")
-        st.rerun()
+        if st.button("确认已阅文件", disabled=not _doc_ack, key="portal_doc_sign_btn"):
+            update_allocation_feedback_fields(pid_canon, cid_url, set_document_signed=True)
+            log_action(
+                "oid_document_sign",
+                "Investor acknowledged subscription documents (summary)",
+                project_id=pid_canon,
+                client_id=cid_url,
+                actor="investor",
+                highlight=True,
+            )
+            st.success("已记录文件查阅确认。")
+            st.rerun()
 elif _doc_fb:
     st.success("文件查阅确认已在系统中存档。")
 
 _rfb = str(_fb_live.get("receipt_uploaded", "") or "").strip()
-_up = st.file_uploader(
-    "上传付款 / 认购凭证（PDF 或图片）",
-    type=["pdf", "png", "jpg", "jpeg", "webp"],
-    key="portal_receipt_upload",
-)
-if _up is not None and can_submit and st.button("提交收据", key="portal_receipt_submit"):
-    _rd = os.path.join(DATA_DIR, "receipts")
-    os.makedirs(_rd, exist_ok=True)
-    _ext = os.path.splitext(_up.name)[1] or ".bin"
-    _fn = f"{pid_canon}_{cid_url}_{int(datetime.now(timezone.utc).timestamp())}{_ext}"
-    _full = os.path.join(_rd, _fn)
-    with open(_full, "wb") as _f:
-        _f.write(_up.getbuffer())
-    _rel = os.path.join("receipts", _fn).replace("\\", "/")
-    update_allocation_feedback_fields(
-        pid_canon, cid_url, set_receipt_uploaded=True, receipt_path=_rel
-    )
-    log_action(
-        "oid_receipt_upload",
-        f"path={_rel}",
-        project_id=pid_canon,
-        client_id=cid_url,
-        actor="investor",
-        highlight=True,
-    )
-    with st.status("正在上传收据…", expanded=True) as _ru:
-        st.caption(f"已保存：{_rel}")
-        _ru.update(label="上传完成", state="complete")
-    st.success("收据已提交，管理人将收到待办提醒。")
-    st.rerun()
-elif _rfb:
+if _rfb:
     st.caption("付款凭证已存档；如需更新请邮件联系客户经理。")
+elif not can_closing_materials:
+    st.caption("此认购链接已过期，无法在线提交收据；请联系客户经理重发链接。")
+else:
+    _up = st.file_uploader(
+        "上传付款 / 认购凭证（PDF 或图片）",
+        type=["pdf", "png", "jpg", "jpeg", "webp"],
+        key="portal_receipt_upload",
+    )
+    if _up is not None:
+        st.caption("文件已选择，请点击下方按钮保存到系统。")
+        if st.button("提交收据", type="primary", key="portal_receipt_submit"):
+            _rd = os.path.join(DATA_DIR, "receipts")
+            os.makedirs(_rd, exist_ok=True)
+            _ext = os.path.splitext(_up.name)[1] or ".bin"
+            _fn = f"{pid_canon}_{cid_url}_{int(datetime.now(timezone.utc).timestamp())}{_ext}"
+            _full = os.path.join(_rd, _fn)
+            with open(_full, "wb") as _f:
+                _f.write(_up.getbuffer())
+            _rel = os.path.join("receipts", _fn).replace("\\", "/")
+            update_allocation_feedback_fields(
+                pid_canon, cid_url, set_receipt_uploaded=True, receipt_path=_rel
+            )
+            log_action(
+                "oid_receipt_upload",
+                f"path={_rel}",
+                project_id=pid_canon,
+                client_id=cid_url,
+                actor="investor",
+                highlight=True,
+            )
+            with st.status("正在上传收据…", expanded=True) as _ru:
+                st.caption(f"已保存：{_rel}")
+                _ru.update(label="上传完成", state="complete")
+            st.success("收据已提交，管理人将收到待办提醒。")
+            st.rerun()

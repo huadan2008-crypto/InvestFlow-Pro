@@ -25,6 +25,8 @@ from utils.cloud_drive_links import (
     parse_drive_links_cell,
 )
 from utils.mail_dispatch_log import append_mail_dispatch_record
+from utils.feedback_activity_log import log_action
+from utils.oid_token_store import issue_opaque_portal_url
 from utils.final_allocations_io import merged_allocation_map_for_project
 from utils.constants import COO_DISTRIBUTION_DEFAULT_SUBJECT, DEFAULT_MAIL_TEMPLATE
 
@@ -54,6 +56,27 @@ _DIST_HOT_LABEL = "确认分配模式 (Hot Deal)"
 _DIST_RECIP_INTENT = "意向收集模式"
 _DIST_RECIP_FORMAL = "正式分配模式"
 DIST_BULK_CC_EMAIL = "aaron.zhong@edeasset.com"
+_OID_EMAIL_BTN_PLACEHOLDER = "__INVFLOW_OID_CTA_V1__"
+
+
+def _dist_clear_preview_portal_cache() -> None:
+    """发送成功后丢弃预览区缓存的不透明链接，避免展示已撤销的旧 Token。"""
+    for k in list(st.session_state.keys()):
+        if isinstance(k, str) and k.startswith("_dist_preview_portal_url_"):
+            try:
+                del st.session_state[k]
+            except KeyError:
+                pass
+
+
+def _oid_portal_cta_button_html(url: str) -> str:
+    return (
+        '<a href="'
+        + html_module.escape(url, quote=True)
+        + '" style="display:inline-block;padding:14px 28px;background-color:#1a73e8;color:#ffffff;'
+        'text-decoration:none;border-radius:8px;font-weight:700;font-family:system-ui,Segoe UI,sans-serif;'
+        'box-shadow:0 1px 2px rgba(0,0,0,0.12);">点击此处访问您的专属认购门户</a>'
+    )
 
 _DIST_BULK_SEND_BTN_SCRIPT = """
 <script>
@@ -546,37 +569,49 @@ def _investment_portal_link(
     client_id: str,
     *,
     expires_at: Optional[int] = None,
+    reuse_session_preview_token: bool = False,
 ) -> str:
-    """正式/测试邮件中的 {{oid_link}}：Investment Portal 深链；可选 expires_at（UTC Unix 秒）。"""
+    """邮件中的 {{oid_link}}：不透明 UUID Token，写入 oid_tokens.json；URL 形式 …/Investment_Portal?t=<uuid>。"""
     b = (base or "").strip().rstrip("/") or "http://localhost:8501"
     cid = str(client_id or "").strip()
     pid = str(project_id or "").strip()
     if not cid:
         return "（未绑定 client_id，无法生成专属门户链接。）"
-    qd: Dict[str, str] = {"project_id": pid, "client_id": cid}
-    if expires_at is not None:
-        qd["expires_at"] = str(int(expires_at))
-    q = urllib.parse.urlencode(qd)
-    return f"{b}/Investment_Portal?{q}"
+    exp_ts = float(expires_at) if expires_at is not None else float(_dist_portal_expires_ts())
+    if reuse_session_preview_token:
+        ck = f"_dist_preview_portal_url_{pid}_{cid}"
+        prev_u = str(st.session_state.get(ck, "") or "").strip()
+        if prev_u.startswith("http"):
+            return prev_u
+        url = issue_opaque_portal_url(b, pid, cid, exp_ts, revoke_previous_for_pair=True)
+        if url:
+            st.session_state[ck] = url
+        return url or "（无法生成门户链接。）"
+    return issue_opaque_portal_url(b, pid, cid, exp_ts, revoke_previous_for_pair=True) or "（无法生成门户链接。）"
 
 
 def _portal_subscribe_button_html(url: str, label: str) -> str:
     return (
         '<a href="'
         + html_module.escape(url, quote=True)
-        + '" style="display:inline-block;padding:12px 24px;background-color:#004a99;color:#ffffff;'
-        'text-decoration:none;border-radius:6px;font-weight:600;">'
+        + '" style="display:inline-block;padding:12px 24px;background-color:#1a73e8;color:#ffffff;'
+        'text-decoration:none;border-radius:8px;font-weight:600;box-shadow:0 1px 2px rgba(0,0,0,0.12);">'
         + html_module.escape(label)
         + "</a>"
     )
 
 
-def _distribution_body_to_html_email(body: str) -> str:
-    """纯文本/Markdown 正文转 HTML：含 Investment_Portal 的 [文字](链接) 替换为品牌色按钮，其余转义。"""
+def _distribution_body_to_html_email(body: str, *, oid_plain_url: Optional[str] = None) -> str:
+    """纯文本/Markdown 正文转 HTML：可将正文中的专属门户 URL 替换为按钮式 CTA；Markdown 链接触发原有按钮逻辑。"""
     pattern = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
     out: List[str] = []
     pos = 0
     raw = body or ""
+    ou = (oid_plain_url or "").strip()
+    placeholder_used = False
+    if ou.startswith("http") and ou in raw:
+        raw = raw.replace(ou, _OID_EMAIL_BTN_PLACEHOLDER, 1)
+        placeholder_used = True
     for m in pattern.finditer(raw):
         out.append(html_module.escape(raw[pos : m.start()], quote=False))
         label, url = m.group(1), m.group(2).strip()
@@ -595,6 +630,8 @@ def _distribution_body_to_html_email(body: str) -> str:
         pos = m.end()
     out.append(html_module.escape(raw[pos:], quote=False))
     inner = "".join(out)
+    if placeholder_used and _OID_EMAIL_BTN_PLACEHOLDER in inner:
+        inner = inner.replace(_OID_EMAIL_BTN_PLACEHOLDER, _oid_portal_cta_button_html(ou))
     return (
         "<!DOCTYPE html><html><head><meta charset='utf-8'></head>"
         "<body style='font-family:system-ui,Segoe UI,sans-serif;font-size:15px;line-height:1.5;'>"
@@ -1279,7 +1316,11 @@ def render_distribution_tab_full() -> None:
                     first_cid = next(iter(oid_m.keys()), "")
                     if first_cid:
                         oid_preview = _investment_portal_link(
-                            portal_base, str(pid), first_cid, expires_at=_dist_portal_expires_ts()
+                            portal_base,
+                            str(pid),
+                            first_cid,
+                            expires_at=_dist_portal_expires_ts(),
+                            reuse_session_preview_token=True,
                         )
                 min_sub_amt = _min_subscription_amount(row)
                 locked_alloc_map = merged_allocation_map_for_project(str(pid))
@@ -1601,6 +1642,7 @@ def render_distribution_tab_full() -> None:
                             str(pid),
                             str(demo_cid0).strip(),
                             expires_at=_dist_portal_expires_ts(),
+                            reuse_session_preview_token=True,
                         )
                     if send_hot:
                         demo_alloc_disp = _format_allocated_currency(
@@ -1616,7 +1658,11 @@ def render_distribution_tab_full() -> None:
                     demo_cid0 = next(iter(oid_m.keys()), "")
                     if demo_cid0:
                         demo_link = _investment_portal_link(
-                            portal_base, str(pid), demo_cid0, expires_at=_dist_portal_expires_ts()
+                            portal_base,
+                            str(pid),
+                            demo_cid0,
+                            expires_at=_dist_portal_expires_ts(),
+                            reuse_session_preview_token=True,
                         )
                     demo_alloc_disp = (
                         _format_allocated_currency(fallback_amt) if send_hot else soft_alloc_txt
@@ -1630,7 +1676,8 @@ def render_distribution_tab_full() -> None:
                     allocated_display=demo_alloc_disp,
                 )
                 prev_plain = _dist_append_cloud_links_to_body(prev_plain, str(pid), cloud_items_all)
-                html_prev = _distribution_body_to_html_email(prev_plain)
+                _oid_u = demo_link if str(demo_link).strip().startswith("http") else None
+                html_prev = _distribution_body_to_html_email(prev_plain, oid_plain_url=_oid_u)
                 hi_vals: List[str] = [str(x).strip() for x in ctx_mail_static.values() if str(x).strip()]
                 for x in (demo_alloc_disp, demo_link, demo_nm_preview):
                     s = str(x).strip()
@@ -1734,7 +1781,12 @@ def render_distribution_tab_full() -> None:
                                         body_one = _dist_append_cloud_links_to_body(
                                             body_one, str(pid), cloud_items_all
                                         )
-                                        html_one = _distribution_body_to_html_email(body_one)
+                                        _plain_oid = (
+                                            portal_link if str(portal_link).strip().startswith("http") else None
+                                        )
+                                        html_one = _distribution_body_to_html_email(
+                                            body_one, oid_plain_url=_plain_oid
+                                        )
                                         send_email(
                                             cfg,
                                             from_addr,
@@ -1752,6 +1804,14 @@ def render_distribution_tab_full() -> None:
                                                 str(cid).strip(),
                                                 str(email).strip(),
                                             )
+                                        log_action(
+                                            "coo_distribution_email_sent",
+                                            f"成功向 {str(email).strip()} 发送了 {str(pid).strip()} 认购邀请",
+                                            project_id=str(pid).strip(),
+                                            client_id=str(cid).strip()[:80] if cid else "",
+                                            actor="coo",
+                                            highlight=False,
+                                        )
                                         if send_hot:
                                             log_rows.append(
                                                 {
@@ -1773,6 +1833,7 @@ def render_distribution_tab_full() -> None:
                                 _append_manual_allocations(log_rows)
                             if ok:
                                 st.toast(f"已发送 {ok}/{len(uniq)}", icon="✅")
+                                _dist_clear_preview_portal_cache()
                             if errs:
                                 st.toast("部分失败", icon="❌")
 
@@ -1856,7 +1917,8 @@ def render_distribution_tab_full() -> None:
                         warrant_body=warrant_txt,
                     )
                     body_demo = _dist_append_cloud_links_to_body(body_demo, str(pid), cloud_items_all)
-                    html_body = _distribution_body_to_html_email(body_demo)
+                    _demo_oid = demo_link if str(demo_link).strip().startswith("http") else None
+                    html_body = _distribution_body_to_html_email(body_demo, oid_plain_url=_demo_oid)
                     try:
                         send_email(
                             cfg,
@@ -1868,6 +1930,15 @@ def render_distribution_tab_full() -> None:
                             attachments=None,
                         )
                         st.success("测试邮件已发送")
+                        _dist_clear_preview_portal_cache()
+                        log_action(
+                            "coo_distribution_test_email_sent",
+                            f"测试邮件已发送至 {str(test_inbox).strip()}（项目 {str(pid).strip()}，含当前变量替换与 OID 链接）",
+                            project_id=str(pid).strip(),
+                            client_id=str(demo_cid).strip()[:80] if demo_cid else "",
+                            actor="coo",
+                            highlight=False,
+                        )
                     except Exception as exc:
                         st.error(f"SMTP 失败：{exc}")
 

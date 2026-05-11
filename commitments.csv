@@ -1,1 +1,12 @@
 Project_ID,client_id,Name_Household,Tier,Desired_Amount,Suggested_Amount,Final_Allocation,Final_Shares,Share_Price,Deal_Type,OID,Dispatch_Status,OID_Expiry_At
+CCINE-2605-01,C10001,Jin Fang / fang family,Anchor,0.0,0.0,0.0,0.0,0.2,Soft Circle,,,
+CCINE-2605-01,C10002,Rainyee Guo / fang family,Anchor,0.0,0.0,0.0,0.0,0.2,Soft Circle,,,
+CCINE-2605-01,C10003,Richard Guo / C10003,Public,0.0,0.0,0.0,0.0,0.2,Soft Circle,,,
+CCINE-2605-01,C10004,Anna Sun / C10004,Anchor,0.0,0.0,0.0,0.0,0.2,Soft Circle,,,
+CCINE-2605-01,C10005,Jianjun Dong / C10005,Anchor,0.0,0.0,0.0,0.0,0.2,Soft Circle,,,
+CCINE-2605-01,C10006,Qi Guo / fang family,Anchor,0.0,0.0,0.0,0.0,0.2,Soft Circle,,,
+CCINE-2605-01,C10007,Aaron Zhong / C10007,Anchor,0.0,0.0,0.0,0.0,0.2,Soft Circle,,,
+CCINE-2605-01,C10008,Ryan Guo / C10008,Waitlist,0.0,0.0,0.0,0.0,0.2,Soft Circle,,,
+CCINE-2605-01,C10009,Joyce Zeng / C10009,Waitlist,0.0,0.0,0.0,0.0,0.2,Soft Circle,,,
+CCINE-2605-01,C10010,Mike Test / Mike's family,Public,0.0,0.0,0.0,0.0,0.2,Soft Circle,,,
+CCINE-2605-01,__COO_MANAGEMENT__,COO (管理账户),—,0.0,0.0,0.0,0.0,0.2,Soft Circle,,,
