@@ -517,36 +517,11 @@ def _oid_url(base: str, oid: str) -> str:
 
 def _portal_base_url() -> str:
     """
-    门户根地址：优先 secrets / 环境变量；否则用当前请求的 Host（Streamlit Cloud）；
-    本地默认 http://localhost:8501。
+    门户根地址：见 ``utils.portal_base_url.resolve_portal_base_url``（secrets / 环境变量 / 请求 Host / localhost）。
     """
-    try:
-        inv = st.secrets.get("investflow", {}) or {}
-        for k in ("portal_base_url", "base_url", "public_url"):
-            u = str(inv.get(k, "") or "").strip().rstrip("/")
-            if u:
-                return u
-    except Exception:
-        pass
-    for env_k in ("PORTAL_BASE_URL", "INVESTFLOW_BASE_URL"):
-        v = os.environ.get(env_k, "").strip().rstrip("/")
-        if v:
-            return v
-    try:
-        ctx = getattr(st, "context", None)
-        headers = getattr(ctx, "headers", None) if ctx is not None else None
-        if isinstance(headers, dict):
-            host = (headers.get("Host") or headers.get("host") or "").strip()
-            proto = (
-                (headers.get("X-Forwarded-Proto") or headers.get("x-forwarded-proto") or "https")
-                .split(",")[0]
-                .strip()
-            )
-            if host:
-                return f"{proto}://{host}".rstrip("/")
-    except Exception:
-        pass
-    return "http://localhost:8501"
+    from utils.portal_base_url import resolve_portal_base_url
+
+    return resolve_portal_base_url()
 
 
 def _dist_link_ttl_hours() -> float:
@@ -572,7 +547,9 @@ def _investment_portal_link(
     reuse_session_preview_token: bool = False,
 ) -> str:
     """邮件中的 {{oid_link}}：不透明 UUID Token，写入 oid_tokens.json；URL 形式 …/Investment_Portal?t=<uuid>。"""
-    b = (base or "").strip().rstrip("/") or "http://localhost:8501"
+    from utils.portal_base_url import effective_portal_base_url
+
+    b = effective_portal_base_url(base).strip().rstrip("/")
     cid = str(client_id or "").strip()
     pid = str(project_id or "").strip()
     if not cid:
@@ -1081,6 +1058,15 @@ def render_distribution_tab_full() -> None:
 
     pids = projects[pid_col].astype(str).tolist()
 
+    if "dist_proj_pick" in st.session_state:
+        leg = str(st.session_state.get("dist_proj_pick") or "").strip()
+        if leg in pids:
+            st.session_state[app_mod.INVESTFLOW_PROJECT_SELECTOR_KEY] = leg
+        st.session_state.pop("dist_proj_pick", None)
+
+    app_mod.apply_pending_allocation_nav_from_hub()
+    app_mod.render_sidebar_current_project()
+
     st.markdown(_dist_coo_layout_css(), unsafe_allow_html=True)
 
     tab_tpl, tab_asm, tab_recip, tab_send = st.tabs(
@@ -1242,18 +1228,27 @@ def render_distribution_tab_full() -> None:
 
     with tab_asm:
         with st.container(border=True):
-            pid = str(
-                st.selectbox(
-                    "选择项目",
-                    pids,
-                    key="dist_proj_pick",
-                    format_func=app_mod.project_id_select_format_func(projects),
-                )
-            ).strip()
-            try:
-                row = _select_project_row(projects, pid)
-            except KeyError:
-                row = None
+            st.markdown("##### 当前处理项目（在 InvestFlow 首页切换）")
+            disk_df = app_mod._load_or_init_projects()
+            dcol = app_mod._project_id_column_name(disk_df)
+            disk_pids: List[str] = []
+            if not disk_df.empty and dcol:
+                disk_pids = [str(x).strip() for x in disk_df[dcol].astype(str).tolist() if str(x).strip()]
+            pid_raw = str(st.session_state.get(app_mod.INVESTFLOW_PROJECT_SELECTOR_KEY, "") or "").strip()
+            canon = app_mod._canonical_project_id_among_pids(pid_raw, disk_pids) if disk_pids else None
+            pid = canon or ""
+            row = None
+            if not pid:
+                st.warning("请先在 **InvestFlow 首页** 选择「COO 当前处理项目」。")
+                app_mod.render_nav_to_investflow_home_for_project_switch()
+            else:
+                st.caption(app_mod.project_id_select_format_func(disk_df)(pid))
+                for src in (projects, disk_df):
+                    try:
+                        row = _select_project_row(src, pid)
+                        break
+                    except KeyError:
+                        continue
 
             payload_a = _load_mail_templates()
             templates_a = dict(payload_a.get("templates") or {})
@@ -1388,7 +1383,7 @@ def render_distribution_tab_full() -> None:
 
         recips: List[Tuple[str, str, str, Optional[float]]] = []
         if row is None:
-            st.info("请先在「邮件组装」中选择项目。")
+            st.info("请先在 **InvestFlow 首页** 选择「COO 当前处理项目」，再回到本页「邮件组装」。")
         elif crm.empty or "email" not in crm.columns:
             st.warning("CRM 无可用数据。")
         else:

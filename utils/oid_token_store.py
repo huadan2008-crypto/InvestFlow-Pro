@@ -189,7 +189,9 @@ def issue_opaque_portal_url(
         float(expires_at_unix),
         revoke_previous_for_pair=revoke_previous_for_pair,
     )
-    b = (base_url or "").strip().rstrip("/") or "http://localhost:8501"
+    from utils.portal_base_url import effective_portal_base_url
+
+    b = effective_portal_base_url(base_url).strip().rstrip("/")
     t = urllib.parse.quote(token.strip(), safe="")
     sep = "&" if "?" in b else "?"
     return f"{b}/Investment_Portal{sep}t={t}"

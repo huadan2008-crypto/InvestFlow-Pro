@@ -8,6 +8,8 @@ from typing import Any, Optional, Tuple
 import pandas as pd
 import streamlit as st
 
+from app import INVESTFLOW_PROJECT_SELECTOR_KEY
+
 GP_MANAGEMENT_POOL_CLIENT_ID = "GP_MANAGEMENT_POOL"
 GP_DISPLAY_NAME = "REMAINDER_A/C (GP Pool)"
 
@@ -131,9 +133,9 @@ def render_remainder_hedge_panel() -> None:
         f"将 **Hard Cap − ΣSuggested**（排除尾差占位行）的正差额记入 "
         f"`{GP_MANAGEMENT_POOL_CLIENT_ID}`（{GP_DISPLAY_NAME}）。"
     )
-    pid = st.session_state.get("ac_alloc_proj_pick")
+    pid = st.session_state.get(INVESTFLOW_PROJECT_SELECTOR_KEY)
     if not pid:
-        st.info("请先在上方「选择项目」。")
+        st.info("请先在 **InvestFlow 首页** 选择「COO 当前处理项目」。")
         return
 
     working, _, cap, _, _ = get_allocation_working_df(str(pid))

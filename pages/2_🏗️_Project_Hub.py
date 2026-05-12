@@ -63,8 +63,10 @@ except StopIteration:
 
 
 def _hub_sync_global_project_and_goto_alloc(project_id: str) -> None:
-    """不在本页写入 investflow_project_selector（侧栏已实例化会报错）；写入 pending 后 switch_page，由 Allocation Center 入口消费。"""
+    """同步全局当前项目并写入 Hub→Allocation 深链；Allocation 入口会再次 `apply_pending` 校验列表。"""
     pid = str(project_id).strip()
+    st.session_state[app_mod.INVESTFLOW_PROJECT_SELECTOR_KEY] = pid
+    st.session_state["current_project"] = pid
     st.session_state[app_mod.PENDING_ALLOC_NAV_FROM_HUB_KEY] = pid
     st.session_state.pop(f"tower_open_editor_{pid}", None)
     if _ALLOC_CENTER_REL:
@@ -74,7 +76,7 @@ def _hub_sync_global_project_and_goto_alloc(project_id: str) -> None:
             st.session_state.pop(app_mod.PENDING_ALLOC_NAV_FROM_HUB_KEY, None)
             st.warning(
                 "无法自动打开 Allocation Center（需 Streamlit ≥ 1.30 且多页路径可用）。"
-                "请从左侧菜单进入 **🎯 Allocation Center** 并手动选择项目。"
+                "请从左侧菜单进入 **🎯 Allocation Center**（项目以 InvestFlow 首页为准）。"
             )
     else:
         st.session_state.pop(app_mod.PENDING_ALLOC_NAV_FROM_HUB_KEY, None)
@@ -383,7 +385,8 @@ def _hub_portfolio_summary_df(projects: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=cols)
 
 
-def _hub_pick_changed() -> None:
+def _hub_reg_mode_changed() -> None:
+    """新建 / 编辑模式切换时重算表单种子（不在此写入全局项目，全局仅在 InvestFlow 首页选择）。"""
     st.session_state["_hub_reseed"] = True
 
 
@@ -567,391 +570,444 @@ def render_project_hub() -> None:
             st.dataframe(_sum_df, use_container_width=True, hide_index=True)
 
     with tab_edit:
+        st.session_state.pop("hub_project_pick", None)
+
         pid_list: list[str] = []
         if not projects.empty and "Project_ID" in projects.columns:
             pid_list = projects["Project_ID"].astype(str).tolist()
 
-        opts: list[str] = [NEW_LABEL] + pid_list
-        _fmt_hub = app_mod.project_id_select_format_func(projects)
+        cur_g = str(st.session_state.get(app_mod.INVESTFLOW_PROJECT_SELECTOR_KEY, "") or "").strip()
 
-        def _hub_pick_label(x: str) -> str:
-            if x == NEW_LABEL:
-                return x
-            return _fmt_hub(str(x))
-
-        pick = st.selectbox(
-            "选择项目（新建或编辑）",
-            opts,
-            key="hub_project_pick",
-            format_func=_hub_pick_label,
-            on_change=_hub_pick_changed,
+        st.radio(
+            "项目登记与编辑（切换处理项目请回 InvestFlow 首页）",
+            ["编辑当前会话项目", NEW_LABEL],
+            horizontal=True,
+            key="hub_reg_mode",
+            on_change=_hub_reg_mode_changed,
         )
+        mode = str(st.session_state.get("hub_reg_mode", "编辑当前会话项目") or "").strip()
+        is_new = mode == NEW_LABEL
+        skip_hub_workspace = False
+        if is_new:
+            pick = NEW_LABEL
+        elif cur_g in pid_list:
+            pick = cur_g
+        else:
+            st.warning("请先在 **InvestFlow 首页** 选择「COO 当前处理项目」。")
+            app_mod.render_nav_to_investflow_home_for_project_switch()
+            st.caption(f"若要在本页创建新项目，请选择 **{NEW_LABEL}**。")
+            skip_hub_workspace = True
+            pick = ""
 
-        if st.session_state.pop("_hub_reseed", False) or st.session_state.get("_hub_seeded_for") != pick:
-            _apply_hub_seed(pick, projects)
-            st.session_state["_hub_seeded_for"] = pick
+        if not skip_hub_workspace:
+            if st.session_state.pop("_hub_reseed", False) or st.session_state.get("_hub_seeded_for") != pick:
+                _apply_hub_seed(pick, projects)
+                st.session_state["_hub_seeded_for"] = pick
 
-        is_new = pick == NEW_LABEL
+            drive_edited = coerce_drive_editor_value_to_df(
+                None, _hub_drive_initial_dataframe(pick, projects)
+            )
 
-        drive_edited = coerce_drive_editor_value_to_df(
-            None, _hub_drive_initial_dataframe(pick, projects)
-        )
+            try:
+                _hub_ws = st.container(key="HUBWS_" + str(abs(hash(str(pick))))[:12])
+            except TypeError:
+                _hub_ws = st.container()
+            with _hub_ws:
+                st.markdown(HUB_SURFACE_CSS, unsafe_allow_html=True)
+                tab_d, tab_o, tab_s = st.tabs(["🚀 执行看板", "🖇️ 云端资料", "⚙️ 项目设置"])
 
-        try:
-            _hub_ws = st.container(key="HUBWS_" + str(abs(hash(str(pick))))[:12])
-        except TypeError:
-            _hub_ws = st.container()
-        with _hub_ws:
-            st.markdown(HUB_SURFACE_CSS, unsafe_allow_html=True)
-            tab_d, tab_o, tab_s = st.tabs(["🚀 执行看板", "🖇️ 云端资料", "⚙️ 项目设置"])
-
-            with tab_d:
-                if is_new:
-                    st.info("创建项目后，「执行看板」将展示意向汇总、募集进度与分配工作台。")
-                else:
-                    selected = pick
-                    projects = load_projects()
-                    idx = projects.index[projects["Project_ID"].astype(str) == selected]
-                    if len(idx) == 0:
-                        st.warning("项目列表已变化，请重新选择。")
+                with tab_d:
+                    if is_new:
+                        st.info("创建项目后，「执行看板」将展示意向汇总、募集进度与分配工作台。")
                     else:
-                        row_idx = int(idx[0])
-                        prj = projects.iloc[row_idx].copy()
-                        deal_row = str(prj.get("Deal_Type", DEAL_SOFT)).strip() or DEAL_SOFT
-                        if deal_row not in (DEAL_SOFT, DEAL_HOT):
-                            deal_row = DEAL_SOFT
+                        selected = pick
+                        projects = load_projects()
+                        idx = projects.index[projects["Project_ID"].astype(str) == selected]
+                        if len(idx) == 0:
+                            st.warning("项目列表已变化，请重新选择。")
+                        else:
+                            row_idx = int(idx[0])
+                            prj = projects.iloc[row_idx].copy()
+                            deal_row = str(prj.get("Deal_Type", DEAL_SOFT)).strip() or DEAL_SOFT
+                            if deal_row not in (DEAL_SOFT, DEAL_HOT):
+                                deal_row = DEAL_SOFT
 
-                        st.subheader(f"{selected} · {deal_row}")
-                        status_options = [
-                            STATUS_OPEN,
-                            STATUS_PROCESSING,
-                            STATUS_ALLOCATING,
-                            STATUS_CLOSING,
-                            STATUS_CLOSED,
-                        ]
-                        cur_status = _normalize_status(prj.get("Status", STATUS_OPEN))
-                        if cur_status not in status_options:
-                            cur_status = STATUS_OPEN
-                        status = cur_status
-                        share_price = float(pd.to_numeric(prj.get("Share_Price"), errors="coerce") or 0.0) or 0.0001
+                            st.subheader(f"{selected} · {deal_row}")
+                            status_options = [
+                                STATUS_OPEN,
+                                STATUS_PROCESSING,
+                                STATUS_ALLOCATING,
+                                STATUS_CLOSING,
+                                STATUS_CLOSED,
+                            ]
+                            cur_status = _normalize_status(prj.get("Status", STATUS_OPEN))
+                            if cur_status not in status_options:
+                                cur_status = STATUS_OPEN
+                            status = cur_status
+                            share_price = float(pd.to_numeric(prj.get("Share_Price"), errors="coerce") or 0.0) or 0.0001
 
-                        commits_all = _load_commitments()
-                        sub = commits_all[commits_all["Project_ID"].astype(str) == str(selected)].copy()
-                        sub_live = _hub_commitments_with_live_intent(sub, str(selected))
-                        _wa = (
-                            sub_live["Desired_Amount"]
-                            if not sub_live.empty and "Desired_Amount" in sub_live.columns
-                            else pd.Series(dtype=float)
-                        )
-                        total_desired = float(pd.to_numeric(_wa, errors="coerce").fillna(0.0).sum())
-                        cap_hard = _hub_total_allocation_cap(prj)
-                        _raise_pct = (100.0 * total_desired / cap_hard) if cap_hard > 0 else 0.0
-                        _dleft = _hub_days_to_hard_deadline(prj)
-                        _ud = _hub_unlock_estimate_date(prj)
-                        dispatch_meta = {}
-                        if not sub.empty and "client_id" in sub.columns:
-                            _cols = [c for c in ("OID", "Dispatch_Status", "OID_Expiry_At") if c in sub.columns]
-                            if _cols:
-                                dispatch_meta = sub.set_index(sub["client_id"].astype(str))[_cols].to_dict("index")
+                            commits_all = _load_commitments()
+                            sub = commits_all[commits_all["Project_ID"].astype(str) == str(selected)].copy()
+                            sub_live = _hub_commitments_with_live_intent(sub, str(selected))
+                            _wa = (
+                                sub_live["Desired_Amount"]
+                                if not sub_live.empty and "Desired_Amount" in sub_live.columns
+                                else pd.Series(dtype=float)
+                            )
+                            total_desired = float(pd.to_numeric(_wa, errors="coerce").fillna(0.0).sum())
+                            cap_hard = _hub_total_allocation_cap(prj)
+                            _raise_pct = (100.0 * total_desired / cap_hard) if cap_hard > 0 else 0.0
+                            _dleft = _hub_days_to_hard_deadline(prj)
+                            _ud = _hub_unlock_estimate_date(prj)
+                            dispatch_meta = {}
+                            if not sub.empty and "client_id" in sub.columns:
+                                _cols = [c for c in ("OID", "Dispatch_Status", "OID_Expiry_At") if c in sub.columns]
+                                if _cols:
+                                    dispatch_meta = sub.set_index(sub["client_id"].astype(str))[_cols].to_dict("index")
 
-                        _pct_show = f"{min(999.99, _raise_pct):.1f}"
-                        _hd_txt = "—"
-                        if _dleft is not None:
-                            _hd_txt = f"已逾期 {abs(_dleft)} 天" if _dleft < 0 else f"{_dleft} 天"
-                        _kpi_pct_label = "募集完成率 (%) · 高负荷" if _raise_pct > 90 else "募集完成率 (%)"
-                        _k1, _k2, _k3, _k4 = st.columns(4)
-                        with _k1:
-                            st.markdown(
-                                _hub_kpi_box("当前意向总额", _fmt_money2(total_desired)),
-                                unsafe_allow_html=True,
-                            )
-                        with _k2:
-                            st.markdown(
-                                _hub_kpi_box(
-                                    _kpi_pct_label,
-                                    _pct_show,
-                                    label_alert=_raise_pct > 90,
-                                ),
-                                unsafe_allow_html=True,
-                            )
-                        with _k3:
-                            st.markdown(
-                                _hub_kpi_box(
-                                    "距 Hard Deadline",
-                                    _hd_txt,
-                                    value_alert=_dleft is not None and _dleft < 0,
-                                ),
-                                unsafe_allow_html=True,
-                            )
-                        with _k4:
-                            st.markdown(
-                                _hub_kpi_box(
-                                    "解锁（估算）",
-                                    _ud.strftime("%Y-%m-%d") if _ud is not None else "—",
-                                ),
-                                unsafe_allow_html=True,
-                            )
-
-                        _fr_ratio = (total_desired / cap_hard) if cap_hard > 0 else 0.0
-                        _cap_glance = _fmt_money2(cap_hard) if cap_hard > 0 else "—"
-                        tk_card = str(prj.get("Ticker") or "").strip() or "—"
-                        dcol_l, dcol_r = st.columns([2, 1])
-                        with dcol_l:
-                            with st.container(border=True):
-                                st.markdown("##### 募集进度")
-                                st.caption(f"当前意向总额（含 Portal 实时提交）：**{_fmt_money2(total_desired)}**")
-                                st.markdown(_hub_progress_bar_html(_fr_ratio), unsafe_allow_html=True)
-                                if cap_hard > 0:
-                                    st.caption(
-                                        f"Σ Desired **{_fmt_money2(total_desired)}** / Hard Cap **{_fmt_money2(cap_hard)}** · 完成率 **{_pct_show}%**"
-                                    )
-                                else:
-                                    st.caption("Hard Cap（Target_Total_Cap / Final_Cap）未设置。")
-                                fc = subscription_funnel_counts(commits_all, str(selected))
-                                st.markdown("##### 认购进度汇总（OID / Portal）")
-                                st.caption(
-                                    f"Sent: **{fc['sent']}** · Clicked: **{fc['clicked']}** · "
-                                    f"Confirmed: **{fc['confirmed']}** · Paid: **{fc['paid']}**"
+                            _pct_show = f"{min(999.99, _raise_pct):.1f}"
+                            _hd_txt = "—"
+                            if _dleft is not None:
+                                _hd_txt = f"已逾期 {abs(_dleft)} 天" if _dleft < 0 else f"{_dleft} 天"
+                            _kpi_pct_label = "募集完成率 (%) · 高负荷" if _raise_pct > 90 else "募集完成率 (%)"
+                            _k1, _k2, _k3, _k4 = st.columns(4)
+                            with _k1:
+                                st.markdown(
+                                    _hub_kpi_box("当前意向总额", _fmt_money2(total_desired)),
+                                    unsafe_allow_html=True,
                                 )
-                                conf_amt = confirmed_amount_total_cad(str(selected), commits_all)
-                                if cap_hard > 0:
-                                    pct_conf = min(1.0, max(0.0, float(conf_amt) / float(cap_hard)))
-                                    st.caption(
-                                        f"已确认认购金额（闭环） **{_fmt_money2(conf_amt)}** / Hard Cap **{_fmt_money2(cap_hard)}**"
-                                    )
-                                    st.progress(pct_conf)
-                                else:
-                                    st.caption("已确认金额（闭环）可在设置 Hard Cap 后显示占比进度条。")
-                                comp_disp = str(prj.get("Company_Name", "") or "").strip()
-                                st.caption(
-                                    f"**{str(prj.get('Project_Name', '') or '—')}** · {comp_disp or '—'} · {deal_row} · `{selected}`"
+                            with _k2:
+                                st.markdown(
+                                    _hub_kpi_box(
+                                        _kpi_pct_label,
+                                        _pct_show,
+                                        label_alert=_raise_pct > 90,
+                                    ),
+                                    unsafe_allow_html=True,
+                                )
+                            with _k3:
+                                st.markdown(
+                                    _hub_kpi_box(
+                                        "距 Hard Deadline",
+                                        _hd_txt,
+                                        value_alert=_dleft is not None and _dleft < 0,
+                                    ),
+                                    unsafe_allow_html=True,
+                                )
+                            with _k4:
+                                st.markdown(
+                                    _hub_kpi_box(
+                                        "解锁（估算）",
+                                        _ud.strftime("%Y-%m-%d") if _ud is not None else "—",
+                                    ),
+                                    unsafe_allow_html=True,
                                 )
 
-                                if status == STATUS_OPEN:
-                                    st.session_state.pop(f"tower_open_editor_{selected}", None)
-                                    st.markdown("##### 当前意向明细")
-                                    st.caption(
-                                        "此处展示最新意向（含 Portal 已提交 Intent 的实时回填）。如需进行额度切分或余额对冲，请前往 **Allocation Center**。"
-                                    )
-                                    intent_cols = [
-                                        "client_id",
-                                        "Name_Household",
-                                        "Tier",
-                                        "Desired_Amount",
-                                        "Suggested_Amount",
-                                        "Final_Allocation",
-                                    ]
-                                    if sub_live.empty:
-                                        intent_show = pd.DataFrame(columns=intent_cols)
+                            _fr_ratio = (total_desired / cap_hard) if cap_hard > 0 else 0.0
+                            _cap_glance = _fmt_money2(cap_hard) if cap_hard > 0 else "—"
+                            tk_card = str(prj.get("Ticker") or "").strip() or "—"
+                            dcol_l, dcol_r = st.columns([2, 1])
+                            with dcol_l:
+                                with st.container(border=True):
+                                    st.markdown("##### 募集进度")
+                                    st.caption(f"当前意向总额（含 Portal 实时提交）：**{_fmt_money2(total_desired)}**")
+                                    st.markdown(_hub_progress_bar_html(_fr_ratio), unsafe_allow_html=True)
+                                    if cap_hard > 0:
+                                        st.caption(
+                                            f"Σ Desired **{_fmt_money2(total_desired)}** / Hard Cap **{_fmt_money2(cap_hard)}** · 完成率 **{_pct_show}%**"
+                                        )
                                     else:
-                                        take = [c for c in intent_cols if c in sub_live.columns]
-                                        intent_show = sub_live[take].copy()
-                                        for c in intent_cols:
-                                            if c not in intent_show.columns:
-                                                intent_show[c] = (
-                                                    0.0
-                                                    if c
-                                                    in ("Desired_Amount", "Suggested_Amount", "Final_Allocation")
-                                                    else ""
+                                        st.caption("Hard Cap（Target_Total_Cap / Final_Cap）未设置。")
+                                    fc = subscription_funnel_counts(commits_all, str(selected))
+                                    st.markdown("##### 认购进度汇总（OID / Portal）")
+                                    st.caption(
+                                        f"Sent: **{fc['sent']}** · Clicked: **{fc['clicked']}** · "
+                                        f"Confirmed: **{fc['confirmed']}** · Paid: **{fc['paid']}**"
+                                    )
+                                    conf_amt = confirmed_amount_total_cad(str(selected), commits_all)
+                                    if cap_hard > 0:
+                                        pct_conf = min(1.0, max(0.0, float(conf_amt) / float(cap_hard)))
+                                        st.caption(
+                                            f"已确认认购金额（闭环） **{_fmt_money2(conf_amt)}** / Hard Cap **{_fmt_money2(cap_hard)}**"
+                                        )
+                                        st.progress(pct_conf)
+                                    else:
+                                        st.caption("已确认金额（闭环）可在设置 Hard Cap 后显示占比进度条。")
+                                    comp_disp = str(prj.get("Company_Name", "") or "").strip()
+                                    st.caption(
+                                        f"**{str(prj.get('Project_Name', '') or '—')}** · {comp_disp or '—'} · {deal_row} · `{selected}`"
+                                    )
+
+                                    if status == STATUS_OPEN:
+                                        st.session_state.pop(f"tower_open_editor_{selected}", None)
+                                        st.markdown("##### 当前意向明细")
+                                        st.caption(
+                                            "此处展示最新意向（含 Portal 已提交 Intent 的实时回填）。如需进行额度切分或余额对冲，请前往 **Allocation Center**。"
+                                        )
+                                        intent_cols = [
+                                            "client_id",
+                                            "Name_Household",
+                                            "Tier",
+                                            "Desired_Amount",
+                                            "Suggested_Amount",
+                                            "Final_Allocation",
+                                        ]
+                                        if sub_live.empty:
+                                            intent_show = pd.DataFrame(columns=intent_cols)
+                                        else:
+                                            take = [c for c in intent_cols if c in sub_live.columns]
+                                            intent_show = sub_live[take].copy()
+                                            for c in intent_cols:
+                                                if c not in intent_show.columns:
+                                                    intent_show[c] = (
+                                                        0.0
+                                                        if c
+                                                        in ("Desired_Amount", "Suggested_Amount", "Final_Allocation")
+                                                        else ""
+                                                    )
+                                        st.dataframe(
+                                            intent_show,
+                                            use_container_width=True,
+                                            hide_index=True,
+                                        )
+                                        if st.button(
+                                            "⚖️ 前往分配中心调整额度",
+                                            type="primary",
+                                            key=f"tower_goto_alloc_{selected}",
+                                        ):
+                                            _hub_sync_global_project_and_goto_alloc(str(selected))
+
+                                        st.info(
+                                            "募集中 (Open)：Project Hub 仅做全景展示；意向与分配明细以 **commitments.csv** 为准，"
+                                            "在 Allocation Center 修改并保存后会反映于此表。"
+                                        )
+                                    elif sub.empty:
+                                        st.warning(
+                                            "该项目尚无认购行。请先在「募集中」阶段录入意向，或在「⚙️ 项目设置」中从 CRM 同步。"
+                                        )
+                                    else:
+                                        cap_eff = _project_effective_cap(prj, deal_row, status)
+
+                                        n_commits_before = len(commits_all)
+                                        commits_all = _ensure_coo_row(commits_all, selected, share_price, deal_row)
+                                        if len(commits_all) > n_commits_before:
+                                            _save_commitments(commits_all)
+                                            _invalidate_action_bench(selected)
+                                        commits_all = _load_commitments()
+                                        sub = commits_all[commits_all["Project_ID"].astype(str) == str(selected)].copy()
+
+                                        negotiated = float(pd.to_numeric(prj.get("Negotiated_Final_Cap"), errors="coerce") or 0.0)
+                                        if deal_row == DEAL_SOFT:
+                                            new_neg = st.number_input(
+                                                "Negotiated_Final_Cap（模式 A：谈回总额度）",
+                                                min_value=0.0,
+                                                value=max(negotiated, 0.0),
+                                                step=10_000.0,
+                                                format="%.2f",
+                                                key=f"tower_neg_{selected}",
+                                                disabled=status == STATUS_CLOSED,
+                                            )
+                                            st.caption(f"Negotiated_Final_Cap 展示：**{_fmt_money2(new_neg)}**")
+                                            if status in (STATUS_PROCESSING, STATUS_ALLOCATING, STATUS_CLOSING):
+                                                live_cap = float(new_neg)
+                                                cap_eff = live_cap if live_cap > 0 else cap_eff
+                                                if cap_eff is not None and cap_eff <= 0:
+                                                    cap_eff = None
+                                            c_neg, c_sug = st.columns(2)
+                                            with c_neg:
+                                                if st.button(
+                                                    "💾 保存谈回额度到项目",
+                                                    type="primary",
+                                                    key=f"tower_save_neg_{selected}",
+                                                    disabled=status == STATUS_CLOSED,
+                                                ):
+                                                    projects.at[row_idx, "Negotiated_Final_Cap"] = float(new_neg)
+                                                    projects.at[row_idx, "Final_Cap"] = float(new_neg)
+                                                    save_projects(projects)
+                                                    _hub_sync_projects_session(load_projects())
+                                                    st.success("已更新 Negotiated_Final_Cap / Final_Cap。")
+                                                    st.rerun()
+                                            with c_sug:
+                                                if st.button(
+                                                    "按权重重新计算 Suggested_Amount (模式 A)",
+                                                    key=f"tower_rec_sug_{selected}",
+                                                    disabled=status == STATUS_CLOSED,
+                                                ):
+                                                    if new_neg <= 0:
+                                                        st.error("请先填写大于 0 的 Negotiated_Final_Cap。")
+                                                    else:
+                                                        work = sub[sub["client_id"].astype(str) != COO_CLIENT_ID].copy()
+                                                        sug_series = compute_soft_circle_suggested(work["Desired_Amount"], work["Tier"], new_neg)
+                                                        work["Suggested_Amount"] = sug_series.values
+                                                        work["Final_Allocation"] = work["Suggested_Amount"]
+                                                        coo = sub[sub["client_id"].astype(str) == COO_CLIENT_ID].copy()
+                                                        merged_sub = pd.concat([work, coo], ignore_index=True)
+                                                        merged_sub = _apply_final_shares(merged_sub, share_price, auto_round=False)
+                                                        rest = commits_all[commits_all["Project_ID"].astype(str) != str(selected)].copy()
+                                                        _save_commitments(pd.concat([rest, merged_sub], ignore_index=True))
+                                                        _invalidate_action_bench(selected)
+                                                        st.success("已重算建议分配并写回 commitments。")
+                                                        st.rerun()
+
+                                        if status != STATUS_OPEN and cap_eff is not None and cap_eff > 0:
+                                            st.caption(f"分配工作台生效硬顶 Cap: **{cap_eff:,.2f}**（合计须 ≤ Cap 方可 Lock & Save）")
+                                        elif deal_row == DEAL_SOFT and status in (STATUS_PROCESSING, STATUS_ALLOCATING, STATUS_CLOSING):
+                                            st.warning("请填写大于 0 的 Negotiated_Final_Cap，或使用右侧按钮写入项目后再进行 Lock & Save。")
+                                        elif deal_row == DEAL_HOT and status in (STATUS_PROCESSING, STATUS_ALLOCATING, STATUS_CLOSING) and (cap_eff is None or cap_eff <= 0):
+                                            st.warning("模式 B 需有效的硬上限（Target_Total_Cap / Final_Cap）方可 Lock & Save。")
+
+                                        if deal_row == DEAL_HOT:
+                                            st.caption("模式 B：Suggested_Amount 固定为 0；请在 Final_Allocation 手动配给。")
+
+                                        dispatch_lock_edit = False
+                                        if deal_row == DEAL_HOT and "Dispatch_Status" in sub.columns:
+                                            non_draft_mask = sub["Dispatch_Status"].astype(str).isin(["Sent", "Confirmed", "Reduced"])
+                                            dispatch_lock_edit = bool(non_draft_mask.any())
+                                            if dispatch_lock_edit:
+                                                st.warning(
+                                                    "检测到该 Hot Deal 项目存在已 Sent/Confirmed/Reduced 的 OID 记录。请在『Hot Deal Dispatch v2.1』中完成后续确认/减额；此处将禁用 Final_Allocation 编辑。"
                                                 )
-                                    st.dataframe(
-                                        intent_show,
-                                        use_container_width=True,
-                                        hide_index=True,
-                                    )
-                                    if st.button(
-                                        "⚖️ 前往分配中心调整额度",
-                                        type="primary",
-                                        key=f"tower_goto_alloc_{selected}",
-                                    ):
-                                        _hub_sync_global_project_and_goto_alloc(str(selected))
 
-                                    st.info(
-                                        "募集中 (Open)：Project Hub 仅做全景展示；意向与分配明细以 **commitments.csv** 为准，"
-                                        "在 Allocation Center 修改并保存后会反映于此表。"
-                                    )
-                                elif sub.empty:
-                                    st.warning(
-                                        "该项目尚无认购行。请先在「募集中」阶段录入意向，或在「⚙️ 项目设置」中从 CRM 同步。"
-                                    )
-                                else:
-                                    cap_eff = _project_effective_cap(prj, deal_row, status)
-
-                                    n_commits_before = len(commits_all)
-                                    commits_all = _ensure_coo_row(commits_all, selected, share_price, deal_row)
-                                    if len(commits_all) > n_commits_before:
-                                        _save_commitments(commits_all)
-                                        _invalidate_action_bench(selected)
-                                    commits_all = _load_commitments()
-                                    sub = commits_all[commits_all["Project_ID"].astype(str) == str(selected)].copy()
-
-                                    negotiated = float(pd.to_numeric(prj.get("Negotiated_Final_Cap"), errors="coerce") or 0.0)
-                                    if deal_row == DEAL_SOFT:
-                                        new_neg = st.number_input(
-                                            "Negotiated_Final_Cap（模式 A：谈回总额度）",
-                                            min_value=0.0,
-                                            value=max(negotiated, 0.0),
-                                            step=10_000.0,
-                                            format="%.2f",
-                                            key=f"tower_neg_{selected}",
+                                        auto_round = st.checkbox(
+                                            "Auto-round to Integer Shares",
+                                            value=False,
+                                            key=f"tower_autoround_{selected}",
                                             disabled=status == STATUS_CLOSED,
                                         )
-                                        st.caption(f"Negotiated_Final_Cap 展示：**{_fmt_money2(new_neg)}**")
-                                        if status in (STATUS_PROCESSING, STATUS_ALLOCATING, STATUS_CLOSING):
-                                            live_cap = float(new_neg)
-                                            cap_eff = live_cap if live_cap > 0 else cap_eff
-                                            if cap_eff is not None and cap_eff <= 0:
-                                                cap_eff = None
-                                        c_neg, c_sug = st.columns(2)
-                                        with c_neg:
+
+                                        display_cols = [
+                                            "Name_Household",
+                                            "Tier",
+                                            "Desired_Amount",
+                                            "Suggested_Amount",
+                                            "Final_Allocation",
+                                            "Final_Shares",
+                                        ]
+                                        work = sub.copy()
+                                        work["Desired_Amount"] = pd.to_numeric(work["Desired_Amount"], errors="coerce").fillna(0.0)
+                                        if deal_row == DEAL_HOT:
+                                            work.loc[work["client_id"].astype(str) != COO_CLIENT_ID, "Suggested_Amount"] = 0.0
+                                        work["Suggested_Amount"] = pd.to_numeric(work["Suggested_Amount"], errors="coerce").fillna(0.0)
+
+                                        work = _apply_final_shares(work, share_price, False)
+
+                                        bk = _bench_key(selected)
+                                        if bk not in st.session_state:
+                                            st.session_state[bk] = work.copy()
+                                        elif set(work["client_id"].astype(str)) != set(st.session_state[bk]["client_id"].astype(str)):
+                                            st.session_state[bk] = work.copy()
+
+                                        if auto_round:
+                                            st.session_state[bk] = _apply_final_shares(st.session_state[bk], share_price, True)
+
+                                        cfg = {
+                                            "Desired_Amount": st.column_config.NumberColumn("Desired_Amount", format="localized", disabled=True),
+                                            "Suggested_Amount": st.column_config.NumberColumn("Suggested_Amount", format="localized", disabled=True),
+                                            "Final_Allocation": st.column_config.NumberColumn(
+                                                "Final_Allocation",
+                                                format="localized",
+                                                disabled=(status == STATUS_CLOSED or dispatch_lock_edit),
+                                            ),
+                                            "Final_Shares": st.column_config.NumberColumn("Final_Shares", format="%.4f", disabled=True),
+                                            "Tier": st.column_config.TextColumn("Tier", disabled=True),
+                                            "Name_Household": st.column_config.TextColumn("Name/Household", disabled=True),
+                                        }
+
+                                        bench_view = st.session_state[bk][display_cols + ["client_id"]].copy()
+
+                                        edited = st.data_editor(
+                                            bench_view,
+                                            use_container_width=True,
+                                            hide_index=True,
+                                            column_config={**cfg, "client_id": st.column_config.TextColumn("client_id", disabled=True)},
+                                            key=f"tower_action_{selected}",
+                                            disabled=status == STATUS_CLOSED or dispatch_lock_edit,
+                                        )
+
+                                        st.session_state[bk] = edited.copy()
+                                        full_edit = st.session_state[bk].copy()
+                                        total_alloc = float(pd.to_numeric(full_edit["Final_Allocation"], errors="coerce").fillna(0.0).sum())
+                                        over = cap_eff is not None and cap_eff > 0 and total_alloc > cap_eff + 1e-6
+
+                                        c_r1, _c_r2 = st.columns(2)
+                                        with c_r1:
                                             if st.button(
-                                                "💾 保存谈回额度到项目",
-                                                type="primary",
-                                                key=f"tower_save_neg_{selected}",
-                                                disabled=status == STATUS_CLOSED,
+                                                "Assign Remainder to COO",
+                                                key=f"tower_remainder_{selected}",
+                                                disabled=status == STATUS_CLOSED or dispatch_lock_edit or cap_eff is None or cap_eff <= 0,
                                             ):
-                                                projects.at[row_idx, "Negotiated_Final_Cap"] = float(new_neg)
-                                                projects.at[row_idx, "Final_Cap"] = float(new_neg)
-                                                save_projects(projects)
-                                                _hub_sync_projects_session(load_projects())
-                                                st.success("已更新 Negotiated_Final_Cap / Final_Cap。")
-                                                st.rerun()
-                                        with c_sug:
-                                            if st.button(
-                                                "按权重重新计算 Suggested_Amount (模式 A)",
-                                                key=f"tower_rec_sug_{selected}",
-                                                disabled=status == STATUS_CLOSED,
-                                            ):
-                                                if new_neg <= 0:
-                                                    st.error("请先填写大于 0 的 Negotiated_Final_Cap。")
+                                                df2 = full_edit.copy()
+                                                mask_coo = df2["client_id"].astype(str) == COO_CLIENT_ID
+                                                mask_others = ~mask_coo
+                                                sum_others = float(
+                                                    pd.to_numeric(df2.loc[mask_others, "Final_Allocation"], errors="coerce").fillna(0.0).sum()
+                                                )
+                                                rem = max(0.0, float(cap_eff) - sum_others)
+                                                if not mask_coo.any():
+                                                    st.error("缺少 COO 行，请先同步 CRM 或重新加载。")
                                                 else:
-                                                    work = sub[sub["client_id"].astype(str) != COO_CLIENT_ID].copy()
-                                                    sug_series = compute_soft_circle_suggested(work["Desired_Amount"], work["Tier"], new_neg)
-                                                    work["Suggested_Amount"] = sug_series.values
-                                                    work["Final_Allocation"] = work["Suggested_Amount"]
-                                                    coo = sub[sub["client_id"].astype(str) == COO_CLIENT_ID].copy()
-                                                    merged_sub = pd.concat([work, coo], ignore_index=True)
-                                                    merged_sub = _apply_final_shares(merged_sub, share_price, auto_round=False)
+                                                    df2.loc[mask_coo, "Final_Allocation"] = rem
+                                                    df2 = _apply_final_shares(df2, share_price, auto_round)
                                                     rest = commits_all[commits_all["Project_ID"].astype(str) != str(selected)].copy()
-                                                    _save_commitments(pd.concat([rest, merged_sub], ignore_index=True))
+                                                    merged_rows = []
+                                                    for _, r in df2.iterrows():
+                                                        cid = str(r["client_id"])
+                                                        meta = dispatch_meta.get(cid, {})
+                                                        merged_rows.append(
+                                                            {
+                                                                "Project_ID": selected,
+                                                                "client_id": cid,
+                                                                "Name_Household": r["Name_Household"],
+                                                                "Tier": r["Tier"],
+                                                                "Desired_Amount": r["Desired_Amount"],
+                                                                "Suggested_Amount": r["Suggested_Amount"],
+                                                                "Final_Allocation": r["Final_Allocation"],
+                                                                "Final_Shares": r["Final_Shares"],
+                                                                "Share_Price": share_price,
+                                                                "Deal_Type": deal_row,
+                                                                "OID": meta.get("OID", ""),
+                                                                "Dispatch_Status": meta.get("Dispatch_Status", ""),
+                                                                "OID_Expiry_At": meta.get("OID_Expiry_At", ""),
+                                                            }
+                                                        )
+                                                    new_sub = pd.DataFrame(merged_rows)
+                                                    _save_commitments(pd.concat([rest, new_sub], ignore_index=True))
                                                     _invalidate_action_bench(selected)
-                                                    st.success("已重算建议分配并写回 commitments。")
+                                                    st.success("已将剩余额度划入 COO 管理账户行。")
                                                     st.rerun()
 
-                                    if status != STATUS_OPEN and cap_eff is not None and cap_eff > 0:
-                                        st.caption(f"分配工作台生效硬顶 Cap: **{cap_eff:,.2f}**（合计须 ≤ Cap 方可 Lock & Save）")
-                                    elif deal_row == DEAL_SOFT and status in (STATUS_PROCESSING, STATUS_ALLOCATING, STATUS_CLOSING):
-                                        st.warning("请填写大于 0 的 Negotiated_Final_Cap，或使用右侧按钮写入项目后再进行 Lock & Save。")
-                                    elif deal_row == DEAL_HOT and status in (STATUS_PROCESSING, STATUS_ALLOCATING, STATUS_CLOSING) and (cap_eff is None or cap_eff <= 0):
-                                        st.warning("模式 B 需有效的硬上限（Target_Total_Cap / Final_Cap）方可 Lock & Save。")
+                                        st.metric("Total Final_Allocation", f"{total_alloc:,.2f}")
+                                        if cap_eff is not None:
+                                            st.caption(f"当前硬上限 Cap: {cap_eff:,.2f}")
+                                        if over:
+                                            st.error(f"熔断：Total ({total_alloc:,.2f}) > Cap ({cap_eff:,.2f})。请调低分配或调整 COO 行后再保存。")
 
-                                    if deal_row == DEAL_HOT:
-                                        st.caption("模式 B：Suggested_Amount 固定为 0；请在 Final_Allocation 手动配给。")
-
-                                    dispatch_lock_edit = False
-                                    if deal_row == DEAL_HOT and "Dispatch_Status" in sub.columns:
-                                        non_draft_mask = sub["Dispatch_Status"].astype(str).isin(["Sent", "Confirmed", "Reduced"])
-                                        dispatch_lock_edit = bool(non_draft_mask.any())
-                                        if dispatch_lock_edit:
-                                            st.warning(
-                                                "检测到该 Hot Deal 项目存在已 Sent/Confirmed/Reduced 的 OID 记录。请在『Hot Deal Dispatch v2.1』中完成后续确认/减额；此处将禁用 Final_Allocation 编辑。"
-                                            )
-
-                                    auto_round = st.checkbox(
-                                        "Auto-round to Integer Shares",
-                                        value=False,
-                                        key=f"tower_autoround_{selected}",
-                                        disabled=status == STATUS_CLOSED,
-                                    )
-
-                                    display_cols = [
-                                        "Name_Household",
-                                        "Tier",
-                                        "Desired_Amount",
-                                        "Suggested_Amount",
-                                        "Final_Allocation",
-                                        "Final_Shares",
-                                    ]
-                                    work = sub.copy()
-                                    work["Desired_Amount"] = pd.to_numeric(work["Desired_Amount"], errors="coerce").fillna(0.0)
-                                    if deal_row == DEAL_HOT:
-                                        work.loc[work["client_id"].astype(str) != COO_CLIENT_ID, "Suggested_Amount"] = 0.0
-                                    work["Suggested_Amount"] = pd.to_numeric(work["Suggested_Amount"], errors="coerce").fillna(0.0)
-
-                                    work = _apply_final_shares(work, share_price, False)
-
-                                    bk = _bench_key(selected)
-                                    if bk not in st.session_state:
-                                        st.session_state[bk] = work.copy()
-                                    elif set(work["client_id"].astype(str)) != set(st.session_state[bk]["client_id"].astype(str)):
-                                        st.session_state[bk] = work.copy()
-
-                                    if auto_round:
-                                        st.session_state[bk] = _apply_final_shares(st.session_state[bk], share_price, True)
-
-                                    cfg = {
-                                        "Desired_Amount": st.column_config.NumberColumn("Desired_Amount", format="localized", disabled=True),
-                                        "Suggested_Amount": st.column_config.NumberColumn("Suggested_Amount", format="localized", disabled=True),
-                                        "Final_Allocation": st.column_config.NumberColumn(
-                                            "Final_Allocation",
-                                            format="localized",
-                                            disabled=(status == STATUS_CLOSED or dispatch_lock_edit),
-                                        ),
-                                        "Final_Shares": st.column_config.NumberColumn("Final_Shares", format="%.4f", disabled=True),
-                                        "Tier": st.column_config.TextColumn("Tier", disabled=True),
-                                        "Name_Household": st.column_config.TextColumn("Name/Household", disabled=True),
-                                    }
-
-                                    bench_view = st.session_state[bk][display_cols + ["client_id"]].copy()
-
-                                    edited = st.data_editor(
-                                        bench_view,
-                                        use_container_width=True,
-                                        hide_index=True,
-                                        column_config={**cfg, "client_id": st.column_config.TextColumn("client_id", disabled=True)},
-                                        key=f"tower_action_{selected}",
-                                        disabled=status == STATUS_CLOSED or dispatch_lock_edit,
-                                    )
-
-                                    st.session_state[bk] = edited.copy()
-                                    full_edit = st.session_state[bk].copy()
-                                    total_alloc = float(pd.to_numeric(full_edit["Final_Allocation"], errors="coerce").fillna(0.0).sum())
-                                    over = cap_eff is not None and cap_eff > 0 and total_alloc > cap_eff + 1e-6
-
-                                    c_r1, _c_r2 = st.columns(2)
-                                    with c_r1:
-                                        if st.button(
-                                            "Assign Remainder to COO",
-                                            key=f"tower_remainder_{selected}",
-                                            disabled=status == STATUS_CLOSED or dispatch_lock_edit or cap_eff is None or cap_eff <= 0,
-                                        ):
-                                            df2 = full_edit.copy()
-                                            mask_coo = df2["client_id"].astype(str) == COO_CLIENT_ID
-                                            mask_others = ~mask_coo
-                                            sum_others = float(
-                                                pd.to_numeric(df2.loc[mask_others, "Final_Allocation"], errors="coerce").fillna(0.0).sum()
-                                            )
-                                            rem = max(0.0, float(cap_eff) - sum_others)
-                                            if not mask_coo.any():
-                                                st.error("缺少 COO 行，请先同步 CRM 或重新加载。")
+                                        cap_ok = cap_eff is not None and float(cap_eff) > 0
+                                        lock = st.button(
+                                            "Lock & Save",
+                                            type="primary",
+                                            key=f"tower_lock_{selected}",
+                                            disabled=over or status == STATUS_CLOSED or dispatch_lock_edit or not cap_ok,
+                                        )
+                                        if lock:
+                                            if over or not cap_ok:
+                                                st.error("保存条件不满足：请确保已设置有效 Cap 且合计不超上限。")
                                             else:
-                                                df2.loc[mask_coo, "Final_Allocation"] = rem
-                                                df2 = _apply_final_shares(df2, share_price, auto_round)
                                                 rest = commits_all[commits_all["Project_ID"].astype(str) != str(selected)].copy()
-                                                merged_rows = []
-                                                for _, r in df2.iterrows():
+                                                out_rows = []
+                                                for _, r in full_edit.iterrows():
                                                     cid = str(r["client_id"])
                                                     meta = dispatch_meta.get(cid, {})
-                                                    merged_rows.append(
+                                                    out_rows.append(
                                                         {
                                                             "Project_ID": selected,
                                                             "client_id": cid,
                                                             "Name_Household": r["Name_Household"],
                                                             "Tier": r["Tier"],
-                                                            "Desired_Amount": r["Desired_Amount"],
-                                                            "Suggested_Amount": r["Suggested_Amount"],
-                                                            "Final_Allocation": r["Final_Allocation"],
-                                                            "Final_Shares": r["Final_Shares"],
+                                                            "Desired_Amount": float(r["Desired_Amount"]),
+                                                            "Suggested_Amount": float(r["Suggested_Amount"]),
+                                                            "Final_Allocation": float(r["Final_Allocation"]),
+                                                            "Final_Shares": float(r["Final_Shares"]),
                                                             "Share_Price": share_price,
                                                             "Deal_Type": deal_row,
                                                             "OID": meta.get("OID", ""),
@@ -959,505 +1015,463 @@ def render_project_hub() -> None:
                                                             "OID_Expiry_At": meta.get("OID_Expiry_At", ""),
                                                         }
                                                     )
-                                                new_sub = pd.DataFrame(merged_rows)
-                                                _save_commitments(pd.concat([rest, new_sub], ignore_index=True))
-                                                _invalidate_action_bench(selected)
-                                                st.success("已将剩余额度划入 COO 管理账户行。")
-                                                st.rerun()
+                                                new_sub = pd.DataFrame(out_rows)
+                                                new_sub = _apply_final_shares(new_sub, share_price, auto_round)
+                                                chk = float(pd.to_numeric(new_sub["Final_Allocation"], errors="coerce").fillna(0.0).sum())
+                                                if chk > float(cap_eff) + 1e-6:
+                                                    st.error("合计仍超过 Cap，未写入。")
+                                                else:
+                                                    _save_commitments(pd.concat([rest, new_sub], ignore_index=True))
+                                                    _invalidate_action_bench(selected)
+                                                    st.success("已锁定并保存至 commitments.csv。")
 
-                                    st.metric("Total Final_Allocation", f"{total_alloc:,.2f}")
-                                    if cap_eff is not None:
-                                        st.caption(f"当前硬上限 Cap: {cap_eff:,.2f}")
-                                    if over:
-                                        st.error(f"熔断：Total ({total_alloc:,.2f}) > Cap ({cap_eff:,.2f})。请调低分配或调整 COO 行后再保存。")
+                                        if status == STATUS_CLOSED:
+                                            st.info("已结项：工作台只读。")
 
-                                    cap_ok = cap_eff is not None and float(cap_eff) > 0
-                                    lock = st.button(
-                                        "Lock & Save",
-                                        type="primary",
-                                        key=f"tower_lock_{selected}",
-                                        disabled=over or status == STATUS_CLOSED or dispatch_lock_edit or not cap_ok,
-                                    )
-                                    if lock:
-                                        if over or not cap_ok:
-                                            st.error("保存条件不满足：请确保已设置有效 Cap 且合计不超上限。")
-                                        else:
-                                            rest = commits_all[commits_all["Project_ID"].astype(str) != str(selected)].copy()
-                                            out_rows = []
-                                            for _, r in full_edit.iterrows():
-                                                cid = str(r["client_id"])
-                                                meta = dispatch_meta.get(cid, {})
-                                                out_rows.append(
-                                                    {
-                                                        "Project_ID": selected,
-                                                        "client_id": cid,
-                                                        "Name_Household": r["Name_Household"],
-                                                        "Tier": r["Tier"],
-                                                        "Desired_Amount": float(r["Desired_Amount"]),
-                                                        "Suggested_Amount": float(r["Suggested_Amount"]),
-                                                        "Final_Allocation": float(r["Final_Allocation"]),
-                                                        "Final_Shares": float(r["Final_Shares"]),
-                                                        "Share_Price": share_price,
-                                                        "Deal_Type": deal_row,
-                                                        "OID": meta.get("OID", ""),
-                                                        "Dispatch_Status": meta.get("Dispatch_Status", ""),
-                                                        "OID_Expiry_At": meta.get("OID_Expiry_At", ""),
-                                                    }
-                                                )
-                                            new_sub = pd.DataFrame(out_rows)
-                                            new_sub = _apply_final_shares(new_sub, share_price, auto_round)
-                                            chk = float(pd.to_numeric(new_sub["Final_Allocation"], errors="coerce").fillna(0.0).sum())
-                                            if chk > float(cap_eff) + 1e-6:
-                                                st.error("合计仍超过 Cap，未写入。")
-                                            else:
-                                                _save_commitments(pd.concat([rest, new_sub], ignore_index=True))
-                                                _invalidate_action_bench(selected)
-                                                st.success("已锁定并保存至 commitments.csv。")
+                            with dcol_r:
+                                st.markdown(
+                                    _hub_glance_card_html(
+                                        ticker=tk_card,
+                                        share_price_fmt=_fmt_share_price(share_price),
+                                        cap_fmt=_cap_glance,
+                                        deadline_txt=_hd_txt,
+                                        badge_inner_html=_hub_status_badge_html(cur_status),
+                                    ),
+                                    unsafe_allow_html=True,
+                                )
 
-                                    if status == STATUS_CLOSED:
-                                        st.info("已结项：工作台只读。")
+                            st.divider()
+                            st.markdown("**Project Notes（预览）**")
+                            _npv = str(st.session_state.get("hub_project_notes", "") or "").strip()
+                            if _npv:
+                                st.text(_npv[:2000] + ("…" if len(_npv) > 2000 else ""))
+                            else:
+                                st.caption("（Notes 为空；在「项目设置」中编辑）")
 
-                        with dcol_r:
-                            st.markdown(
-                                _hub_glance_card_html(
-                                    ticker=tk_card,
-                                    share_price_fmt=_fmt_share_price(share_price),
-                                    cap_fmt=_cap_glance,
-                                    deadline_txt=_hd_txt,
-                                    badge_inner_html=_hub_status_badge_html(cur_status),
-                                ),
-                                unsafe_allow_html=True,
-                            )
+                with tab_o:
+                    st.info(
+                        "以下链接在保存项目时将写入 **Cloud_Drive_Links_JSON**，并自动供 **Smart Distribution** 模块在发信前勾选插入正文。"
+                    )
+                    st.caption(
+                        "编辑后请在「⚙️ 项目设置」点击保存，以写回 **projects.csv** 与 **projects_data**。"
+                    )
+                    _drive_tbl_key = f"hub_drive_ed_{pick}"
+                    _drive_seed = _hub_drive_initial_dataframe(pick, projects)
+                    _drive_raw = st.session_state.get(_drive_tbl_key)
+                    _drive_df = coerce_drive_editor_value_to_df(_drive_raw, _drive_seed)
+                    _n_rows = max(2, len(_drive_df) + 1) if _drive_df is not None and len(_drive_df) else 3
+                    _drive_editor_h = min(280, max(96, _n_rows * 34))
+                    _ed_kw = dict(
+                        num_rows="dynamic",
+                        hide_index=True,
+                        use_container_width=True,
+                        key=_drive_tbl_key,
+                        column_config={
+                            "description": st.column_config.TextColumn("文件描述", required=False),
+                            "url": st.column_config.TextColumn("Google Drive URL", required=False),
+                        },
+                    )
+                    with st.container(border=True):
+                        try:
+                            drive_edited = st.data_editor(_drive_df, height=_drive_editor_h, **_ed_kw)
+                        except TypeError:
+                            drive_edited = st.data_editor(_drive_df, **_ed_kw)
+                    drive_edited = coerce_drive_editor_value_to_df(drive_edited, _drive_seed)
+                    _drive_items = dataframe_to_drive_items(drive_edited)
+                    _bpv = f"hub_drive_pv_on_{pick}"
+                    if st.button("👁 链接预览模式", key=f"hub_drive_pv_btn_{pick}"):
+                        st.session_state[_bpv] = not st.session_state.get(_bpv, False)
+                    if st.session_state.get(_bpv, False):
+                        if not _drive_items:
+                            st.caption("当前表格中无有效链接，请在上方编辑后保存项目。")
+                    if st.session_state.get(_bpv, False) and _drive_items:
+                        st.caption("预览 · 在新标签页打开")
+                        _ni = len(_drive_items)
+                        _nc = min(4, max(2, _ni))
+                        for _r0 in range(0, _ni, _nc):
+                            _pcols = st.columns(_nc)
+                            for _k in range(_nc):
+                                _ix = _r0 + _k
+                                if _ix >= _ni:
+                                    break
+                                _it = _drive_items[_ix]
+                                _u = str(_it.get("url", "") or "").strip()
+                                _lb = str(_it.get("description", "") or "").strip() or _u or f"链接 {_ix + 1}"
+                                _short = _lb if len(_lb) <= 22 else _lb[:19] + "…"
+                                with _pcols[_k]:
+                                    if _u.startswith("http://") or _u.startswith("https://"):
+                                        st.link_button(f"📎 {_short}", _u, use_container_width=True)
+                                    else:
+                                        st.caption(f"📎 {_short}（URL 无效）")
 
-                        st.divider()
-                        st.markdown("**Project Notes（预览）**")
-                        _npv = str(st.session_state.get("hub_project_notes", "") or "").strip()
-                        if _npv:
-                            st.text(_npv[:2000] + ("…" if len(_npv) > 2000 else ""))
-                        else:
-                            st.caption("（Notes 为空；在「项目设置」中编辑）")
-
-            with tab_o:
-                st.info(
-                    "以下链接在保存项目时将写入 **Cloud_Drive_Links_JSON**，并自动供 **Smart Distribution** 模块在发信前勾选插入正文。"
-                )
-                st.caption(
-                    "编辑后请在「⚙️ 项目设置」点击保存，以写回 **projects.csv** 与 **projects_data**。"
-                )
-                _drive_tbl_key = f"hub_drive_ed_{pick}"
-                _drive_seed = _hub_drive_initial_dataframe(pick, projects)
-                _drive_raw = st.session_state.get(_drive_tbl_key)
-                _drive_df = coerce_drive_editor_value_to_df(_drive_raw, _drive_seed)
-                _n_rows = max(2, len(_drive_df) + 1) if _drive_df is not None and len(_drive_df) else 3
-                _drive_editor_h = min(280, max(96, _n_rows * 34))
-                _ed_kw = dict(
-                    num_rows="dynamic",
-                    hide_index=True,
-                    use_container_width=True,
-                    key=_drive_tbl_key,
-                    column_config={
-                        "description": st.column_config.TextColumn("文件描述", required=False),
-                        "url": st.column_config.TextColumn("Google Drive URL", required=False),
-                    },
-                )
-                with st.container(border=True):
-                    try:
-                        drive_edited = st.data_editor(_drive_df, height=_drive_editor_h, **_ed_kw)
-                    except TypeError:
-                        drive_edited = st.data_editor(_drive_df, **_ed_kw)
-                drive_edited = coerce_drive_editor_value_to_df(drive_edited, _drive_seed)
-                _drive_items = dataframe_to_drive_items(drive_edited)
-                _bpv = f"hub_drive_pv_on_{pick}"
-                if st.button("👁 链接预览模式", key=f"hub_drive_pv_btn_{pick}"):
-                    st.session_state[_bpv] = not st.session_state.get(_bpv, False)
-                if st.session_state.get(_bpv, False):
-                    if not _drive_items:
-                        st.caption("当前表格中无有效链接，请在上方编辑后保存项目。")
-                if st.session_state.get(_bpv, False) and _drive_items:
-                    st.caption("预览 · 在新标签页打开")
-                    _ni = len(_drive_items)
-                    _nc = min(4, max(2, _ni))
-                    for _r0 in range(0, _ni, _nc):
-                        _pcols = st.columns(_nc)
-                        for _k in range(_nc):
-                            _ix = _r0 + _k
-                            if _ix >= _ni:
-                                break
-                            _it = _drive_items[_ix]
-                            _u = str(_it.get("url", "") or "").strip()
-                            _lb = str(_it.get("description", "") or "").strip() or _u or f"链接 {_ix + 1}"
-                            _short = _lb if len(_lb) <= 22 else _lb[:19] + "…"
-                            with _pcols[_k]:
-                                if _u.startswith("http://") or _u.startswith("https://"):
-                                    st.link_button(f"📎 {_short}", _u, use_container_width=True)
-                                else:
-                                    st.caption(f"📎 {_short}（URL 无效）")
-
-            with tab_s:
-                _hub_settings_ro = False
-                if not is_new:
-                    _pix_ro = projects.index[projects["Project_ID"].astype(str) == str(pick)]
-                    if len(_pix_ro):
-                        _hub_settings_ro = _normalize_status(projects.iloc[int(_pix_ro[0])].get("Status")) == STATUS_CLOSED
-                st.subheader("项目参数与登记")
-                if _hub_settings_ro:
-                    st.info("该项目状态为 **已结项 (Closed)**：此处参数只读；系统自动状态变更见 **Project Notes** 中的时间戳审计行。")
-                st.markdown("#### 基础信息")
-                st.caption(
-                    "**Project_Name** 由 `Ticker` + `命名日期` 自动生成；Ticker 可搜索或手输。"
-                )
-                q1, q2 = st.columns(2)
-                company_inp = q1.text_input(
-                    "Company Name（公司名称，用于搜索 Ticker）",
-                    key="tower_company_name",
-                    placeholder="例如：Aurion Capital",
-                    disabled=_hub_settings_ro,
-                )
-                if q2.button("🔍 Search Ticker", key="tower_yahoo_search_btn", disabled=_hub_settings_ro):
-                    hits = _yahoo_finance_search_quotes(company_inp)
-                    st.session_state["tower_yahoo_hits"] = hits
-                    if hits.empty:
-                        st.warning("未找到匹配报价，请换关键词或手填 Ticker。")
-                    else:
-                        st.success(f"找到 {len(hits)} 条候选。")
-
-                hits_df = st.session_state.get("tower_yahoo_hits")
-                if hits_df is not None and isinstance(hits_df, pd.DataFrame) and not hits_df.empty:
-
-                    def _sym_label(i: int) -> str:
-                        r = hits_df.iloc[int(i)]
-                        sym = str(r.get("symbol", ""))
-                        ex = str(r.get("exchange", ""))
-                        nm = str(r.get("name", ""))[:48]
-                        return f"{sym}  |  {ex}  |  {nm}"
-
-                    pick_i = st.selectbox(
-                        "选择交易所 / 代码后缀（Yahoo symbol）",
-                        options=list(range(len(hits_df))),
-                        format_func=_sym_label,
-                        key="tower_yahoo_pick_i",
+                with tab_s:
+                    _hub_settings_ro = False
+                    if not is_new:
+                        _pix_ro = projects.index[projects["Project_ID"].astype(str) == str(pick)]
+                        if len(_pix_ro):
+                            _hub_settings_ro = _normalize_status(projects.iloc[int(_pix_ro[0])].get("Status")) == STATUS_CLOSED
+                    st.subheader("项目参数与登记")
+                    if _hub_settings_ro:
+                        st.info("该项目状态为 **已结项 (Closed)**：此处参数只读；系统自动状态变更见 **Project Notes** 中的时间戳审计行。")
+                    st.markdown("#### 基础信息")
+                    st.caption(
+                        "**Project_Name** 由 `Ticker` + `命名日期` 自动生成；Ticker 可搜索或手输。"
+                    )
+                    q1, q2 = st.columns(2)
+                    company_inp = q1.text_input(
+                        "Company Name（公司名称，用于搜索 Ticker）",
+                        key="tower_company_name",
+                        placeholder="例如：Aurion Capital",
                         disabled=_hub_settings_ro,
                     )
-                    sym_pick = str(hits_df.iloc[int(pick_i)].get("symbol", "")).strip()
-                    ap1, ap2 = st.columns([1, 3])
-                    if ap1.button("填入 Ticker", type="primary", key="tower_apply_yahoo_sym", disabled=_hub_settings_ro):
-                        st.session_state["tower_form_ticker"] = sym_pick
-                        st.rerun()
-                    ap2.caption(f"当前选中：**{sym_pick}**（含 .V / .CN / .TO 等后缀）")
+                    if q2.button("🔍 Search Ticker", key="tower_yahoo_search_btn", disabled=_hub_settings_ro):
+                        hits = _yahoo_finance_search_quotes(company_inp)
+                        st.session_state["tower_yahoo_hits"] = hits
+                        if hits.empty:
+                            st.warning("未找到匹配报价，请换关键词或手填 Ticker。")
+                        else:
+                            st.success(f"找到 {len(hits)} 条候选。")
 
-                if is_new:
-                    _pid_preview = str(st.session_state.get("hub_new_pid", "") or "").strip()
-                    st.caption(
-                        f"**Project_ID（自动生成）**：`{_pid_preview or '（填写 Ticker 后按上方格式预览）'}`  "
-                        "规则：`Ticker` 清洗为缩写 + 命名日期的年月 (YYMM) + 当月两位流水。"
-                    )
-                else:
-                    _pid_st1, _pid_st2 = st.columns(2)
-                    with _pid_st1:
-                        st.caption(f"**Project_ID（不可改）**：`{pick}`")
-                    with _pid_st2:
-                        _pso = [
-                            STATUS_OPEN,
-                            STATUS_PROCESSING,
-                            STATUS_ALLOCATING,
-                            STATUS_CLOSING,
-                            STATUS_CLOSED,
-                        ]
-                        _cur_st = str(st.session_state.get("hub_project_status", STATUS_OPEN))
-                        if _cur_st not in _pso:
-                            _cur_st = STATUS_OPEN
-                        st.selectbox(
-                            "项目状态",
-                            _pso,
-                            index=_pso.index(_cur_st),
-                            key="hub_project_status",
-                            help="写入 projects.csv；保存后「执行看板」与分配工作台会按新状态切换。",
+                    hits_df = st.session_state.get("tower_yahoo_hits")
+                    if hits_df is not None and isinstance(hits_df, pd.DataFrame) and not hits_df.empty:
+
+                        def _sym_label(i: int) -> str:
+                            r = hits_df.iloc[int(i)]
+                            sym = str(r.get("symbol", ""))
+                            ex = str(r.get("exchange", ""))
+                            nm = str(r.get("name", ""))[:48]
+                            return f"{sym}  |  {ex}  |  {nm}"
+
+                        pick_i = st.selectbox(
+                            "选择交易所 / 代码后缀（Yahoo symbol）",
+                            options=list(range(len(hits_df))),
+                            format_func=_sym_label,
+                            key="tower_yahoo_pick_i",
                             disabled=_hub_settings_ro,
                         )
+                        sym_pick = str(hits_df.iloc[int(pick_i)].get("symbol", "")).strip()
+                        ap1, ap2 = st.columns([1, 3])
+                        if ap1.button("填入 Ticker", type="primary", key="tower_apply_yahoo_sym", disabled=_hub_settings_ro):
+                            st.session_state["tower_form_ticker"] = sym_pick
+                            st.rerun()
+                        ap2.caption(f"当前选中：**{sym_pick}**（含 .V / .CN / .TO 等后缀）")
 
-                _nd1, _nd2 = st.columns(2)
-                with _nd1:
-                    name_date = st.date_input(
-                        "命名日期（用于 Project_Name = Ticker_YYYY-MM-DD）",
-                        key="hub_name_date",
-                        disabled=_hub_settings_ro,
-                    )
-                with _nd2:
-                    t_clean_preview = str(st.session_state.get("tower_form_ticker", "")).strip()
-                    if t_clean_preview:
-                        auto_name = f"{t_clean_preview}_{name_date.strftime('%Y-%m-%d')}"
-                        st.caption(f"将保存的 **Project_Name**：`{auto_name}`")
-                    _tk_preview = str(st.session_state.get("tower_form_ticker", "")).strip()
-                    if _tk_preview:
-                        _px = _ticker_last_price(_tk_preview)
-                        if _px is not None:
-                            st.caption(
-                                f"yfinance · `{_tk_preview}` 参考价：**{_fmt_money2(_px)}**（延迟行情，仅供参考）"
+                    if is_new:
+                        _pid_preview = str(st.session_state.get("hub_new_pid", "") or "").strip()
+                        st.caption(
+                            f"**Project_ID（自动生成）**：`{_pid_preview or '（填写 Ticker 后按上方格式预览）'}`  "
+                            "规则：`Ticker` 清洗为缩写 + 命名日期的年月 (YYMM) + 当月两位流水。"
+                        )
+                    else:
+                        _pid_st1, _pid_st2 = st.columns(2)
+                        with _pid_st1:
+                            st.caption(f"**Project_ID（不可改）**：`{pick}`")
+                        with _pid_st2:
+                            _pso = [
+                                STATUS_OPEN,
+                                STATUS_PROCESSING,
+                                STATUS_ALLOCATING,
+                                STATUS_CLOSING,
+                                STATUS_CLOSED,
+                            ]
+                            _cur_st = str(st.session_state.get("hub_project_status", STATUS_OPEN))
+                            if _cur_st not in _pso:
+                                _cur_st = STATUS_OPEN
+                            st.selectbox(
+                                "项目状态",
+                                _pso,
+                                index=_pso.index(_cur_st),
+                                key="hub_project_status",
+                                help="写入 projects.csv；保存后「执行看板」与分配工作台会按新状态切换。",
+                                disabled=_hub_settings_ro,
                             )
 
-                st.text_input("Ticker（可搜索填入或手输）", key="tower_form_ticker", disabled=_hub_settings_ro)
-
-                st.divider()
-                st.markdown("#### 定价与规模")
-                pr1, pr2 = st.columns(2)
-                with pr1:
-                    sp = st.number_input(
-                        "Share_Price",
-                        min_value=0.0001,
-                        step=0.01,
-                        format="%.4f",
-                        key="hub_sp",
-                        help="存储为数值；下方有千分位预览。",
-                        disabled=_hub_settings_ro,
-                    )
-                with pr2:
-                    target_cap = st.number_input(
-                        "Hard Cap / Target_Total_Cap（Hot Deal 必填；Soft 填后供分配台）",
-                        min_value=0.0,
-                        step=10_000.0,
-                        format="%.2f",
-                        key="hub_target_cap",
-                        disabled=_hub_settings_ro,
-                    )
-                pr3, pr4 = st.columns(2)
-                with pr3:
-                    lot_sz = st.number_input("Lot_Size", min_value=1, step=1, key="hub_lot_sz", disabled=_hub_settings_ro)
-                with pr4:
-                    deal = st.selectbox(
-                        "Deal_Type (模式)", [DEAL_SOFT, DEAL_HOT], key="hub_deal", disabled=_hub_settings_ro
-                    )
-
-                _tc_live = float(st.session_state.get("hub_target_cap", 0.0) or 0.0)
-                _sp_live = float(st.session_state.get("hub_sp", 0.5) or 0.5)
-                st.caption(
-                    f"金额预览（千分位）· Hard Cap: **{_fmt_money2(_tc_live)}** · Share_Price: **{_fmt_share_price(_sp_live)}**"
-                )
-
-                st.divider()
-                st.markdown("#### 日期与时效")
-                dt1, dt2 = st.columns(2)
-                with dt1:
-                    soft_d = st.date_input("Soft_Deadline", key="hub_soft_d", disabled=_hub_settings_ro)
-                with dt2:
-                    hard_d = st.date_input("Hard_Deadline", key="hub_hard_d", disabled=_hub_settings_ro)
-                dt3, dt4 = st.columns(2)
-                with dt3:
-                    hold_m = st.number_input(
-                        "Hold_Period (Months)",
-                        min_value=1,
-                        max_value=120,
-                        step=1,
-                        key="hub_hold_m",
-                        help="写入 projects.csv · 供 Smart Distribution 邮件引用。",
-                        disabled=_hub_settings_ro,
-                    )
-                with dt4:
-                    st.date_input(
-                        "deadline_date（回复截止日；Distribution 默认）",
-                        key="hub_deadline_date",
-                        disabled=_hub_settings_ro,
-                    )
-                st.text_input(
-                    "Preset_Options（金额档位，逗号分隔，可含千分位）",
-                    key="hub_preset_raw",
-                    disabled=_hub_settings_ro,
-                )
-
-                _pr_live = str(st.session_state.get("hub_preset_raw", "") or "")
-                st.caption(f"档位预览（千分位）：**{_preset_options_display(_pr_live)}**")
-
-                st.divider()
-                st.markdown("#### 附件与条款")
-                st.text_area(
-                    "Project Notes",
-                    key="hub_project_notes",
-                    height=120,
-                    help="保存至 projects.csv 的 Notes 列，并同步到会话 projects_data。",
-                    disabled=_hub_settings_ro,
-                )
-                st.text_area(
-                    "warrant_info（定增附加条款，写入 projects.csv，邮件变量 {{warrant_info}}）",
-                    key="hub_warrant_info",
-                    height=80,
-                    disabled=_hub_settings_ro,
-                )
-
-                cloud_links_json = serialize_drive_links(dataframe_to_drive_items(drive_edited))
-                t_clean = str(st.session_state.get("tower_form_ticker", "") or "").strip()
-                company_saved = str(st.session_state.get("tower_company_name", "") or "").strip()
-                preset_norm = _normalize_preset_options_csv(_pr_live)
-                hub_deadline_d = st.session_state.get("hub_deadline_date")
-                if not hasattr(hub_deadline_d, "strftime"):
-                    hub_deadline_d = date.today()
-                deadline_date_str = hub_deadline_d.strftime("%Y-%m-%d")
-                warrant_save = str(st.session_state.get("hub_warrant_info", "") or "")
-                project_notes = str(st.session_state.get("hub_project_notes", "") or "")
-
-                if is_new:
-                    submitted = st.button("🚀 创建新项目", type="primary", key="hub_btn_create")
-                else:
-                    submitted = st.button(
-                        "💾 更新项目信息", type="primary", key="hub_btn_update", disabled=_hub_settings_ro
-                    )
-
-                if submitted:
-                    if not t_clean:
-                        st.error("请填写 Ticker，或通过 Search Ticker 选择。")
-                    elif deal == DEAL_HOT and float(st.session_state.get("hub_target_cap", 0.0) or 0.0) <= 0:
-                        st.error("模式 B 必须填写大于 0 的 Target_Total_Cap。")
-                    else:
-                        projects_sv = load_projects()
-                        pname_auto = f"{t_clean}_{name_date.strftime('%Y-%m-%d')}"
-                        tc_val = float(st.session_state.get("hub_target_cap", 0.0) or 0.0)
-                        final_cap = float(tc_val) if deal == DEAL_HOT else 0.0
-                        target_total = float(tc_val)
-
-                        if is_new:
-                            abbr = app_mod.sanitize_project_id_abbrev(t_clean)
-                            pid_clean = ""
-                            if not abbr:
-                                st.error("无法生成 Project_ID：请先填写有效的 Ticker（字母/数字）。")
-                            else:
-                                try:
-                                    pid_clean = app_mod.next_project_id_for_month(
-                                        abbr,
-                                        projects_sv["Project_ID"].astype(str).tolist(),
-                                        name_date,
-                                    )
-                                except ValueError as exc:
-                                    st.error(str(exc))
-                            if pid_clean and (
-                                projects_sv.empty
-                                or pid_clean not in projects_sv["Project_ID"].astype(str).values
-                            ):
-                                row = {
-                                    "Project_ID": pid_clean,
-                                    "Project_Name": pname_auto,
-                                    "Company_Name": company_saved,
-                                    "Ticker": t_clean,
-                                    "Share_Price": float(sp),
-                                    "Final_Cap": final_cap,
-                                    "Open_Date": soft_d.strftime("%Y-%m-%d"),
-                                    "Close_Date": hard_d.strftime("%Y-%m-%d"),
-                                    "Soft_Deadline": soft_d.strftime("%Y-%m-%d"),
-                                    "Hard_Deadline": hard_d.strftime("%Y-%m-%d"),
-                                    "Target_Total_Cap": target_total,
-                                    "Negotiated_Final_Cap": 0.0,
-                                    "Status": STATUS_OPEN,
-                                    "Deal_Type": deal,
-                                    "Lot_Size": int(lot_sz),
-                                    "Preset_Options": preset_norm,
-                                    "preset_options": preset_norm,
-                                    "Hold_Period_Months": int(hold_m),
-                                    "Notes": project_notes.strip(),
-                                    "warrant_info": warrant_save,
-                                    "deadline_date": deadline_date_str,
-                                    "Created_Date": date.today().strftime("%Y-%m-%d"),
-                                    "Cloud_Drive_Links_JSON": cloud_links_json,
-                                }
-                                merged = pd.concat([projects_sv, pd.DataFrame([row])], ignore_index=True)
-                                merged = merged.drop_duplicates(subset=["Project_ID"], keep="last")
-                                save_projects(merged)
-                                _hub_sync_projects_session(load_projects())
-                                msg_extra = (
-                                    f" Project_Name=`{pname_auto}` · Hard Cap={_fmt_money2(tc_val)} · "
-                                    f"Options={_preset_options_display(preset_norm)} · Hold={int(hold_m)}mo."
+                    _nd1, _nd2 = st.columns(2)
+                    with _nd1:
+                        name_date = st.date_input(
+                            "命名日期（用于 Project_Name = Ticker_YYYY-MM-DD）",
+                            key="hub_name_date",
+                            disabled=_hub_settings_ro,
+                        )
+                    with _nd2:
+                        t_clean_preview = str(st.session_state.get("tower_form_ticker", "")).strip()
+                        if t_clean_preview:
+                            auto_name = f"{t_clean_preview}_{name_date.strftime('%Y-%m-%d')}"
+                            st.caption(f"将保存的 **Project_Name**：`{auto_name}`")
+                        _tk_preview = str(st.session_state.get("tower_form_ticker", "")).strip()
+                        if _tk_preview:
+                            _px = _ticker_last_price(_tk_preview)
+                            if _px is not None:
+                                st.caption(
+                                    f"yfinance · `{_tk_preview}` 参考价：**{_fmt_money2(_px)}**（延迟行情，仅供参考）"
                                 )
-                                st.success("项目已创建。" + msg_extra)
-                                st.session_state["_hub_seeded_for"] = None
-                                st.session_state["_hub_reseed"] = True
-                                st.rerun()
-                            elif pid_clean:
-                                st.error("Project_ID 已存在，请刷新后重试。")
-                        else:
-                            idx = projects_sv.index[projects_sv["Project_ID"].astype(str) == str(pick)]
-                            if len(idx) == 0:
-                                st.error("未找到该项目行。")
-                            else:
-                                row_idx = int(idx[0])
-                                prev = projects_sv.iloc[row_idx]
-                                neg_keep = float(
-                                    pd.to_numeric(prev.get("Negotiated_Final_Cap"), errors="coerce") or 0.0
-                                )
-                                _raw_st = st.session_state.get("hub_project_status", prev.get("Status", STATUS_OPEN))
-                                stat_keep = _normalize_status(_raw_st)
-                                if stat_keep not in (
-                                    STATUS_OPEN,
-                                    STATUS_PROCESSING,
-                                    STATUS_ALLOCATING,
-                                    STATUS_CLOSING,
-                                    STATUS_CLOSED,
-                                ):
-                                    stat_keep = STATUS_OPEN
-                                prev_fc = float(pd.to_numeric(prev.get("Final_Cap"), errors="coerce") or 0.0)
-                                prev_ttc = float(
-                                    pd.to_numeric(prev.get("Target_Total_Cap"), errors="coerce") or 0.0
-                                )
-                                if deal == DEAL_SOFT:
-                                    fc_save = prev_fc
-                                    ttc_save = float(tc_val)
-                                else:
-                                    fc_save = final_cap
-                                    ttc_save = target_total
 
-                                projects_sv.at[row_idx, "Project_Name"] = pname_auto
-                                projects_sv.at[row_idx, "Company_Name"] = company_saved
-                                projects_sv.at[row_idx, "Ticker"] = t_clean
-                                projects_sv.at[row_idx, "Share_Price"] = float(sp)
-                                projects_sv.at[row_idx, "Final_Cap"] = fc_save
-                                projects_sv.at[row_idx, "Open_Date"] = soft_d.strftime("%Y-%m-%d")
-                                projects_sv.at[row_idx, "Close_Date"] = hard_d.strftime("%Y-%m-%d")
-                                projects_sv.at[row_idx, "Soft_Deadline"] = soft_d.strftime("%Y-%m-%d")
-                                projects_sv.at[row_idx, "Hard_Deadline"] = hard_d.strftime("%Y-%m-%d")
-                                projects_sv.at[row_idx, "Target_Total_Cap"] = ttc_save
-                                projects_sv.at[row_idx, "Negotiated_Final_Cap"] = neg_keep
-                                projects_sv.at[row_idx, "Status"] = stat_keep
-                                projects_sv.at[row_idx, "Deal_Type"] = deal
-                                projects_sv.at[row_idx, "Lot_Size"] = int(lot_sz)
-                                projects_sv.at[row_idx, "Preset_Options"] = preset_norm
-                                projects_sv.at[row_idx, "preset_options"] = preset_norm
-                                projects_sv.at[row_idx, "Hold_Period_Months"] = int(hold_m)
-                                projects_sv.at[row_idx, "Notes"] = project_notes.strip()
-                                projects_sv.at[row_idx, "warrant_info"] = warrant_save
-                                projects_sv.at[row_idx, "deadline_date"] = deadline_date_str
-                                projects_sv.at[row_idx, "Cloud_Drive_Links_JSON"] = cloud_links_json
-                                prev_cd = str(prev.get("Created_Date", "") or "").strip()
-                                if not prev_cd:
-                                    projects_sv.at[row_idx, "Created_Date"] = soft_d.strftime("%Y-%m-%d")
-                                save_projects(projects_sv)
-                                _hub_sync_projects_session(load_projects())
-                                st.success("已更新项目信息。")
-                                _invalidate_action_bench(pick)
-                                st.session_state["_hub_seeded_for"] = None
-                                st.session_state["_hub_reseed"] = True
-                                st.rerun()
+                    st.text_input("Ticker（可搜索填入或手输）", key="tower_form_ticker", disabled=_hub_settings_ro)
 
-                if not is_new:
                     st.divider()
-                    st.caption("认购数据维护")
-                    if st.button(
-                        "🔄 从 CRM 同步未存在的客户行",
-                        type="primary",
-                        key=f"tower_sync_crm_inline_{pick}",
+                    st.markdown("#### 定价与规模")
+                    pr1, pr2 = st.columns(2)
+                    with pr1:
+                        sp = st.number_input(
+                            "Share_Price",
+                            min_value=0.0001,
+                            step=0.01,
+                            format="%.4f",
+                            key="hub_sp",
+                            help="存储为数值；下方有千分位预览。",
+                            disabled=_hub_settings_ro,
+                        )
+                    with pr2:
+                        target_cap = st.number_input(
+                            "Hard Cap / Target_Total_Cap（Hot Deal 必填；Soft 填后供分配台）",
+                            min_value=0.0,
+                            step=10_000.0,
+                            format="%.2f",
+                            key="hub_target_cap",
+                            disabled=_hub_settings_ro,
+                        )
+                    pr3, pr4 = st.columns(2)
+                    with pr3:
+                        lot_sz = st.number_input("Lot_Size", min_value=1, step=1, key="hub_lot_sz", disabled=_hub_settings_ro)
+                    with pr4:
+                        deal = st.selectbox(
+                            "Deal_Type (模式)", [DEAL_SOFT, DEAL_HOT], key="hub_deal", disabled=_hub_settings_ro
+                        )
+
+                    _tc_live = float(st.session_state.get("hub_target_cap", 0.0) or 0.0)
+                    _sp_live = float(st.session_state.get("hub_sp", 0.5) or 0.5)
+                    st.caption(
+                        f"金额预览（千分位）· Hard Cap: **{_fmt_money2(_tc_live)}** · Share_Price: **{_fmt_share_price(_sp_live)}**"
+                    )
+
+                    st.divider()
+                    st.markdown("#### 日期与时效")
+                    dt1, dt2 = st.columns(2)
+                    with dt1:
+                        soft_d = st.date_input("Soft_Deadline", key="hub_soft_d", disabled=_hub_settings_ro)
+                    with dt2:
+                        hard_d = st.date_input("Hard_Deadline", key="hub_hard_d", disabled=_hub_settings_ro)
+                    dt3, dt4 = st.columns(2)
+                    with dt3:
+                        hold_m = st.number_input(
+                            "Hold_Period (Months)",
+                            min_value=1,
+                            max_value=120,
+                            step=1,
+                            key="hub_hold_m",
+                            help="写入 projects.csv · 供 Smart Distribution 邮件引用。",
+                            disabled=_hub_settings_ro,
+                        )
+                    with dt4:
+                        st.date_input(
+                            "deadline_date（回复截止日；Distribution 默认）",
+                            key="hub_deadline_date",
+                            disabled=_hub_settings_ro,
+                        )
+                    st.text_input(
+                        "Preset_Options（金额档位，逗号分隔，可含千分位）",
+                        key="hub_preset_raw",
                         disabled=_hub_settings_ro,
-                    ):
-                        _pl = load_projects()
-                        _idx = _pl.index[_pl["Project_ID"].astype(str) == str(pick)]
-                        if len(_idx) == 0:
-                            st.error("项目不存在。")
+                    )
+
+                    _pr_live = str(st.session_state.get("hub_preset_raw", "") or "")
+                    st.caption(f"档位预览（千分位）：**{_preset_options_display(_pr_live)}**")
+
+                    st.divider()
+                    st.markdown("#### 附件与条款")
+                    st.text_area(
+                        "Project Notes",
+                        key="hub_project_notes",
+                        height=120,
+                        help="保存至 projects.csv 的 Notes 列，并同步到会话 projects_data。",
+                        disabled=_hub_settings_ro,
+                    )
+                    st.text_area(
+                        "warrant_info（定增附加条款，写入 projects.csv，邮件变量 {{warrant_info}}）",
+                        key="hub_warrant_info",
+                        height=80,
+                        disabled=_hub_settings_ro,
+                    )
+
+                    cloud_links_json = serialize_drive_links(dataframe_to_drive_items(drive_edited))
+                    t_clean = str(st.session_state.get("tower_form_ticker", "") or "").strip()
+                    company_saved = str(st.session_state.get("tower_company_name", "") or "").strip()
+                    preset_norm = _normalize_preset_options_csv(_pr_live)
+                    hub_deadline_d = st.session_state.get("hub_deadline_date")
+                    if not hasattr(hub_deadline_d, "strftime"):
+                        hub_deadline_d = date.today()
+                    deadline_date_str = hub_deadline_d.strftime("%Y-%m-%d")
+                    warrant_save = str(st.session_state.get("hub_warrant_info", "") or "")
+                    project_notes = str(st.session_state.get("hub_project_notes", "") or "")
+
+                    if is_new:
+                        submitted = st.button("🚀 创建新项目", type="primary", key="hub_btn_create")
+                    else:
+                        submitted = st.button(
+                            "💾 更新项目信息", type="primary", key="hub_btn_update", disabled=_hub_settings_ro
+                        )
+
+                    if submitted:
+                        if not t_clean:
+                            st.error("请填写 Ticker，或通过 Search Ticker 选择。")
+                        elif deal == DEAL_HOT and float(st.session_state.get("hub_target_cap", 0.0) or 0.0) <= 0:
+                            st.error("模式 B 必须填写大于 0 的 Target_Total_Cap。")
                         else:
-                            _ridx = int(_idx[0])
-                            _pr = _pl.iloc[_ridx].copy()
-                            _dr = str(_pr.get("Deal_Type", DEAL_SOFT)).strip() or DEAL_SOFT
-                            if _dr not in (DEAL_SOFT, DEAL_HOT):
-                                _dr = DEAL_SOFT
-                            _spx = float(pd.to_numeric(_pr.get("Share_Price"), errors="coerce") or 0.0) or 0.0001
-                            _ca = _load_commitments()
-                            merged = _merge_crm_seed(crm, _ca, str(pick), _spx, _dr)
-                            _save_commitments(merged)
-                            _invalidate_action_bench(pick)
-                            st.success("已同步 CRM 客户行。")
-                            st.rerun()
+                            projects_sv = load_projects()
+                            pname_auto = f"{t_clean}_{name_date.strftime('%Y-%m-%d')}"
+                            tc_val = float(st.session_state.get("hub_target_cap", 0.0) or 0.0)
+                            final_cap = float(tc_val) if deal == DEAL_HOT else 0.0
+                            target_total = float(tc_val)
+
+                            if is_new:
+                                abbr = app_mod.sanitize_project_id_abbrev(t_clean)
+                                pid_clean = ""
+                                if not abbr:
+                                    st.error("无法生成 Project_ID：请先填写有效的 Ticker（字母/数字）。")
+                                else:
+                                    try:
+                                        pid_clean = app_mod.next_project_id_for_month(
+                                            abbr,
+                                            projects_sv["Project_ID"].astype(str).tolist(),
+                                            name_date,
+                                        )
+                                    except ValueError as exc:
+                                        st.error(str(exc))
+                                if pid_clean and (
+                                    projects_sv.empty
+                                    or pid_clean not in projects_sv["Project_ID"].astype(str).values
+                                ):
+                                    row = {
+                                        "Project_ID": pid_clean,
+                                        "Project_Name": pname_auto,
+                                        "Company_Name": company_saved,
+                                        "Ticker": t_clean,
+                                        "Share_Price": float(sp),
+                                        "Final_Cap": final_cap,
+                                        "Open_Date": soft_d.strftime("%Y-%m-%d"),
+                                        "Close_Date": hard_d.strftime("%Y-%m-%d"),
+                                        "Soft_Deadline": soft_d.strftime("%Y-%m-%d"),
+                                        "Hard_Deadline": hard_d.strftime("%Y-%m-%d"),
+                                        "Target_Total_Cap": target_total,
+                                        "Negotiated_Final_Cap": 0.0,
+                                        "Status": STATUS_OPEN,
+                                        "Deal_Type": deal,
+                                        "Lot_Size": int(lot_sz),
+                                        "Preset_Options": preset_norm,
+                                        "preset_options": preset_norm,
+                                        "Hold_Period_Months": int(hold_m),
+                                        "Notes": project_notes.strip(),
+                                        "warrant_info": warrant_save,
+                                        "deadline_date": deadline_date_str,
+                                        "Created_Date": date.today().strftime("%Y-%m-%d"),
+                                        "Cloud_Drive_Links_JSON": cloud_links_json,
+                                    }
+                                    merged = pd.concat([projects_sv, pd.DataFrame([row])], ignore_index=True)
+                                    merged = merged.drop_duplicates(subset=["Project_ID"], keep="last")
+                                    save_projects(merged)
+                                    _hub_sync_projects_session(load_projects())
+                                    st.session_state[app_mod.INVESTFLOW_PROJECT_SELECTOR_KEY] = pid_clean
+                                    st.session_state["current_project"] = pid_clean
+                                    st.session_state["hub_reg_mode"] = "编辑当前会话项目"
+                                    msg_extra = (
+                                        f" Project_Name=`{pname_auto}` · Hard Cap={_fmt_money2(tc_val)} · "
+                                        f"Options={_preset_options_display(preset_norm)} · Hold={int(hold_m)}mo."
+                                    )
+                                    st.success("项目已创建。" + msg_extra)
+                                    st.session_state["_hub_seeded_for"] = None
+                                    st.session_state["_hub_reseed"] = True
+                                    st.rerun()
+                                elif pid_clean:
+                                    st.error("Project_ID 已存在，请刷新后重试。")
+                            else:
+                                idx = projects_sv.index[projects_sv["Project_ID"].astype(str) == str(pick)]
+                                if len(idx) == 0:
+                                    st.error("未找到该项目行。")
+                                else:
+                                    row_idx = int(idx[0])
+                                    prev = projects_sv.iloc[row_idx]
+                                    neg_keep = float(
+                                        pd.to_numeric(prev.get("Negotiated_Final_Cap"), errors="coerce") or 0.0
+                                    )
+                                    _raw_st = st.session_state.get("hub_project_status", prev.get("Status", STATUS_OPEN))
+                                    stat_keep = _normalize_status(_raw_st)
+                                    if stat_keep not in (
+                                        STATUS_OPEN,
+                                        STATUS_PROCESSING,
+                                        STATUS_ALLOCATING,
+                                        STATUS_CLOSING,
+                                        STATUS_CLOSED,
+                                    ):
+                                        stat_keep = STATUS_OPEN
+                                    prev_fc = float(pd.to_numeric(prev.get("Final_Cap"), errors="coerce") or 0.0)
+                                    prev_ttc = float(
+                                        pd.to_numeric(prev.get("Target_Total_Cap"), errors="coerce") or 0.0
+                                    )
+                                    if deal == DEAL_SOFT:
+                                        fc_save = prev_fc
+                                        ttc_save = float(tc_val)
+                                    else:
+                                        fc_save = final_cap
+                                        ttc_save = target_total
+
+                                    projects_sv.at[row_idx, "Project_Name"] = pname_auto
+                                    projects_sv.at[row_idx, "Company_Name"] = company_saved
+                                    projects_sv.at[row_idx, "Ticker"] = t_clean
+                                    projects_sv.at[row_idx, "Share_Price"] = float(sp)
+                                    projects_sv.at[row_idx, "Final_Cap"] = fc_save
+                                    projects_sv.at[row_idx, "Open_Date"] = soft_d.strftime("%Y-%m-%d")
+                                    projects_sv.at[row_idx, "Close_Date"] = hard_d.strftime("%Y-%m-%d")
+                                    projects_sv.at[row_idx, "Soft_Deadline"] = soft_d.strftime("%Y-%m-%d")
+                                    projects_sv.at[row_idx, "Hard_Deadline"] = hard_d.strftime("%Y-%m-%d")
+                                    projects_sv.at[row_idx, "Target_Total_Cap"] = ttc_save
+                                    projects_sv.at[row_idx, "Negotiated_Final_Cap"] = neg_keep
+                                    projects_sv.at[row_idx, "Status"] = stat_keep
+                                    projects_sv.at[row_idx, "Deal_Type"] = deal
+                                    projects_sv.at[row_idx, "Lot_Size"] = int(lot_sz)
+                                    projects_sv.at[row_idx, "Preset_Options"] = preset_norm
+                                    projects_sv.at[row_idx, "preset_options"] = preset_norm
+                                    projects_sv.at[row_idx, "Hold_Period_Months"] = int(hold_m)
+                                    projects_sv.at[row_idx, "Notes"] = project_notes.strip()
+                                    projects_sv.at[row_idx, "warrant_info"] = warrant_save
+                                    projects_sv.at[row_idx, "deadline_date"] = deadline_date_str
+                                    projects_sv.at[row_idx, "Cloud_Drive_Links_JSON"] = cloud_links_json
+                                    prev_cd = str(prev.get("Created_Date", "") or "").strip()
+                                    if not prev_cd:
+                                        projects_sv.at[row_idx, "Created_Date"] = soft_d.strftime("%Y-%m-%d")
+                                    save_projects(projects_sv)
+                                    _hub_sync_projects_session(load_projects())
+                                    st.success("已更新项目信息。")
+                                    _invalidate_action_bench(pick)
+                                    st.session_state["_hub_seeded_for"] = None
+                                    st.session_state["_hub_reseed"] = True
+                                    st.rerun()
+
+                    if not is_new:
+                        st.divider()
+                        st.caption("认购数据维护")
+                        if st.button(
+                            "🔄 从 CRM 同步未存在的客户行",
+                            type="primary",
+                            key=f"tower_sync_crm_inline_{pick}",
+                            disabled=_hub_settings_ro,
+                        ):
+                            _pl = load_projects()
+                            _idx = _pl.index[_pl["Project_ID"].astype(str) == str(pick)]
+                            if len(_idx) == 0:
+                                st.error("项目不存在。")
+                            else:
+                                _ridx = int(_idx[0])
+                                _pr = _pl.iloc[_ridx].copy()
+                                _dr = str(_pr.get("Deal_Type", DEAL_SOFT)).strip() or DEAL_SOFT
+                                if _dr not in (DEAL_SOFT, DEAL_HOT):
+                                    _dr = DEAL_SOFT
+                                _spx = float(pd.to_numeric(_pr.get("Share_Price"), errors="coerce") or 0.0) or 0.0001
+                                _ca = _load_commitments()
+                                merged = _merge_crm_seed(crm, _ca, str(pick), _spx, _dr)
+                                _save_commitments(merged)
+                                _invalidate_action_bench(pick)
+                                st.success("已同步 CRM 客户行。")
+                                st.rerun()
 
         st.divider()
 

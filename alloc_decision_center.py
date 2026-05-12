@@ -10,7 +10,7 @@ import json
 import math
 import os
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import altair as alt
 import pandas as pd
@@ -19,9 +19,11 @@ import streamlit as st
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(ROOT_DIR, "data")
 
+from app import INVESTFLOW_PROJECT_SELECTOR_KEY
 from investflow_data import PROJECTS_CSV
 
 from utils.allocations_io import latest_allocation_map_for_project, save_allocations_replace_project
+from utils.mail_dispatch_log import clients_with_mail_already_sent
 from utils.final_allocations_io import (
     FINAL_ALLOCATIONS_CSV,
     SYNTHETIC_BUFFER_CLIENT_ID,
@@ -377,6 +379,50 @@ def _feedback_map_for_project(pid: str, fb: pd.DataFrame) -> Dict[str, float]:
     return {k: v[0] for k, v in latest.items()}
 
 
+_DISPATCH_LINK_SENT_STATUSES = frozenset({"sent", "confirmed", "reduced", "expired"})
+
+
+def _commitment_monetary_footprint(cmt: pd.Series) -> float:
+    """Hot Deal 等：COO 常把额度写在 Final_Allocation / Suggested，而 Desired 仍为 0。"""
+    d = _parse_money(cmt.get("Desired_Amount", 0))
+    s = _parse_money(cmt.get("Suggested_Amount", 0))
+    f = _parse_money(cmt.get("Final_Allocation", 0))
+    return float(max(d, s, f))
+
+
+def _commitment_row_in_alloc_center_scope(
+    cmt: pd.Series,
+    *,
+    cid: str,
+    fb_map: Dict[str, float],
+    lock_map: Dict[str, float],
+    mail_sent: Set[str],
+) -> bool:
+    """
+    分配台名单：仅保留「确有认购参与依据」的客户。
+
+    不以 commitments.OID 是否非空为准（Soft Circle 邮件多为 opaque token，OID 列可能空；
+    亦可能误写 OID 导致链接状态显示「未点击」却实际从未群发）。
+
+    满足任一即展示：Portal 意向反馈、**commitments 上任意额度列（Desired / Suggested / Final）为正**、
+    已锁定分配、mail_dispatch_log 正式群发、Dispatch_Status 为已发送链路。
+    """
+    if not cid or cid.startswith("__"):
+        return True
+    if cid in fb_map:
+        return True
+    if _commitment_monetary_footprint(cmt) > 1e-6:
+        return True
+    if float(lock_map.get(cid, 0.0) or 0.0) > 0:
+        return True
+    if cid in mail_sent:
+        return True
+    ds = str(cmt.get("Dispatch_Status", "") or "").strip().lower()
+    if ds in _DISPATCH_LINK_SENT_STATUSES:
+        return True
+    return False
+
+
 def _crm_tier_weight(tier: Any) -> Tuple[str, float]:
     t = str(tier or "").strip().lower()
     if "anchor" in t:
@@ -393,8 +439,9 @@ def _build_allocation_base_table(
     commits: pd.DataFrame,
     soft: bool,
 ) -> pd.DataFrame:
-    min_amt = _min_subscription_amount(proj_row)
     fb_map = _feedback_map_for_project(pid, read_oid_feedback_df()) if soft else {}
+    lock_map = latest_allocation_map_for_project(str(pid))
+    mail_sent = clients_with_mail_already_sent(str(pid))
 
     if not commits.empty and "Project_ID" in commits.columns and "client_id" in commits.columns:
         sub = commits[commits["Project_ID"].astype(str).str.strip() == str(pid).strip()].copy()
@@ -419,11 +466,20 @@ def _build_allocation_base_table(
             elif soft:
                 ref_amt = _parse_money(cmt.get("Desired_Amount", 0))
                 if ref_amt <= 0:
-                    ref_amt = float(min_amt) if min_amt > 0 else 0.0
+                    ref_amt = 0.0
             else:
-                ref_amt = _parse_money(cmt.get("Desired_Amount", 0))
+                # Hot Deal：COO 在 Hub 手工填的额度通常在 Final_Allocation / Suggested，Desired 常为 0
+                ref_amt = _commitment_monetary_footprint(cmt)
                 if ref_amt < 0:
                     ref_amt = 0.0
+            if not _commitment_row_in_alloc_center_scope(
+                cmt,
+                cid=cid,
+                fb_map=fb_map,
+                lock_map=lock_map,
+                mail_sent=mail_sent,
+            ):
+                continue
             if soft:
                 final_alloc = 0.0
             else:
@@ -444,7 +500,9 @@ def _build_allocation_base_table(
                 continue
             inv_type, _ = _crm_tier_weight(r.get("tier"))
             if soft:
-                ref_amt = fb_map.get(cid, 0.0)
+                ref_amt = float(fb_map.get(cid, 0.0))
+                if ref_amt <= 0:
+                    continue
                 final_alloc = 0.0
             else:
                 ref_amt = 0.0
@@ -1369,7 +1427,7 @@ def _ac_smart_allocate_hard_cap(
 
 
 def _ac_cb_smart_allocate_hard_cap() -> None:
-    pid = str(st.session_state.get("ac_alloc_proj_pick", "") or "").strip()
+    pid = str(st.session_state.get(INVESTFLOW_PROJECT_SELECTOR_KEY, "") or "").strip()
     if not pid:
         return
     cap = float(st.session_state.get(f"_ac_cap_{pid}", 0.0) or 0.0)
@@ -1445,7 +1503,7 @@ def _ac_update_alloc_client_map(pid: str, df: pd.DataFrame) -> None:
 
 def _ac_cb_recalculate_global() -> None:
     """遍历项目全局分配表（非当前筛选子集）重算份额并刷新分解文案。"""
-    pid = str(st.session_state.get("ac_alloc_proj_pick", "") or "").strip()
+    pid = str(st.session_state.get(INVESTFLOW_PROJECT_SELECTOR_KEY, "") or "").strip()
     if not pid:
         return
     k = f"ac_editor_override_{pid}"
@@ -1859,20 +1917,23 @@ def render_allocations_decision_center() -> None:
     projects = _read_projects_df()
     import app as _app_alloc
 
-    _app_alloc.render_sidebar_current_project(projects)
+    _app_alloc.render_sidebar_current_project()
     pid_col = _project_id_column(projects)
     if projects.empty or pid_col not in projects.columns:
         return
 
     pids = projects[pid_col].astype(str).tolist()
+    pids_norm = [str(x).strip() for x in pids]
+    pid_raw = str(st.session_state.get(_app_alloc.INVESTFLOW_PROJECT_SELECTOR_KEY, "") or "").strip()
+    pid = _app_alloc._canonical_project_id_among_pids(pid_raw, pids_norm) or ""
     row_top = st.columns([4, 1])
     with row_top[0]:
-        pid = st.selectbox(
-            "选择项目",
-            pids,
-            key="ac_alloc_proj_pick",
-            format_func=_app_alloc.project_id_select_format_func(projects),
-        )
+        st.markdown("##### 当前处理项目")
+        if not pid:
+            st.warning("请先在 **InvestFlow 首页** 选择「COO 当前处理项目」。")
+            _app_alloc.render_nav_to_investflow_home_for_project_switch()
+            return
+        st.caption(_app_alloc.project_id_select_format_func(projects)(pid))
     with row_top[1]:
         st.write("")
         if st.button("刷新实时数据", key="ac_refresh_oid_fb"):

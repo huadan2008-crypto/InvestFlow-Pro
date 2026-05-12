@@ -18,7 +18,11 @@ def _closing_page_rel() -> Optional[str]:
 
 
 def render_coo_feedback_banner() -> None:
-    """在所有 COO 页面顶部展示轻量待办；投资人 Portal 勿调用。"""
+    """在所有 COO 页面顶部展示当前会话项目（app 层）与轻量待办；投资人 Portal 勿调用。"""
+    import app as app_mod
+
+    app_mod.render_coo_current_project_context()
+
     todos = coo_open_todos()
     if not todos:
         return

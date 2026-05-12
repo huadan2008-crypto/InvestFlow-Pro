@@ -33,25 +33,15 @@ LS_PENDING = "⏳ 未点击"
 
 
 def _portal_base_url() -> str:
-    try:
-        import streamlit as st
+    from utils.portal_base_url import resolve_portal_base_url
 
-        inv = st.secrets.get("investflow", {}) or {}
-        for k in ("portal_base_url", "base_url", "public_url"):
-            u = str(inv.get(k, "") or "").strip().rstrip("/")
-            if u:
-                return u
-    except Exception:
-        pass
-    for env_k in ("PORTAL_BASE_URL", "INVESTFLOW_BASE_URL"):
-        v = os.environ.get(env_k, "").strip().rstrip("/")
-        if v:
-            return v
-    return "http://localhost:8501"
+    return resolve_portal_base_url()
 
 
 def investment_portal_token_link(base: str, token: str) -> str:
-    b = (base or "").strip().rstrip("/") or "http://localhost:8501"
+    from utils.portal_base_url import effective_portal_base_url
+
+    b = effective_portal_base_url(base).strip().rstrip("/")
     t = urllib.parse.quote(str(token or "").strip(), safe="")
     sep = "&" if "?" in b else "?"
     return f"{b}/Investment_Portal{sep}t={t}"
