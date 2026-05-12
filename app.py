@@ -307,10 +307,14 @@ def render_coo_current_project_context(projects: Optional[pd.DataFrame] = None) 
 
 def render_nav_to_investflow_home_for_project_switch() -> None:
     """子页返回首页以切换 `INVESTFLOW_PROJECT_SELECTOR_KEY`（多页应用根脚本为 `app.py`）。"""
-    try:
-        st.page_link("app.py", label="打开 InvestFlow 首页（切换 COO 当前处理项目）", icon="🏠")
-    except Exception:
-        st.caption("请从左侧菜单打开 **InvestFlow** 应用首页，在「COO 当前处理项目」中切换。")
+    pl = getattr(st, "page_link", None)
+    if callable(pl):
+        try:
+            pl("app.py", label="打开 InvestFlow 首页（切换 COO 当前处理项目）", icon="🏠")
+            return
+        except Exception:
+            pass
+    st.caption("请从左侧菜单打开 **InvestFlow** 应用首页，在「COO 当前处理项目」中切换。")
 
 
 def _load_or_init_crm():

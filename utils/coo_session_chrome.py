@@ -19,9 +19,21 @@ def _closing_page_rel() -> Optional[str]:
 
 def render_coo_feedback_banner() -> None:
     """在所有 COO 页面顶部展示当前会话项目（app 层）与轻量待办；投资人 Portal 勿调用。"""
-    import app as app_mod
+    import importlib
+    import sys
+    from pathlib import Path
 
-    app_mod.render_coo_current_project_context()
+    # 从 pages/*.py 运行时，确保仓库根在 path 首位，避免 `import app` 误解析到其它同名模块
+    _root = str(Path(__file__).resolve().parent.parent)
+    if _root not in sys.path:
+        sys.path.insert(0, _root)
+
+    app_mod = importlib.import_module("app")
+    fn = getattr(app_mod, "render_coo_current_project_context", None)
+    if not callable(fn):
+        st.caption("无法加载首页顶栏（缺少 `render_coo_current_project_context`），请确认已部署完整 `app.py`。")
+        return
+    fn()
 
     todos = coo_open_todos()
     if not todos:
