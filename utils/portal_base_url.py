@@ -9,6 +9,38 @@ import os
 from typing import Optional
 
 
+def _normalize_public_base_url(raw: Optional[str]) -> str:
+    """
+    将 secrets / 环境变量里的「根地址」规范为无尾斜杠的 http(s) URL。
+    支持只写主机名（如 ``xxx.streamlit.app``），避免被误判为空而回退 localhost。
+    """
+    s = str(raw or "").strip().strip('"').strip("'").rstrip("/")
+    if not s:
+        return ""
+    low = s.lower()
+    if low.startswith("https://") or low.startswith("http://"):
+        return s
+    if s.startswith("//"):
+        return f"https:{s}".rstrip("/")
+    if "://" not in s and "." in s and not s.startswith("/"):
+        return f"https://{s}".rstrip("/")
+    return ""
+
+
+def _headers_get(headers: object, key: str) -> str:
+    if headers is None:
+        return ""
+    try:
+        if isinstance(headers, dict):
+            return str(headers.get(key) or headers.get(key.lower()) or "").strip()
+        getter = getattr(headers, "get", None)
+        if callable(getter):
+            return str(getter(key) or getter(key.lower()) or "").strip()
+    except Exception:
+        return ""
+    return ""
+
+
 def resolve_portal_base_url(*, default_local: str = "http://localhost:8501") -> str:
     """
     返回 Streamlit 应用根 URL（无尾斜杠），用于拼接 `/Investment_Portal?...`。
@@ -20,9 +52,9 @@ def resolve_portal_base_url(*, default_local: str = "http://localhost:8501") -> 
     4. ``default_local``（本地开发）
     """
     for env_k in ("PORTAL_BASE_URL", "INVESTFLOW_BASE_URL"):
-        v = str(os.environ.get(env_k, "") or "").strip().rstrip("/")
-        if v.startswith("http://") or v.startswith("https://"):
-            return v
+        u = _normalize_public_base_url(os.environ.get(env_k, ""))
+        if u:
+            return u
 
     try:
         import streamlit as st
@@ -30,8 +62,8 @@ def resolve_portal_base_url(*, default_local: str = "http://localhost:8501") -> 
         inv = st.secrets.get("investflow", {}) or {}
         if isinstance(inv, dict):
             for k in ("portal_base_url", "base_url", "public_url"):
-                u = str(inv.get(k, "") or "").strip().rstrip("/")
-                if u.startswith("http://") or u.startswith("https://"):
+                u = _normalize_public_base_url(inv.get(k, ""))
+                if u:
                     return u
     except Exception:
         pass
@@ -41,15 +73,11 @@ def resolve_portal_base_url(*, default_local: str = "http://localhost:8501") -> 
 
         ctx = getattr(st, "context", None)
         headers = getattr(ctx, "headers", None) if ctx is not None else None
-        if isinstance(headers, dict):
-            host = (headers.get("Host") or headers.get("host") or "").strip()
-            proto = (
-                (headers.get("X-Forwarded-Proto") or headers.get("x-forwarded-proto") or "https")
-                .split(",")[0]
-                .strip()
-            )
-            if host:
-                return f"{proto}://{host}".rstrip("/")
+        host = _headers_get(headers, "Host")
+        if host:
+            proto = _headers_get(headers, "X-Forwarded-Proto") or "https"
+            proto = proto.split(",")[0].strip() or "https"
+            return f"{proto}://{host}".rstrip("/")
     except Exception:
         pass
 
@@ -58,7 +86,7 @@ def resolve_portal_base_url(*, default_local: str = "http://localhost:8501") -> 
 
 def effective_portal_base_url(explicit: Optional[str]) -> str:
     """若调用方传入非空 base 则用之，否则走统一解析。"""
-    b = str(explicit or "").strip().rstrip("/")
-    if b.startswith("http://") or b.startswith("https://"):
+    b = _normalize_public_base_url(explicit)
+    if b:
         return b
     return resolve_portal_base_url()

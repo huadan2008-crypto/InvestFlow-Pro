@@ -559,7 +559,13 @@ def _investment_portal_link(
         ck = f"_dist_preview_portal_url_{pid}_{cid}"
         prev_u = str(st.session_state.get(ck, "") or "").strip()
         if prev_u.startswith("http"):
-            return prev_u
+            try:
+                want = urllib.parse.urlparse(b if "://" in b else f"https://{b}" if b else "")
+                got = urllib.parse.urlparse(prev_u)
+                if want.netloc and got.netloc and got.netloc == want.netloc:
+                    return prev_u
+            except Exception:
+                pass
         url = issue_opaque_portal_url(b, pid, cid, exp_ts, revoke_previous_for_pair=True)
         if url:
             st.session_state[ck] = url
