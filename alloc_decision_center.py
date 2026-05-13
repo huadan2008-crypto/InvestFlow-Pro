@@ -1593,6 +1593,7 @@ def _ac_build_global_alloc_summary_display(
             else 0,
         }
     )
+    _nan = float("nan")
     footer = pd.DataFrame(
         [
             {
@@ -1600,31 +1601,34 @@ def _ac_build_global_alloc_summary_display(
                 "客户姓名": "[当前群组小计]",
                 "Tier": "",
                 "Type": "",
-                "意向 (CAD)": "",
+                "意向 (CAD)": _nan,
                 "已分配 (CAD)": float(sub_cur),
-                "份额": "",
+                "份额": _nan,
             },
             {
                 "范围": "—",
                 "客户姓名": "[其他群组已占份额]",
                 "Tier": "",
                 "Type": "",
-                "意向 (CAD)": "",
+                "意向 (CAD)": _nan,
                 "已分配 (CAD)": float(other),
-                "份额": "",
+                "份额": _nan,
             },
             {
                 "范围": "—",
                 "客户姓名": "[全局总计]",
                 "Tier": "",
                 "Type": "",
-                "意向 (CAD)": "",
+                "意向 (CAD)": _nan,
                 "已分配 (CAD)": float(total),
-                "份额": "",
+                "份额": _nan,
             },
         ]
     )
     out = pd.concat([disp, footer], ignore_index=True)
+    out["意向 (CAD)"] = pd.to_numeric(out["意向 (CAD)"], errors="coerce")
+    out["已分配 (CAD)"] = pd.to_numeric(out["已分配 (CAD)"], errors="coerce")
+    out["份额"] = pd.to_numeric(out["份额"], errors="coerce")
     return out, {"sub_cur": sub_cur, "other": other, "total": total}
 
 

@@ -1693,7 +1693,7 @@ def render_distribution_tab_full() -> None:
             cc_l, cc_r = st.columns([1, 15])
             with cc_l:
                 st.checkbox(
-                    "",
+                    "群发时抄送附加邮箱",
                     key="dist_send_cc_aaron",
                     label_visibility="collapsed",
                 )
