@@ -21,6 +21,7 @@ from utils.final_allocations_io import (
 from utils.mail_dispatch_log import clients_with_mail_already_sent
 from utils.financial_display import dataframe_financial_display
 from utils.cloud_drive_links import appendix_plaintext_lines, multiselect_label, parse_drive_links_cell
+from utils.business_rules import closing_row_amount_cad
 
 DEFAULT_SUBSCRIPTION_FILES = ["private_equity_workflow.csv", "my_investments.csv"]
 # CRM 主数据仅使用 CSV，请在应用内维护，以便 client_id 自动生成与唯一性校验一致。
@@ -1413,20 +1414,14 @@ def _build_closing_deal_base_df(pid: str) -> pd.DataFrame:
                         nm = str(hit.iloc[0].get("name") or "").strip()
                     if "email" in hit.columns:
                         email = str(hit.iloc[0].get("email") or "").strip()
-            amt = pd.to_numeric(r.get("Final_Allocation"), errors="coerce")
-            if pd.isna(amt) or float(amt) <= 0:
-                amt = pd.to_numeric(r.get("Suggested_Amount"), errors="coerce")
-            if pd.isna(amt) or float(amt) <= 0:
-                amt = float(alloc_map.get(cid, 0.0))
-            else:
-                amt = float(amt)
+            amt = closing_row_amount_cad(r.get("Final_Allocation"), float(alloc_map.get(cid, 0.0)))
 
             rows.append(
                 {
                     "client_id": cid,
                     "姓名": nm or cid,
                     "邮件": email,
-                    "分配额度": round(float(amt), 2),
+                    "分配额度": float(amt),
                     "备注": "",
                 }
             )
@@ -1458,11 +1453,10 @@ def _build_closing_deal_base_df(pid: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _closing_filter_participants(pid: str, df: pd.DataFrame) -> pd.DataFrame:
+def _closing_filter_participants(_pid: str, df: pd.DataFrame) -> pd.DataFrame:
     """
-    Closing 清单仅保留参与人，降低噪音：
-    - 分配额度 > 0；或
-    - 在 allocations 中出现 Portal 关键行为（确认/签署/收据）。
+    Closing 清单仅保留 **分配额度 > 0** 的参与人。
+    分配额度由 Final_Allocation / merged_allocation_map 决定，不含 Suggested_Amount（产品确认）。
     """
     if df is None or df.empty:
         return df
@@ -1471,35 +1465,8 @@ def _closing_filter_participants(pid: str, df: pd.DataFrame) -> pd.DataFrame:
         return out
 
     amt = pd.to_numeric(out.get("分配额度", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
-    participant_ids: set[str] = set(
-        out.loc[amt > 0, "client_id"].astype(str).str.strip().tolist()
-    )
-
-    try:
-        from utils.allocations_io import allocations_rows_for_project
-
-        ar = allocations_rows_for_project(str(pid))
-        if not ar.empty and "client_id" in ar.columns:
-            behavior_cols = [
-                c
-                for c in ("commitment_confirmed", "document_signed", "receipt_uploaded")
-                if c in ar.columns
-            ]
-            if behavior_cols:
-                mark = pd.Series(False, index=ar.index)
-                for c in behavior_cols:
-                    mark = mark | ar[c].astype(str).str.strip().ne("")
-                for cid in ar.loc[mark, "client_id"].astype(str).str.strip().tolist():
-                    if cid:
-                        participant_ids.add(cid)
-    except Exception:
-        # 过滤是体验增强，不阻断主流程
-        pass
-
-    keep = out["client_id"].astype(str).str.strip().isin(participant_ids)
+    keep = amt > 0
     filtered = out.loc[keep].copy()
-    if filtered.empty:
-        return out
     return filtered.reset_index(drop=True)
 
 

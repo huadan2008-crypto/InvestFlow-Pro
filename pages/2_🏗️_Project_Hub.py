@@ -570,6 +570,12 @@ def render_project_hub() -> None:
             st.dataframe(_sum_df, use_container_width=True, hide_index=True)
 
     with tab_edit:
+        # hub_reg_mode 绑定在下方 st.radio；同一次 run 里不能再直接改该 key（StreamlitAPIException）。
+        # 保存新项后改模式请写入 _hub_reg_mode_pending，在此处、radio 创建之前应用。
+        _hub_mode_pending = st.session_state.pop("_hub_reg_mode_pending", None)
+        if _hub_mode_pending is not None:
+            st.session_state["hub_reg_mode"] = str(_hub_mode_pending)
+
         st.session_state.pop("hub_project_pick", None)
 
         pid_list: list[str] = []
@@ -1372,7 +1378,7 @@ def render_project_hub() -> None:
                                     _hub_sync_projects_session(load_projects())
                                     st.session_state[app_mod.INVESTFLOW_PROJECT_SELECTOR_KEY] = pid_clean
                                     st.session_state["current_project"] = pid_clean
-                                    st.session_state["hub_reg_mode"] = "编辑当前会话项目"
+                                    st.session_state["_hub_reg_mode_pending"] = "编辑当前会话项目"
                                     msg_extra = (
                                         f" Project_Name=`{pname_auto}` · Hard Cap={_fmt_money2(tc_val)} · "
                                         f"Options={_preset_options_display(preset_norm)} · Hold={int(hold_m)}mo."

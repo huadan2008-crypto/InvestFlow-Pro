@@ -3,3 +3,4 @@ pandas
 yfinance
 altair
 openpyxl
+pytest>=8.0.0
